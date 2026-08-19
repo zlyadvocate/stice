@@ -1,0 +1,74 @@
+# Build directories
+build/
+build-*/
+out/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+*.cmake
+Makefile
+
+# Compiled object files
+*.o
+*.obj
+*.ko
+*.elf
+
+# Shared libraries / DLLs
+*.so
+*.so.*
+*.dylib
+*.dll
+*.dll.a
+
+# Static libraries
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+*.hex
+
+# Debug symbols
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.suo
+*.user
+
+# Precompiled headers
+*.gch
+*.pch
+
+# IDE files
+.vscode/
+.vs/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+*.log
+*.xml
+*.json
+coverage/
+.coverage
+htmlcov/
+
+# Third-party (keep tracked submodules, ignore build artifacts)
+third_party/*/build/
+third_party/*/CMakeCache.txt
+
+# Temporary files
+*.tmp
+*.bak
+*.orig
+*.rej

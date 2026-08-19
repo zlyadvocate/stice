@@ -1,0 +1,36 @@
+# stserver configuration file
+# Copy to stserver.conf and edit as needed.
+# All keys are optional; missing values use the built-in defaults.
+
+# Address to listen on (both UDP and TCP). Default: 0.0.0.0
+listenAddress = 0.0.0.0
+
+# UDP listener port (STUN + TURN/UDP). Default: 3478
+udpPort = 3478
+
+# TCP listener port (TURN/TCP + RFC 6062 data pipes). Default: 3478
+tcpPort = 3478
+
+# TURN realm used in long-term credential challenges. Default: stserver
+realm = stserver
+
+# Long-term credential users. Format: username:password, comma-separated.
+# When set, overrides individual user/password keys.
+# Leave empty for open relay (no authentication) — NOT recommended for production.
+users = testuser:testpass
+
+# Maximum concurrent TURN allocations. Default: 2000
+maxAllocations = 2000
+
+# Allocation lifetime in seconds. Default: 600
+allocationLifetime = 600
+
+# Relay port range for TURN allocations. Default: 49152-65535
+relayPortBegin = 49152
+relayPortEnd = 65535
+
+# Log level: verbose, debug, info, warn, error, fatal, none. Default: info
+logLevel = info
+
+# Number of IO worker threads (TCP data plane). Default: 4
+workerCount = 4
