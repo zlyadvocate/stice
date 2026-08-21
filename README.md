@@ -341,6 +341,18 @@ Catch2-based tests support tag filtering:
 ./build/Release/test_stun.exe --list-tests
 ```
 
+## Documentation
+
+In-depth technical documentation is available in the `docs/` directory. All documents are provided in both English and Chinese.
+
+| Document | English | Chinese | Description |
+|----------|---------|---------|-------------|
+| TURN over TCP Control Connection (RFC 8656) | [EN](docs/TURN-over-TCP-RFC8656.en.md) | [ZH](docs/TURN-over-TCP-RFC8656.md) | Self-delimiting STUN/ChannelData framing, StunConn parser, Mode-A control connection, long-term credential auth, C API usage |
+| RFC 6062 TCP Allocations | [EN](docs/RFC6062-TCP-Allocations.en.md) | [ZH](docs/RFC6062-TCP-Allocations.zh.md) | Mode-A/B architecture, CONNECT/CONNECTION-ATTEMPT/CONNECTION-BIND flow, CONNECTION-ID, data connection with RFC 4571 framing, ufrag-based initiator selection |
+| Integration with libdatachannel | [EN](docs/Integration-with-libdatachannel.en.md) | [ZH](docs/Integration-with-libdatachannel.zh.md) | Drop-in replacement guide, add_subdirectory/find_package/FetchContent methods, compatibility guarantees, feature differences, FAQ |
+
+> **Note**: This README is also available in Chinese: [README.zh.md](README.zh.md)
+
 ## License
 
 This project is licensed under the **Mozilla Public License 2.0 (MPL-2.0)**.
