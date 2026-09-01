@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // Author: zlyadvocate
-// Version: 0.10.0
+// Version: 0.10.1
 // EpollBackend: D plan implementation on Linux — epoll-based async IO with
 // a dynamic worker thread pool.
 //

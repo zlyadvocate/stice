@@ -39,6 +39,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -443,10 +444,16 @@ private:
 	// own stable memory the C API config_.turn_servers can point into).
 	std::vector<stice_turn_server_t> turnServersInternal_;
 	// Backing storage for C strings in turnServersInternal_ (added via
-	// addIceServer URL parsing, which creates strings dynamically).
-	std::vector<std::string> turnServerHostStorage_;
-	std::vector<std::string> turnServerUserStorage_;
-	std::vector<std::string> turnServerPassStorage_;
+	// addIceServer URL parsing or addTurnServer, which create strings
+	// dynamically). MUST be std::deque: push_back never invalidates
+	// references to existing elements, so the c_str() pointers stored in
+	// turnServersInternal_ stay valid as more servers are added. A vector
+	// reallocates on growth and left every previously-added TURN server's
+	// host/username/password dangling (garbage hosts like "could not
+	// resolve <mojibake>" when 2+ servers were registered).
+	std::deque<std::string> turnServerHostStorage_;
+	std::deque<std::string> turnServerUserStorage_;
+	std::deque<std::string> turnServerPassStorage_;
 	// Internal storage for STUN servers added via add_stun_server or
 	// config_.stun_servers. Each entry is a host:port pair. All are
 	// queried concurrently during gatherServerReflexive.

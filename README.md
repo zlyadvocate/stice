@@ -200,6 +200,44 @@ stice_make_pairing_config(STICE_PAIRING_EMBEDDED_STABLE, &cfg);
 stice_set_pairing_config(agent, &cfg);
 ```
 
+## Benchmark & Tuning
+
+The reference benchmark [`tests/test_coturn_bench.cpp`](tests/test_coturn_bench.cpp) drives the stice client against a [coturn](https://github.com/coturn/coturn) server in four modes — `ice-udp` / `ice-tcp` (direct, host candidates) and `turn-udp` / `turn-tcp` (RFC 6062 relayed, relay-only candidates). Each mode measures one-way RTT (100 × 64B ping-pong) plus a windowed bulk goodput (1200 B datagrams).
+
+```bash
+# Modes: ice-udp,ice-tcp,turn-udp,turn-tcp (comma-separated)
+# Args:  host port user pass modes [targetMbps] [udpWindow] [udpPkts] [tcpPkts] [turnTcpWindow]
+./build/Release/test_coturn_bench.exe 192.168.3.223 3478 testuser 123456 turn-udp 0 3
+```
+
+### Default Four-Mode Sweep (coturn `192.168.3.223:3478`, default windows)
+
+| Mode | RTT/2 avg | RTT/2 p95 | goodput | Loss |
+|------|-----------|-----------|---------|------|
+| ice-udp | 0.027 ms | 0.040 ms | 810.1 Mbps | 0 |
+| ice-tcp | 0.019 ms | 0.051 ms | 905.7 Mbps | 0 |
+| turn-udp | 0.488 ms | 0.238 ms | 117.8 Mbps | 2.73% (w=32) |
+| turn-tcp | 0.478 ms | 0.215 ms | 25.7 Mbps | 0 (w=16) |
+
+### Optimal Zero-Loss Configurations
+
+The relay path is bottlenecked by the coturn/VM ceiling (~175 Mbps zero-loss for UDP; ~25–40 Mbps sustained for the TCP relay). Within that ceiling, window = RTT × target bandwidth keeps throughput high with **zero packet loss**. Direct ICE paths need no tuning.
+
+| Mode | Optimal config | RTT/2 avg | RTT/2 p95 | goodput | Loss |
+|------|----------------|-----------|-----------|---------|------|
+| ice-udp | direct (default) | 0.027 ms | 0.040 ms | 810.1 Mbps | 0 |
+| ice-tcp | direct (default) | 0.019 ms | 0.051 ms | 905.7 Mbps | 0 |
+| turn-udp | window = 3 | 0.503 ms | 0.318 ms | 169.9 Mbps | 0/20000 |
+| turn-tcp | window = 1 | 0.098 ms | 0.193 ms | 39.7 Mbps | 0/40000 |
+
+**Tuning notes:**
+
+- **Windows are derived from the p95 RTT, not the average**: the coturn relay delivers latency in bursty tails (max up to 23–26 ms, so lat-avg can exceed lat-p95); an avg-derived window under-fills and triggers spurious stall-breaks. A p95-derived window sustains the target rate across latency spikes.
+- **The stall-breaker resets the in-flight count and enters a 100 ms cooldown**, instead of retransmitting the whole window, preventing over-send after a spurious stall detection from overflowing the relay buffer.
+- **The default turn-udp window (w32) over-drives** and loses 1–4% of packets; dropping to **w=3** eliminates loss while throughput actually rises from 117.8 → 169.9 Mbps.
+- **turn-tcp is most stable with the smallest window (w=1)**: throughput rises 25.7 → 39.7 Mbps at zero loss; a windowed TCP relay fills up cleanly without errors.
+- Stability: turn-udp(w=3) is near-lossless over 20 min (~0.06%); turn-tcp(w=1) is lossless over long runs. Both are bounded by the coturn single-path ceiling, not stice flow control.
+
 ## Testing
 
 The test suite uses [Catch2](https://github.com/catchorg/Catch2) for unit tests and standalone binaries for integration / stress tests. Tests are divided into three tiers based on external dependencies.

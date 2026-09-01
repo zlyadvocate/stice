@@ -9,8 +9,10 @@
 #include "stice/net/addr.hpp"
 #include "stice/net/platform.hpp"
 #include "stice/net/udp.hpp"
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 namespace stice::net {
@@ -87,14 +89,23 @@ public:
 	// written to `out` (0 if no data yet), or -1 on failure.
 	int recv(char *out, std::size_t outSize, AddrRecord & /*peer*/);
 
-	bool wantsWrite() const { return !sendQueue_.empty() || state_ == TcpState::Connecting; }
+	// True when the socket should be armed for POLLOUT: queued data or an
+	// in-progress connect. Thread-safe: sendQueue_ is mutated by senders on
+	// any thread (e.g. stice_send from the user thread, STUN responses from
+	// the poll thread) and drained by the poll thread's flushSends.
+	bool wantsWrite() const {
+		std::lock_guard<std::mutex> lk(sendMtx_);
+		return !sendQueue_.empty() || state_ == TcpState::Connecting;
+	}
 
 private:
 	short flushSends();
 	short driveTlsHandshake();
 
 	socket_t sock_ = STICE_INVALID_SOCKET;
-	TcpState state_ = TcpState::Disconnected;
+	// State is read by sender threads and written by the poll thread
+	// (connect completion, error transitions) — atomic for torn-free reads.
+	std::atomic<TcpState> state_{TcpState::Disconnected};
 	bool useTls_ = false;
 	bool skipVerify_ = false;
 	std::string sni_;
@@ -109,10 +120,19 @@ private:
 
 	// Write queue. In RFC4571 mode each entry is 2-byte prefix + payload.
 	// In Raw mode each entry is just the payload.
+	// Guarded by sendMtx_: send() (any thread) appends while the poll
+	// thread drains via onWritable()/flushSends(). Unserialized
+	// insert/erase on this vector caused heap corruption (0xC0000374 /
+	// 0xC0000005) when app data was sent from the user thread while the
+	// poll thread flushed a pending queue.
 	std::vector<unsigned char> sendQueue_;
+	mutable std::mutex sendMtx_;
 
-	// Read buffer accumulation for framing.
+	// Read buffer accumulation for framing. Guarded by recvMtx_
+	// (onReadable appends on the poll thread; recv drains on the caller's
+	// thread).
 	std::vector<unsigned char> recvBuf_;
+	mutable std::mutex recvMtx_;
 
 	// Application-layer connect deadline. Set by setConnectTimeoutMs. When
 	// the poll loop calls onWritable/onReadable while still Connecting/

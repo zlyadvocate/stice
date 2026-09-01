@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // Author: zlyadvocate
-// Version: 0.10.0
+// Version: 0.10.1
 // IocpBackend: D plan implementation — Windows IOCP (Input/Output Completion
 // Port) based async IO with a dynamic worker thread pool.
 //
@@ -110,6 +110,21 @@ bool setNonBlocking(socket_t s) {
 	u_long nb = 1;
 	return ioctlsocket(s, FIONBIO, &nb) == 0;
 }
+
+// Disable SIO_UDP_CONNRESET: by default Windows maps incoming ICMP
+// port-unreachable (e.g. an in-flight response to a client that just closed
+// its socket) onto the socket's PENDING overlapped WSARecvFrom, completing
+// it with WSAECONNRESET. Production TURN servers (coturn) disable this so
+// stale ICMP errors cannot consume the posted receive.
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET 0x9800000C
+#endif
+bool disableUdpConnReset(socket_t s) {
+	BOOL val = FALSE;
+	DWORD dw = 0;
+	return ::WSAIoctl(s, SIO_UDP_CONNRESET, &val, sizeof(val), nullptr, 0,
+	                  &dw, nullptr, nullptr) == 0;
+}
 } // namespace
 
 class IocpBackend : public IoBackend {
@@ -137,6 +152,10 @@ public:
 		if (udpListener_ != INVALID_SOCKET) {
 			::CreateIoCompletionPort(reinterpret_cast<HANDLE>(udpListener_), iocp_,
 			                         static_cast<ULONG_PTR>(udpListener_), 0);
+			// Ignore ICMP port-unreachable on the listener: a response sent
+			// to a just-closed client would otherwise complete the posted
+			// WSARecvFrom with WSAECONNRESET and deafen the server.
+			disableUdpConnReset(udpListener_);
 		}
 		if (tcpListener_ != INVALID_SOCKET) {
 			::CreateIoCompletionPort(reinterpret_cast<HANDLE>(tcpListener_), iocp_,
@@ -198,6 +217,7 @@ public:
 		if (s == INVALID_SOCKET) return;
 		::CreateIoCompletionPort(reinterpret_cast<HANDLE>(s), iocp_,
 		                         static_cast<ULONG_PTR>(s), 0);
+		disableUdpConnReset(s);
 		{
 			std::lock_guard<std::mutex> lk(relayMutex_);
 			relaySockets_.insert(s);
@@ -222,6 +242,10 @@ public:
 		if (s == INVALID_SOCKET) return;
 		::CreateIoCompletionPort(reinterpret_cast<HANDLE>(s), iocp_,
 		                         static_cast<ULONG_PTR>(s), 0);
+		{
+			std::lock_guard<std::mutex> lk(tcpConnMutex_);
+			tcpConns_.insert(s);
+		}
 		if (hasWritePending) {
 			std::lock_guard<std::mutex> lk(writePendingMutex_);
 			writePending_.insert(s);
@@ -234,7 +258,14 @@ public:
 		// The worker thread will safely handle the final completion and
 		// clean up the context. Erasing here risks use-after-free if an
 		// IOCP completion packet is already queued.
+		// Mark the conn removed first so completion handlers do not
+		// re-post a recv on a socket handle that may be closed and
+		// recycled by a new connection.
 		::CancelIo(reinterpret_cast<HANDLE>(s));
+		{
+			std::lock_guard<std::mutex> lk(tcpConnMutex_);
+			tcpConns_.erase(s);
+		}
 		std::lock_guard<std::mutex> lk(writePendingMutex_);
 		writePending_.erase(s);
 	}
@@ -275,17 +306,41 @@ private:
 
 		DWORD flags = 0;
 		DWORD bytesRecv = 0;
-		int rc = ::WSARecvFrom(s, &raw->wbuf, 1, &bytesRecv, &flags,
-		                       reinterpret_cast<sockaddr *>(&raw->fromAddr),
-		                       &raw->fromLen, &raw->ol, nullptr);
-		if (rc == SOCKET_ERROR) {
-			int err = WSAGetLastError();
-			if (err != WSA_IO_PENDING) {
-				STICE_LOG_ERROR("stserver: WSARecvFrom failed: %d", err);
+		int rc = SOCKET_ERROR;
+		int err = 0;
+		// A synchronous (non-IO_PENDING) failure of an overlapped WSARecvFrom
+		// does NOT produce an IOCP completion packet, so the worker-thread
+		// error-repost path never sees it — giving up here permanently
+		// deafens the socket (measured: relay went silent mid-stream after
+		// "WSARecvFrom failed: 10049", dropping 14k+ consecutive packets).
+		// Windows surfaces ICMP-derived errors queued on the socket (e.g.
+		// WSAEADDRNOTAVAIL 10049 / WSAECONNRESET 10054 after a sendto hit a
+		// closed port) on the next recv call; the failed call CONSUMES the
+		// queued error, so an immediate retry recovers. Retry transient
+		// errors; only fatal socket-state errors abort the recv loop.
+		for (int attempt = 0;; ++attempt) {
+			flags = 0;
+			raw->fromLen = sizeof(raw->fromAddr);
+			rc = ::WSARecvFrom(s, &raw->wbuf, 1, &bytesRecv, &flags,
+			                   reinterpret_cast<sockaddr *>(&raw->fromAddr),
+			                   &raw->fromLen, &raw->ol, nullptr);
+			if (rc != SOCKET_ERROR) break;
+			err = WSAGetLastError();
+			if (err == WSA_IO_PENDING) break; // normal overlapped path
+			bool transient =
+			    err == WSAEADDRNOTAVAIL || err == WSAECONNRESET ||
+			    err == WSAEMSGSIZE || err == WSAENETUNREACH ||
+			    err == WSAEHOSTUNREACH || err == WSAENETDOWN ||
+			    err == WSAETIMEDOUT || err == WSAEWOULDBLOCK;
+			if (!transient || attempt >= 8) {
+				STICE_LOG_ERROR("stserver: WSARecvFrom failed on sock %llu: %d", static_cast<unsigned long long>(s), err);
 				std::lock_guard<std::mutex> lk(ctxMutex_);
 				ctxs_.erase(s);
 				return;
 			}
+			// Consume the queued ICMP-derived error and retry.
+			STICE_LOG_WARN("stserver: WSARecvFrom transient err %d on sock %llu (attempt %d), retrying",
+			               err, static_cast<unsigned long long>(s), attempt);
 		}
 	}
 
@@ -396,15 +451,28 @@ private:
 						if (it->second.get() == ctx) { ctxs_.erase(it); break; }
 					}
 				} else if (opType == OpType::RecvFrom) {
-					// UDP recv failed — just clean up the context.
-					// The socket may have been removed via removeRelaySocket.
+				// UDP recv failed (e.g. WSAECONNRESET from an ICMP
+				// port-unreachable — SIO_UDP_CONNRESET is disabled, but be
+				// defensive). CRITICAL: re-post the receive, otherwise a
+				// single transient error permanently deafens that socket
+				// (measured: after one client teardown the server stopped
+				// responding to any Allocate).
+				{
 					std::lock_guard<std::mutex> lk(ctxMutex_);
 					for (auto it = ctxs_.begin(); it != ctxs_.end(); ++it) {
 						if (it->second.get() == ctx) { ctxs_.erase(it); break; }
 					}
 				}
-				continue;
+				if (running_ && s == udpListener_) {
+					postRecvFrom(s);
+				} else if (running_) {
+					// Relay socket: only re-post if still registered.
+					std::lock_guard<std::mutex> lk(relayMutex_);
+					if (relaySockets_.count(s) > 0) postRecvFrom(s);
+				}
 			}
+			continue;
+		}
 
 			auto *ctx = CONTAINING_RECORD(ol, OverlappedCtx, ol);
 			OpType opType = ctx->type;
@@ -553,10 +621,18 @@ private:
 		                        reinterpret_cast<unsigned char *>(ctx->buf),
 		                        static_cast<std::size_t>(bytesTransfered));
 
-		// Re-post recv if the connection is still valid.
+		// Re-post recv only if the connection is still tracked: the owner
+		// callback may have closed the conn (removeTcpConn) during delivery,
+		// and a blind re-post on a closed+recycled handle would steal
+		// completions belonging to a new connection.
 		bool shouldRepost = running_ && ctxOwner != nullptr;
+		bool stillConn = false;
+		if (shouldRepost) {
+			std::lock_guard<std::mutex> lk(tcpConnMutex_);
+			stillConn = tcpConns_.count(sock) > 0;
+		}
 		ctxOwner.reset();
-		if (shouldRepost) postRecv(sock);
+		if (shouldRepost && stillConn) postRecv(sock);
 	}
 
 	// Write retry thread: periodically flush pending writes.
@@ -596,6 +672,11 @@ private:
 	// Relay socket tracking (to distinguish relay vs TCP conn on completion).
 	std::mutex relayMutex_;
 	std::set<socket_t> relaySockets_;
+
+	// Live TCP connection tracking: guards stale recv re-posts after
+	// removeTcpConn (socket handle may be recycled by a new accept).
+	std::mutex tcpConnMutex_;
+	std::set<socket_t> tcpConns_;
 
 	// Sockets with pending write data.
 	std::mutex writePendingMutex_;

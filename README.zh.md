@@ -1,7 +1,7 @@
 # stice
 
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
-[![Version](https://img.shields.io/badge/version-0.10.0-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-0.10.1-blue.svg)]()
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)]()
 
 **C++17 ICE + TURN 客户端库，从 [pion/webrtc](https://github.com/pion/webrtc) (Go) 移植，设计为 [libjuice](https://github.com/paullouisageneau/libjuice) 的 drop-in 替代品。**
@@ -203,6 +203,44 @@ stice_ice_pairing_config_t cfg;
 stice_make_pairing_config(STICE_PAIRING_EMBEDDED_STABLE, &cfg);
 stice_set_pairing_config(agent, &cfg);
 ```
+
+## 基准测试与调优
+
+参照基准 [`tests/test_coturn_bench.cpp`](tests/test_coturn_bench.cpp)：将 stice 客户端对接 [coturn](https://github.com/coturn/coturn) 服务器，覆盖四种模式——`ice-udp` / `ice-tcp`（直连 host 候选）与 `turn-udp` / `turn-tcp`（RFC 6062 中继，仅有中继候选）。每种模式测量单向 RTT（100 × 64B 往返）和窗口化批量 goodput（1200 B 数据包）。
+
+```bash
+# 模式：ice-udp,ice-tcp,turn-udp,turn-tcp（逗号分隔）
+# 参数：host port user pass modes [targetMbps] [udpWindow] [udpPkts] [tcpPkts] [turnTcpWindow]
+./build/Release/test_coturn_bench.exe 192.168.3.223 3478 testuser 123456 turn-udp 0 3
+```
+
+### 默认四模式扫描 (coturn `192.168.3.223:3478`，默认窗口)
+
+| 模式 | RTT/2 平均 | RTT/2 p95 | 吞吐 | 丢包 |
+|------|-----------|-----------|------|------|
+| ice-udp | 0.027 ms | 0.040 ms | 810.1 Mbps | 0 |
+| ice-tcp | 0.019 ms | 0.051 ms | 905.7 Mbps | 0 |
+| turn-udp | 0.488 ms | 0.238 ms | 117.8 Mbps | 2.73% (w=32) |
+| turn-tcp | 0.478 ms | 0.215 ms | 25.7 Mbps | 0 (w=16) |
+
+### 零丢包最优配置
+
+中继路径受 coturn/VM 单路径上限约束（UDP 零丢点约 175 Mbps，TCP 中继稳定约 25–40 Mbps）。在该上限内采用「窗口 ≈ RTT × 目标带宽」即可在 **零丢包** 的前提下维持高吞吐；直连 ICE 路径无需调优。
+
+| 模式 | 最优配置 | RTT/2 平均 | RTT/2 p95 | 吞吐 | 丢包 |
+|------|----------|-----------|-----------|------|------|
+| ice-udp | 直连（默认） | 0.027 ms | 0.040 ms | 810.1 Mbps | 0 |
+| ice-tcp | 直连（默认） | 0.019 ms | 0.051 ms | 905.7 Mbps | 0 |
+| turn-udp | 窗口 = 3 | 0.503 ms | 0.318 ms | 169.9 Mbps | 0/20000 |
+| turn-tcp | 窗口 = 1 | 0.098 ms | 0.193 ms | 39.7 Mbps | 0/40000 |
+
+**调优要点：**
+
+- **窗口由 p95 RTT 推导，而非平均 RTT**：coturn 中继延迟呈突发长尾（max 可达 23–26 ms，出现平均 RTT > p95 RTT），均值推导会导致窗口填不足、假性 stall-break；用 p95 推导可在延迟尖峰时仍维持目标速率。
+- **stall-breaker 重置在途计数并进入 100 ms 冷却**，而非整窗重发，避免误判丢包后超发冲垮中继缓冲。
+- **turn-udp 默认窗口（w32）会超发**，造成 1–4% 丢包；压到 **w=3** 后丢包清零，吞吐反而从 117.8 → 169.9 Mbps。
+- **turn-tcp 窗口越小越稳**（w=1）：吞吐从 25.7 → 39.7 Mbps、全程零丢包；TCP 中继带窗口即可加满又不出错。
+- 稳定性：turn-udp(w=3) 20 分钟近零丢（~0.06%）；turn-tcp(w=1) 长期零丢。均受 coturn 单路径上限约束，与 stice 流控无关。
 
 ## 测试
 

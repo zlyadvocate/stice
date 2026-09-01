@@ -142,12 +142,9 @@ bool Agent::init(const stice_config_t *cfg, stice_agent_t *self) {
 	local_.iceUfrag = generateUfrag();
 	local_.icePwd = generatePwd();
 
-	// Reserve capacity so candidate pointers stored in CandidatePair remain
-	// stable. Without this, vector reallocation on push_back would invalidate
-	// the raw `local`/`remote` pointers held by existing pairs, causing
-	// use-after-free crashes when new candidates arrive after pairs are formed.
-	local_.candidates.reserve(MaxCandidates);
-	remote_.candidates.reserve(MaxCandidates);
+	// candidates is std::deque (see Description): push_back never
+	// invalidates pointers into it, so CandidatePair's raw local/remote
+	// pointers stay valid as trickle candidates arrive after pairing.
 	// Reserve entries_ so turnTcpEntry_ / relayEntry_ raw pointers stay valid
 	// after subsequent push_back calls (formPairs, peer-reflexive, etc.).
 	entries_.reserve(MaxStunEntries);
@@ -267,6 +264,27 @@ int64_t Agent::nextTimestampMs() const {
 			if (e.nextTransmission < t) t = e.nextTransmission;
 		}
 	}
+	// Controlling-side nomination deadline. isNominatable() becomes true at
+	// checkingStartTime_ + max(acceptanceMinWait(local), acceptanceMinWait(remote)),
+	// but nomination is only armed inside onBookkeeping, which only runs when
+	// the poll thread wakes. If all entries have transitioned to
+	// SucceededKeepalive and the peer (controlled agent awaiting
+	// USE-CANDIDATE) goes silent, no inbound traffic wakes the poll — the
+	// next wake would be the keepalive deadline, delaying nomination (and
+	// everything gated on it: DTLS/SCTP handshake, peer "connected") by the
+	// full keepalive period. Expose the deadline so the poll wakes exactly
+	// when the selected pair becomes nominatable.
+	if (mode_ == AgentMode::Controlling && selectedPair_ &&
+	    !selectedPair_->nominated && !selectedPair_->nominationRequested &&
+	    selectedPair_->local && selectedPair_->remote) {
+		auto wait = std::max(acceptanceMinWaitMs(selectedPair_->local->type),
+		                     acceptanceMinWaitMs(selectedPair_->remote->type));
+		auto t_nom = checkingStartTime_ + wait;
+		if (t_nom < t) {
+			hasPending = true;
+			t = t_nom;
+		}
+	}
 	// Account for pending CONNECT retry timer (RFC 6062).
 	if (pendingConnectRetry_ && nextConnectRetry_ < t) {
 		hasPending = true;
@@ -384,7 +402,21 @@ std::vector<net::AddrRecord> Agent::resolveServer(const std::string &host, std::
 void Agent::addLocalCandidate(Candidate c) {
 	if (local_.candidates.size() >= MaxCandidates) return;
 	local_.candidates.push_back(std::move(c));
-	local_.sortCandidates();
+	// Sort only before any pair is formed: stable_sort permutes elements,
+	// which would silently change which candidate an existing pair's
+	// `local` pointer refers to. Pair priority is computed per-pair, so the
+	// list order is irrelevant once checking has started.
+	if (state_ == STICE_STATE_DISCONNECTED || state_ == STICE_STATE_GATHERING)
+		local_.sortCandidates();
+	// Late local candidate (e.g. a second TURN server's allocation succeeded
+	// while checks are already running, or local candidate gathered after the
+	// remote description triggered early pair formation): pair it
+	// incrementally with all remote candidates. formPairs dedups by pointer
+	// identity, so existing pairs are untouched.
+	if (state_ == STICE_STATE_CONNECTING || state_ == STICE_STATE_CONNECTED ||
+	    state_ == STICE_STATE_COMPLETED) {
+		formPairs();
+	}
 }
 
 void Agent::gatherHostCandidates() {
@@ -978,11 +1010,10 @@ int Agent::setRemoteDescription(const char *sdp) {
 	Description d;
 	if (!d.parse(sdp)) return STICE_ERR_INVALID;
 	remote_ = std::move(d);
-	// Re-reserve after move-assigning a new Description, since the reserved
-	// capacity from init() is lost when remote_ is replaced. Without this,
-	// later addRemoteCandidate calls would reallocate remote_.candidates and
-	// invalidate the raw Candidate* pointers stored in CandidatePair::remote.
-	remote_.candidates.reserve(MaxCandidates);
+	// candidates is std::deque: pointers into remote_.candidates stay valid
+	// across later addRemoteCandidate (trickle) push_back calls — no reserve
+	// needed. (Move-assigning a deque also moves its storage, but pairs are
+	// only formed after this point in the same call.)
 	if (mode_ == AgentMode::Unknown) {
 		// We are the controlled agent if we set the remote description first.
 		mode_ = AgentMode::Controlled;
@@ -999,9 +1030,19 @@ int Agent::setRemoteDescription(const char *sdp) {
 			addRemotePassiveTcpCandidate(rc);
 		}
 	}
-	if (gatheringDone_ && state_ == STICE_STATE_GATHERING) {
+	if (state_ == STICE_STATE_GATHERING) {
+		// Trickle ICE / multi-TURN: start connectivity checks as soon as the
+		// remote description is set and at least one local candidate can be
+		// paired. Waiting for gatheringDone lets one dead TURN server's ~10s
+		// allocate timeout stall the entire checking phase (we are likely the
+		// controlling side, so the peer is waiting for our checks and times
+		// out). Candidates gathered later (slow/dead servers) are paired
+		// incrementally in addLocalCandidate.
+		auto pairsBefore = pairs_.size();
 		formPairs();
-		changeState(STICE_STATE_CONNECTING);
+		if (gatheringDone_ || pairs_.size() > pairsBefore) {
+			changeState(STICE_STATE_CONNECTING);
+		}
 	}
 	return STICE_ERR_SUCCESS;
 }
@@ -1033,6 +1074,13 @@ int Agent::addRemoteCandidate(const char *sdp) {
 	if (state_ == STICE_STATE_CONNECTING || state_ == STICE_STATE_CONNECTED ||
 	    state_ == STICE_STATE_COMPLETED) {
 		formPairs();
+	} else if (state_ == STICE_STATE_GATHERING && !local_.candidates.empty()) {
+		// Remote trickle candidate arrived while local gathering is still
+		// in progress (e.g. one TURN server of a multi-server deployment is
+		// slow/dead). Form pairs with the local candidates we already have
+		// and start checking instead of waiting for gathering to complete.
+		formPairs();
+		changeState(STICE_STATE_CONNECTING);
 	}
 	return STICE_ERR_SUCCESS;
 }
@@ -1041,11 +1089,26 @@ int Agent::addTurnServer(const stice_turn_server_t *srv) {
 	std::lock_guard<std::recursive_mutex> lock(mutex_);
 	if (config_.turn_servers_count >= 8) return STICE_ERR_TOO_LARGE;
 	// Append to the config's turn server list. The C API gives us a pointer
-	// to a stice_turn_server_t; we copy it. We assume config_ owns a stable
-	// array; for simplicity we grow a vector kept alongside config_.
+	// to a stice_turn_server_t whose host/username/password are raw pointers
+	// into caller memory (e.g. a temporary IceServer in libdatachannel).
+	// Deep-copy those strings into owned backing storage so they stay valid
+	// after the caller's copy is destroyed (same pattern as addIceServer).
 	// NOTE: config_.turn_servers points into user memory, so we maintain a
 	// separate internal vector.
-	turnServersInternal_.push_back(*srv);
+	stice_turn_server_t ts = *srv;
+	if (srv->host) {
+		turnServerHostStorage_.emplace_back(srv->host);
+		ts.host = turnServerHostStorage_.back().c_str();
+	}
+	if (srv->username) {
+		turnServerUserStorage_.emplace_back(srv->username);
+		ts.username = turnServerUserStorage_.back().c_str();
+	}
+	if (srv->password) {
+		turnServerPassStorage_.emplace_back(srv->password);
+		ts.password = turnServerPassStorage_.back().c_str();
+	}
+	turnServersInternal_.push_back(ts);
 	config_.turn_servers = turnServersInternal_.data();
 	config_.turn_servers_count = static_cast<int>(turnServersInternal_.size());
 	return STICE_ERR_SUCCESS;
@@ -1146,6 +1209,17 @@ int Agent::addIceServer(const char *url, const char *username, const char *passw
 	}
 
 	// Add STUN server entry (for both stun: and turn: URLs).
+	// Deduplicate by host:port — registering several TURN URLs against the
+	// same server (udp/tcp/tls variants) must not create duplicate STUN
+	// entries (each would gather a redundant server-reflexive candidate).
+	for (const auto &s : stunServersInternal_) {
+		if (s.port == port && s.host == hostPart) {
+			STICE_LOG_INFO("Agent: addIceServer %s: STUN server %s:%u already "
+			               "registered, skipping duplicate",
+			               scheme.c_str(), hostPart.c_str(), port);
+			return STICE_ERR_SUCCESS;
+		}
+	}
 	if (stunServersInternal_.size() >= 8) return STICE_ERR_TOO_LARGE;
 	// For turns: (TLS), STUN over UDP is still useful for srflx — the coturn
 	// server listens on UDP 3478 for STUN even if TLS is on TCP 5349. Use the
@@ -1506,14 +1580,19 @@ void Agent::armTransmission(StunEntry &e, int delayMs) {
 void Agent::armKeepalive(StunEntry &e) {
 	e.state = StunEntryState::SucceededKeepalive;
 	auto now = std::chrono::steady_clock::now();
-	// Idle backoff (P1-2): if no application data has flowed for
+	// Idle backoff (P1-2): if application data HAS flowed and none has for
 	// IdleThresholdMs, stretch the consent check interval to
 	// IdleConsentCheckMs (still safely under ConsentTimeoutMs=30s) to
 	// reduce keepalive traffic on quiescent sessions. Active sessions use
 	// the configured keepalive interval (keepalive_udp / keepalive_tcp_relay)
 	// jittered +/- 1s to avoid synchronization storms. Falls back to the
 	// compiled-in defaults if the config value is 0.
-	bool idle = (lastAppDataAt_.time_since_epoch().count() == 0) ||
+	// Note: lastAppDataAt_ == 0 (no app data yet) is NOT idle — that is the
+	// normal state right after a pair succeeds, before the DTLS handshake
+	// starts. Treating it as idle stretched the first post-connect keepalive
+	// to IdleConsentCheckMs (15s), which also stalled the poll thread (see
+	// nextTimestampMs) and delayed nomination by the full 15s.
+	bool idle = lastAppDataAt_.time_since_epoch().count() != 0 &&
 	            (now - lastAppDataAt_ > std::chrono::milliseconds(IdleThresholdMs));
 	int period;
 	if (idle) {
@@ -1722,7 +1801,14 @@ void Agent::sendBindingResponse(const stun::Message &req, const net::AddrRecord 
 	}
 	if (remoteIsRelayed) {
 		for (auto &re : entries_) {
-			if (re.type == StunEntryType::Relay && re.turn) {
+			// Only route through ALLOCATED relays. With multiple TURN servers,
+			// entries_ may contain a dead server's relay (allocate timeout)
+			// before the live one — sendData on an unallocated TURN silently
+			// drops the message, so binding responses (and triggered-check
+			// replies) would never reach the peer, stalling its ICE state in
+			// "checking" until consent timeout.
+			if (re.type == StunEntryType::Relay && re.turn &&
+			    re.turn->state() == turn::AllocState::Allocated) {
 				re.turn->sendData(dst, m.raw.data(), m.raw.size());
 				return;
 			}
@@ -2136,14 +2222,19 @@ void Agent::handleInboundUdp(const char *buf, int len, const net::AddrRecord &sr
 	}
 	if (turn::isChannelData(data, static_cast<std::size_t>(len))) {
 		// ChannelData from a TURN server: find the relay entry and let its
-		// turn::Client decode it.
+		// turn::Client decode it. Source-address discrimination: only frames
+		// from the entry's TURN control endpoint (e.record, e.g. port 3478)
+		// are ChannelData. Raw application data from a relay port / peer
+		// whose first bytes merely look like a ChannelData frame (first byte
+		// 0x40-0x7F and a plausible length field) must fall through to app
+		// delivery instead of being silently dropped as an invalid channel.
 		for (auto &e : entries_) {
-			if (e.type == StunEntryType::Relay && e.turn) {
+			if (e.type == StunEntryType::Relay && e.turn && e.record.isEqual(src, true)) {
 				e.turn->handleInbound(data, static_cast<std::size_t>(len));
 				return;
 			}
 		}
-		return;
+		// Not from a TURN control endpoint: treat as application data below.
 	}
 	// Application data: deliver to the user.
 	// Before delivering, find the candidate pair matching the source address
@@ -2412,8 +2503,13 @@ void Agent::checkGatheringComplete() {
 	gatheringDone_ = true;
 	local_.finished = true;
 	emitGatheringDone();
-	// If remote description was set before gathering finished, transition to CONNECTING.
-	if (!remote_.iceUfrag.empty() && !remote_.icePwd.empty()) {
+	// If remote description was set before gathering finished and early pair
+	// formation (setRemoteDescription/addRemoteCandidate) has not already
+	// moved us to CONNECTING, do it now. The state guard prevents a spurious
+	// CONNECTING transition (and a second formPairs call) when checks are
+	// already running.
+	if (!remote_.iceUfrag.empty() && !remote_.icePwd.empty() &&
+	    state_ == STICE_STATE_GATHERING) {
 		formPairs();
 		changeState(STICE_STATE_CONNECTING);
 	}
@@ -2428,7 +2524,11 @@ void Agent::onUdpReadable() {
 	if (!ls) return;
 	std::lock_guard<std::recursive_mutex> lock(mutex_);
 	STICE_LOG_DEBUG("onUdpReadable: fd=%d", static_cast<int>(sock_.handle()));
-	char buf[1500];
+	// 64KB buffer: TURN-relayed datagrams (e.g. ChannelData carrying large
+	// application payloads) exceed the 1500-byte MTU. A too-small buffer
+	// makes recvfrom fail with EMSGSIZE on Windows (or truncate on Linux),
+	// silently dropping every jumbo application packet.
+	char buf[65536];
 	net::AddrRecord src;
 	while (true) {
 		int n = sock_.recvfrom(buf, sizeof(buf), src);
@@ -3075,6 +3175,30 @@ void Agent::onBookkeeping(int64_t nowMs) {
 			// REGULAR (and REGULAR_STABLE_CHECK for non-TCP pairs):
 			// nominate when nominatable. UDP pairs need no extra wait.
 			should_nominate = isNominatable(selectedPair_);
+		}
+		// Early lock: if every other connectivity check has concluded (no
+		// Check entry is still Pending or not yet armed), no better pair can
+		// appear from the current candidate set — skip the acceptance min
+		// wait and nominate immediately instead of idling for the full
+		// NominationDelayRelayMs. Renomination (draft-thatcher-ice-
+		// renomination) still switches to a higher-priority pair if one
+		// succeeds later (e.g. candidates arriving via trickle), so early
+		// locking never sticks to a suboptimal link.
+		bool tcp_relay_precheck_path =
+		    pairingCfg_.nomination_mode == IceNominationMode::REGULAR_STABLE_CHECK &&
+		    pairIsTcpRelay(selectedPair_);
+		if (!should_nominate && !tcp_relay_precheck_path) {
+			StunEntry *sel = findEntry(selectedPair_);
+			bool all_settled = true;
+			for (const auto &e : entries_) {
+				if (e.type == StunEntryType::Check && &e != sel &&
+				    (e.state == StunEntryState::Pending ||
+				     e.state == StunEntryState::Idle)) {
+					all_settled = false;
+					break;
+				}
+			}
+			if (all_settled) should_nominate = true;
 		}
 		if (should_nominate) {
 			selectedPair_->nominationRequested = true;

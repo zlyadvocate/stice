@@ -22,7 +22,9 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -128,10 +130,20 @@ private:
 	                               const Allocation *exclude) const;
 	Allocation *findPendingByConnId(std::uint32_t connId,
 	                                Allocation::PendingConnect **outPc = nullptr);
+	// Remove an allocation from all lookup maps, release its relay port
+	// (ownership-checked) and erase it. Must be called with stateMutex_ held.
+	void destroyAllocation(Allocation *a);
 
 	// ---- Relay port allocation ----
-	std::uint16_t allocRelayPort();
-	void releaseRelayPort(std::uint16_t port);
+	// Reserve an unused relay port, avoiding both ports already reserved by
+	// live allocations and the per-attempt `avoid` set (ports whose bind
+	// failed earlier in the same Allocate — prevents retrying unbindable
+	// ports). Returns 0 when the range is exhausted.
+	std::uint16_t allocRelayPort(const std::set<std::uint16_t> &avoid);
+	// Release a relay port owned by `owner`. Ownership is checked so a
+	// double release (or a release on behalf of a different allocation)
+	// cannot free a port still in use (ports are unique per allocation).
+	void releaseRelayPort(std::uint16_t port, const Allocation *owner);
 	// Build the relayed AddrRecord advertised to clients, using the server's
 	// externally-reachable IP (falls back to loopback for 0.0.0.0 binds).
 	bool buildRelayedAddr(std::uint16_t port, stice::net::AddrRecord &out) const;
@@ -161,6 +173,38 @@ private:
 	void handleTcpFrame(TcpConn &conn, const unsigned char *data, std::size_t size);
 	void dispatchStun(stice::stun::Message &msg, const stice::net::AddrRecord &src,
 	                  TcpConn *tcpConn, Allocation *alloc);
+
+	// ---- Business dispatch (control / data queues) ----
+	// IO callbacks enqueue work items instead of processing inline. A single
+	// business thread drains two FIFO queues: the control queue (STUN/TURN
+	// control: UDP listener data, TCP accepts, control-connection frames,
+	// closes) is drained first — control has priority over data but keeps
+	// its own arrival order — then the data queue (relay forwarding, RFC
+	// 6062 data pipes, write flushes).
+	struct WorkItem {
+		enum class Kind {
+			UdpData,
+			TcpAccepted,
+			RelayData,
+			TcpConnData,
+			TcpConnClosed,
+			TcpConnWritable,
+		};
+		Kind kind = Kind::UdpData;
+		socket_t sock = STICE_INVALID_SOCKET;
+		stice::net::AddrRecord from;
+		std::vector<unsigned char> data;
+	};
+	void enqueueControl(WorkItem &&item);
+	void enqueueData(WorkItem &&item);
+	void businessLoop();
+	void processItem(const WorkItem &item);
+	void registerTcpConn(socket_t sock, const stice::net::AddrRecord &peer);
+	void handleTcpConnData(socket_t connSock, const unsigned char *data, std::size_t len);
+	// Classify a TCP conn socket by its current isData flag (data pipe vs
+	// control). Takes stateMutex_ briefly; safe because the flag only flips
+	// on the business thread.
+	bool connIsDataSock(socket_t s) const;
 
 	void handleBinding(stice::stun::Message &req, const stice::net::AddrRecord &src,
 	                   TcpConn *tcpConn);
@@ -220,11 +264,11 @@ private:
 	// IO backend (B plan: select + thread pool, D plan: IOCP/epoll).
 	std::unique_ptr<IoBackend> ioBackend_;
 
-	// Shared state mutex. All maps below are accessed from IO worker threads
-	// (potentially concurrently) and must hold this lock. Using
-	// recursive_mutex because handlers may indirectly call back into methods
-	// that also lock (e.g. closeTcpConn from ioOnTcpConnClosed during
-	// handleTcpFrame processing).
+	// Shared state mutex. All allocation/TCP state below is mutated only on
+	// the business thread; IO worker threads take this lock briefly for
+	// read-only lookups (tcpBySock_ classification). recursive_mutex is kept
+	// because business handlers re-enter locking helpers (e.g. closeTcpConn
+	// from handleTcpConnData during frame processing).
 	mutable std::recursive_mutex stateMutex_;
 
 	// Allocations: owned by unique_ptr (stable pointers) in a map keyed by
@@ -233,13 +277,23 @@ private:
 	std::map<socket_t, Allocation *> allocByRelaySock_;
 	std::map<socket_t, Allocation *> allocByControlSock_;
 	std::map<std::uint32_t, Allocation *> pendingByConnId_;
-	std::set<std::uint16_t> usedRelayPorts_;
+	// Relay port reservation with ownership: port -> owning allocation.
+	// A port is released only by its owner, so ports stay unique per
+	// allocation and cannot be double-released.
+	std::map<std::uint16_t, const Allocation *> usedRelayPorts_;
 	std::uint32_t nextConnId_ = 1;
 
 	// TCP connections (control + data). Owned by unique_ptr for stability.
 	std::vector<std::unique_ptr<TcpConn>> tcpConns_;
 	std::map<socket_t, TcpConn *> tcpBySock_;                 // sock -> connection
 	std::map<socket_t, socket_t> dataPipe_;                    // RFC 6062 data pairing
+
+	// Business dispatch queues (see WorkItem). Guarded by queueMutex_.
+	std::deque<WorkItem> controlQueue_;
+	std::deque<WorkItem> dataQueue_;
+	mutable std::mutex queueMutex_;
+	std::condition_variable queueCv_;
+	std::thread businessThread_;
 
 	std::atomic<bool> running_{false};
 };

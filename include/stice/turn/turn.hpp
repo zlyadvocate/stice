@@ -81,6 +81,15 @@ struct TurnConfig {
 	std::string sni;
 	// Requested lifetime (seconds). Server may return a smaller value.
 	std::uint32_t requestedLifetime = 600;
+	// RFC 6062 TCP relayed-transport allocation opt-in. When false (the
+	// default) the allocation is always a UDP relay (REQUESTED-TRANSPORT=17)
+	// even when `transport` is TCP/TLS (RFC 8656: control over TCP, media
+	// relayed over UDP, ChannelData over the control connection). This is
+	// what browsers and coturn interoperate with. When true, a TCP
+	// relayed-transport allocation (REQUESTED-TRANSPORT=6) is used — this
+	// requires the full RFC 6062 CONNECT/CONNECTION-BIND machinery and is
+	// only interoperable between stice agents, not browsers.
+	bool tcpAllocation = false;
 };
 
 // Callbacks the TURN client uses to talk to the agent's network layer.
@@ -117,8 +126,9 @@ public:
 	void init(TurnConfig cfg, TurnSink sink);
 
 	// Kick off the allocation. Calls onAllocated on success.
-	// Uses REQUESTED-TRANSPORT based on cfg_.transport: UDP(17) for UDP/TLS
-	// control connections (RFC 5766), TCP(6) for TCP allocations (RFC 6062).
+	// Uses REQUESTED-TRANSPORT based on cfg_.tcpAllocation: UDP(17) for
+	// RFC 8656 (default, all control transports), TCP(6) for RFC 6062
+	// TCP allocations (opt-in, stice-to-stice only).
 	void allocate();
 
 	// Send application data to `peer` via the relay. Handles the

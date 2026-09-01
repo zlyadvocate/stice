@@ -16,6 +16,7 @@
 
 #include "stice/ice/candidate.hpp"
 
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -29,7 +30,12 @@ struct Description {
 	std::string iceUfrag;
 	std::string icePwd;
 	bool iceLite = false;
-	std::vector<Candidate> candidates;
+	// MUST be std::deque: CandidatePair stores raw pointers into this
+	// container (p->local / p->remote). Trickle ICE appends candidates
+	// after pairs are formed; a vector's push_back reallocates and leaves
+	// every formed pair's pointers dangling. deque push_back never
+	// invalidates references to existing elements.
+	std::deque<Candidate> candidates;
 	bool finished = false; // end-of-candidates seen
 
 	void sortCandidates();

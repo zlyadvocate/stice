@@ -146,7 +146,9 @@ int64_t UDPMux::nextTimestampMs() const {
 }
 
 void UDPMux::onUdpReadable() {
-	char buf[1500];
+	// 64KB buffer: TURN-relayed datagrams (ChannelData with large app
+	// payloads) exceed the 1500-byte MTU; a small buffer drops them.
+	char buf[65536];
 	AddrRecord src;
 	while (true) {
 		int n = sock_.recvfrom(buf, sizeof(buf), src);

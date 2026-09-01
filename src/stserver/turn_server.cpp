@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // Author: zlyadvocate
-// Version: 0.10.0
+// Version: 0.10.1
 // stserver TURN/STUN server implementation.
 //
 // Implements STUN Binding (RFC 5389), TURN Allocate/Refresh/CreatePermission/
@@ -41,6 +41,7 @@
 #include <chrono>
 #include <cstring>
 #include <cstdio>
+#include <thread>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -95,6 +96,19 @@ bool samePeerIP(const AddrRecord &a, const AddrRecord &b) {
 	return addrEqual(reinterpret_cast<const sockaddr *>(&a.addr),
 	                 reinterpret_cast<const sockaddr *>(&b.addr), false);
 }
+
+// Log a failed UDP sendto (relay forward / client delivery path). These
+// failures silently drop TURN data — without logging they are undiagnosable.
+void logSendToFailure(const AddrRecord &dst, int n) {
+	if (n >= 0) return;
+#ifdef _WIN32
+	int err = WSAGetLastError();
+#else
+	int err = errno;
+#endif
+	STICE_LOG_ERROR("stserver: relay sendto to %s failed: %d",
+	                dst.toString().c_str(), err);
+}
 } // namespace
 
 // Member definitions for the helpers declared in turn_server.hpp.
@@ -110,7 +124,11 @@ std::string TurnServer::allocKey(int transport, const stice::net::AddrRecord &cl
 
 TurnServer::TurnServer() = default;
 TurnServer::~TurnServer() {
-	// Stop the IO backend first so no more callbacks fire while we tear down.
+	// Stop the business thread first (it may still be draining queues), then
+	// the IO backend so no more callbacks fire while we tear down.
+	running_ = false;
+	queueCv_.notify_all();
+	if (businessThread_.joinable()) businessThread_.join();
 	if (ioBackend_) {
 		ioBackend_->stop();
 		ioBackend_.reset();
@@ -249,29 +267,57 @@ Allocation *TurnServer::findPendingByConnId(std::uint32_t connId,
 
 // ---- Relay port allocation -------------------------------------------------
 
-std::uint16_t TurnServer::allocRelayPort() {
+std::uint16_t TurnServer::allocRelayPort(const std::set<std::uint16_t> &avoid) {
 	if (relayPortEnd_ < relayPortBegin_) std::swap(relayPortBegin_, relayPortEnd_);
+	std::uint32_t span = std::uint32_t(relayPortEnd_) - relayPortBegin_ + 1;
 	for (int tries = 0; tries < 200; ++tries) {
 		std::uint32_t r = stice::crypto::randomU32();
-		std::uint16_t port = relayPortBegin_ +
-		                     static_cast<std::uint16_t>(r % (std::uint32_t(relayPortEnd_) - relayPortBegin_ + 1));
-		if (usedRelayPorts_.count(port) == 0) {
-			usedRelayPorts_.insert(port);
+		std::uint16_t port = relayPortBegin_ + static_cast<std::uint16_t>(r % span);
+		if (usedRelayPorts_.count(port) == 0 && avoid.count(port) == 0) {
+			usedRelayPorts_[port] = nullptr; // owner recorded on allocation commit
 			return port;
 		}
 	}
-	// Fallback: sequential scan.
-	for (std::uint16_t p = relayPortBegin_; p != relayPortEnd_; ++p) {
-		if (usedRelayPorts_.count(p) == 0) {
-			usedRelayPorts_.insert(p);
-			return p;
+	// Fallback: sequential scan (inclusive of relayPortEnd_).
+	for (std::uint32_t p = relayPortBegin_; p <= relayPortEnd_; ++p) {
+		std::uint16_t port = static_cast<std::uint16_t>(p);
+		if (usedRelayPorts_.count(port) == 0 && avoid.count(port) == 0) {
+			usedRelayPorts_[port] = nullptr;
+			return port;
 		}
 	}
 	return 0;
 }
 
-void TurnServer::releaseRelayPort(std::uint16_t port) {
-	usedRelayPorts_.erase(port);
+void TurnServer::releaseRelayPort(std::uint16_t port, const Allocation *owner) {
+	auto it = usedRelayPorts_.find(port);
+	if (it == usedRelayPorts_.end()) return;
+	// Ownership check: only the owner (or a release before the owner is
+	// committed, owner == nullptr during Allocate) may free the port. This
+	// makes release idempotent and prevents a double release from freeing a
+	// port that has already been handed to a different allocation.
+	if (it->second != nullptr && it->second != owner) {
+		STICE_LOG_WARN("stserver: relay port %u release rejected (owner mismatch)", port);
+		return;
+	}
+	usedRelayPorts_.erase(it);
+}
+
+void TurnServer::destroyAllocation(Allocation *a) {
+	if (!a) return;
+	// Unbind from IO backend first so no further relay data arrives.
+	if (a->transport == SOCK_DGRAM && a->relaySock.valid()) {
+		if (ioBackend_) ioBackend_->removeRelaySocket(a->relaySock.handle());
+		allocByRelaySock_.erase(a->relaySock.handle());
+	}
+	// TURN-over-TCP with UDP relay keeps both a relay socket and a control
+	// socket — clean both lookup entries independently.
+	if (a->controlSock != STICE_INVALID_SOCKET) {
+		allocByControlSock_.erase(a->controlSock);
+	}
+	for (const auto &pc : a->pendingConnects) pendingByConnId_.erase(pc.connId);
+	releaseRelayPort(a->relayPort, a);
+	allocations_.erase(allocKey(a->transport, a->clientAddr));
 }
 
 bool TurnServer::buildRelayedAddr(std::uint16_t port, AddrRecord &out) const {
@@ -314,8 +360,19 @@ int TurnServer::authenticate(const Message &msg, std::string &outUsername) {
 // ---- Response builders / senders ------------------------------------------
 
 void TurnServer::sendUdp(const AddrRecord &dst, const Message &msg) {
-	if (!msg.raw.empty()) udpListener_.sendto(reinterpret_cast<const char *>(msg.raw.data()),
-	                                         msg.raw.size(), dst);
+	if (!msg.raw.empty()) {
+		int n = udpListener_.sendto(reinterpret_cast<const char *>(msg.raw.data()),
+		                            static_cast<int>(msg.raw.size()), dst);
+		if (n < 0) {
+#ifdef _WIN32
+			int err = WSAGetLastError();
+#else
+			int err = errno;
+#endif
+			STICE_LOG_ERROR("stserver: sendto to %s failed: %d",
+			                dst.toString().c_str(), err);
+		}
+	}
 }
 
 void TurnServer::sendTcpRaw(TcpConn &conn, const unsigned char *data, std::size_t size) {
@@ -479,9 +536,19 @@ void TurnServer::dispatchStun(Message &msg, const AddrRecord &src, TcpConn *tcpC
 	case Method::Allocate:
 		if (msg.cls == Class::Request) {
 			if (alloc) {
-				if (tcpConn) sendErrorResponseTcp(*tcpConn, msg, StunErrorAllocationMismatch);
-				else sendErrorResponseUdp(src, msg, StunErrorAllocationMismatch);
-				return;
+				if (alloc->expiryMs <= nowMs()) {
+					// Expired but not yet reaped: replace it, cleaning the
+					// old allocation (relay socket, ports, lookups) fully
+					// before creating the new one.
+					destroyAllocation(alloc);
+					alloc = nullptr;
+				} else {
+					if (tcpConn)
+						sendErrorResponseTcp(*tcpConn, msg, StunErrorAllocationMismatch);
+					else
+						sendErrorResponseUdp(src, msg, StunErrorAllocationMismatch);
+					return;
+				}
 			}
 			std::string user;
 			int code = authenticate(msg, user);
@@ -627,7 +694,7 @@ void TurnServer::handleAllocate(Message &req, const AddrRecord &src, TcpConn *tc
 	if (proto == 6) {
 		// RFC 6062 TCP allocation: no relay socket, allocate a unique relayed
 		// port from the range and advertise the server's TCP relay address.
-		std::uint16_t port = allocRelayPort();
+		std::uint16_t port = allocRelayPort({});
 		if (port == 0) {
 			if (tcpConn) sendErrorResponseTcp(*tcpConn, req, StunErrorInsufficientCapacity);
 			else sendErrorResponseUdp(src, req, StunErrorInsufficientCapacity);
@@ -638,7 +705,11 @@ void TurnServer::handleAllocate(Message &req, const AddrRecord &src, TcpConn *tc
 		a->controlSock = tcpConn ? tcpConn->sock : STICE_INVALID_SOCKET;
 	} else {
 		// UDP allocation: bind a relay socket on a port from the range.
-		std::uint16_t port = allocRelayPort();
+		// Ports whose bind fails are remembered in `failed` and excluded from
+		// subsequent picks, so the retry loop always advances to a fresh
+		// port instead of spinning on the same (unbindable) one.
+		std::set<std::uint16_t> failed;
+		std::uint16_t port = allocRelayPort(failed);
 		if (port == 0) {
 			if (tcpConn) sendErrorResponseTcp(*tcpConn, req, StunErrorInsufficientCapacity);
 			else sendErrorResponseUdp(src, req, StunErrorInsufficientCapacity);
@@ -651,8 +722,9 @@ void TurnServer::handleAllocate(Message &req, const AddrRecord &src, TcpConn *tc
 		UdpSocket rs = UdpSocket::create(rcfg);
 		int tries = 0;
 		while (!rs.valid() && tries < 50) {
-			releaseRelayPort(port);
-			port = allocRelayPort();
+			failed.insert(port);
+			releaseRelayPort(port, nullptr);
+			port = allocRelayPort(failed);
 			if (port == 0) break;
 			rcfg.portBegin = port;
 			rcfg.portEnd = port;
@@ -660,15 +732,22 @@ void TurnServer::handleAllocate(Message &req, const AddrRecord &src, TcpConn *tc
 			++tries;
 		}
 		if (!rs.valid()) {
-			releaseRelayPort(port);
+			if (port != 0) releaseRelayPort(port, nullptr);
 			if (tcpConn) sendErrorResponseTcp(*tcpConn, req, StunErrorInsufficientCapacity);
 			else sendErrorResponseUdp(src, req, StunErrorInsufficientCapacity);
 			return;
 		}
-		// Use the actual bound port (may differ if the requested was taken).
+		// Use the actual bound port. With portBegin==portEnd the bound port
+		// equals the reserved one; defensively move the reservation if it
+		// differs so release stays exact.
+		std::uint16_t reserved = port;
 		AddrRecord bound;
 		if (rs.boundAddr(bound)) {
 			port = addrPort(reinterpret_cast<sockaddr *>(&bound.addr));
+		}
+		if (port != reserved) {
+			releaseRelayPort(reserved, nullptr);
+			usedRelayPorts_[port] = nullptr;
 		}
 		a->relayPort = port;
 		a->relaySock = std::move(rs);
@@ -689,6 +768,9 @@ void TurnServer::handleAllocate(Message &req, const AddrRecord &src, TcpConn *tc
 	// Register in lookup maps before sending.
 	std::string key = allocKey(a->transport, src);
 	Allocation *raw = a.get();
+	// Commit relay-port ownership: the reservation held owner=nullptr during
+	// Allocate; from here only this allocation may release the port.
+	usedRelayPorts_[a->relayPort] = raw;
 	if (a->transport == SOCK_DGRAM) {
 		allocByRelaySock_[a->relaySock.handle()] = raw;
 		// Register the relay socket with the IO backend so it starts
@@ -729,18 +811,7 @@ void TurnServer::handleRefresh(Message &req, const AddrRecord &src, TcpConn *tcp
 	if (lifetime == 0) {
 		STICE_LOG_INFO("stserver: REFRESH lifetime=0 deleting allocation %s",
 		               alloc->clientAddr.toString().c_str());
-		std::string key = allocKey(alloc->transport, alloc->clientAddr);
-		auto a = allocations_.find(key);
-		if (a != allocations_.end()) {
-			if (a->second->transport == SOCK_DGRAM) {
-				if (ioBackend_) ioBackend_->removeRelaySocket(a->second->relaySock.handle());
-				allocByRelaySock_.erase(a->second->relaySock.handle());
-			} else {
-				allocByControlSock_.erase(a->second->controlSock);
-			}
-			releaseRelayPort(a->second->relayPort);
-			allocations_.erase(a);
-		}
+		destroyAllocation(alloc);
 	}
 }
 
@@ -853,8 +924,9 @@ void TurnServer::handleSendIndication(Message &req, Allocation *alloc) {
 	}
 	if (!permitted) return;
 	if (alloc->transport == SOCK_DGRAM && alloc->relaySock.valid())
-		alloc->relaySock.sendto(reinterpret_cast<const char *>(dataAttr->value.data()),
-		                        dataAttr->value.size(), peer);
+		logSendToFailure(peer, alloc->relaySock.sendto(
+		                     reinterpret_cast<const char *>(dataAttr->value.data()),
+		                     static_cast<int>(dataAttr->value.size()), peer));
 }
 
 // ---- TURN ChannelData frame (client -> peer) -----------------------------
@@ -872,7 +944,9 @@ void TurnServer::handleChannelDataFrame(const unsigned char *data, std::size_t s
 	}
 	if (!ch) return;
 	if (alloc->transport == SOCK_DGRAM && alloc->relaySock.valid())
-		alloc->relaySock.sendto(reinterpret_cast<const char *>(outData), n, ch->peer);
+		logSendToFailure(ch->peer, alloc->relaySock.sendto(
+		                     reinterpret_cast<const char *>(outData),
+		                     static_cast<int>(n), ch->peer));
 }
 
 // ---- Relay data forwarding (peer -> client) ------------------------------
@@ -888,8 +962,9 @@ void TurnServer::forwardToClient(Allocation &alloc, const AddrRecord &peer,
 					auto it = tcpBySock_.find(alloc.controlSock);
 					if (it != tcpBySock_.end()) sendTcpRaw(*it->second, frame.data(), frame.size());
 				} else {
-					udpListener_.sendto(reinterpret_cast<const char *>(frame.data()),
-					                    frame.size(), alloc.clientAddr);
+					logSendToFailure(alloc.clientAddr, udpListener_.sendto(
+					                     reinterpret_cast<const char *>(frame.data()),
+					                     static_cast<int>(frame.size()), alloc.clientAddr));
 				}
 			}
 			return;
@@ -1052,16 +1127,8 @@ void TurnServer::closeTcpConn(TcpConn *conn) {
 	}
 	if (a) {
 		std::string key = allocKey(a->transport, a->clientAddr);
-		if (a->transport == SOCK_DGRAM && a->relaySock.valid()) {
-			if (ioBackend_) ioBackend_->removeRelaySocket(a->relaySock.handle());
-			allocByRelaySock_.erase(a->relaySock.handle());
-		}
-		allocByControlSock_.erase(s);
-		releaseRelayPort(a->relayPort);
-		// Remove any pending connects anchored here.
-		for (const auto &pc : a->pendingConnects)
-			pendingByConnId_.erase(pc.connId);
-		allocations_.erase(key);
+		// Full cleanup: IO unbind, lookup maps, relay port, map entry.
+		destroyAllocation(a);
 		STICE_LOG_INFO("stserver: allocation deleted (TCP control closed) %s", key.c_str());
 	}
 	// Remove from RFC 6062 data pipe (both directions).
@@ -1105,17 +1172,11 @@ void TurnServer::expireStale() {
 		pc.erase(std::remove_if(pc.begin(), pc.end(),
 		                        [now](const Allocation::PendingConnect &p) { return p.expiryMs <= now; }),
 		         pc.end());
-		// Expire the allocation itself.
+		// Expire the allocation itself. Advance the iterator first:
+		// destroyAllocation() erases the current map node.
 		if (a->expiryMs <= now) {
-			if (a->transport == SOCK_DGRAM && a->relaySock.valid()) {
-				if (ioBackend_) ioBackend_->removeRelaySocket(a->relaySock.handle());
-				allocByRelaySock_.erase(a->relaySock.handle());
-			} else {
-				allocByControlSock_.erase(a->controlSock);
-			}
-			releaseRelayPort(a->relayPort);
-			for (const auto &x : a->pendingConnects) pendingByConnId_.erase(x.connId);
-			it = allocations_.erase(it);
+			++it;
+			destroyAllocation(a);
 		} else {
 			++it;
 		}
@@ -1123,17 +1184,159 @@ void TurnServer::expireStale() {
 }
 
 // ---- IoBackendOwner callbacks --------------------------------------------
-// These are called from IO worker threads. Each acquires stateMutex_ to
-// serialize access to shared state (allocations_, tcpConns_, etc.).
+// These are called from IO worker threads. They never touch shared state
+// directly: each event is copied into a WorkItem and pushed onto the
+// control or data queue. A single business thread (businessLoop) drains
+// the control queue first — control (STUN/TURN) is prioritized over data
+// but keeps its own arrival order (FIFO) — then the data queue (relay
+// forwarding, RFC 6062 data pipes, write flushes).
 
 void TurnServer::ioOnUdpData(const unsigned char *data, std::size_t len,
                               const stice::net::AddrRecord &from) {
-	std::lock_guard<std::recursive_mutex> lk(stateMutex_);
-	handleUdpPacket(data, len, from);
+	WorkItem it;
+	it.kind = WorkItem::Kind::UdpData;
+	it.from = from;
+	it.data.assign(data, data + len);
+	enqueueControl(std::move(it));
 }
 
 void TurnServer::ioOnTcpAccepted(socket_t sock, const stice::net::AddrRecord &peer) {
+	WorkItem it;
+	it.kind = WorkItem::Kind::TcpAccepted;
+	it.sock = sock;
+	it.from = peer;
+	enqueueControl(std::move(it));
+}
+
+void TurnServer::ioOnRelayData(socket_t relaySock, const unsigned char *data,
+                                std::size_t len, const stice::net::AddrRecord &from) {
+	WorkItem it;
+	it.kind = WorkItem::Kind::RelayData;
+	it.sock = relaySock;
+	it.from = from;
+	it.data.assign(data, data + len);
+	enqueueData(std::move(it));
+}
+
+void TurnServer::ioOnTcpConnData(socket_t connSock, const unsigned char *data,
+                                  std::size_t len) {
+	WorkItem it;
+	it.kind = WorkItem::Kind::TcpConnData;
+	it.sock = connSock;
+	it.data.assign(data, data + len);
+	// Data pipes (RFC 6062, post CONNECTION-BIND) carry bulk peer data and
+	// go to the data queue; control connections carry STUN/TURN frames and
+	// go to the (prioritized, order-preserving) control queue.
+	if (connIsDataSock(connSock))
+		enqueueData(std::move(it));
+	else
+		enqueueControl(std::move(it));
+}
+
+void TurnServer::ioOnTcpConnClosed(socket_t connSock) {
+	WorkItem it;
+	it.kind = WorkItem::Kind::TcpConnClosed;
+	it.sock = connSock;
+	enqueueControl(std::move(it));
+}
+
+void TurnServer::ioOnTcpConnWritable(socket_t connSock) {
+	WorkItem it;
+	it.kind = WorkItem::Kind::TcpConnWritable;
+	it.sock = connSock;
+	enqueueData(std::move(it));
+}
+
+void TurnServer::ioOnTimerTick() {
+	// No-op: the business thread drives expireStale() unconditionally on
+	// its own 50ms schedule. (Previously only the select backend fired this
+	// callback, so epoll/IOCP builds never expired allocations.)
+}
+
+// ---- Business dispatch ----------------------------------------------------
+
+void TurnServer::enqueueControl(WorkItem &&item) {
+	{
+		std::lock_guard<std::mutex> lk(queueMutex_);
+		controlQueue_.push_back(std::move(item));
+	}
+	queueCv_.notify_one();
+}
+
+void TurnServer::enqueueData(WorkItem &&item) {
+	{
+		std::lock_guard<std::mutex> lk(queueMutex_);
+		dataQueue_.push_back(std::move(item));
+	}
+	queueCv_.notify_one();
+}
+
+void TurnServer::businessLoop() {
+	std::deque<WorkItem> controlBatch, dataBatch;
+	std::int64_t lastTickMs = nowMs();
+	while (running_) {
+		{
+			std::unique_lock<std::mutex> lk(queueMutex_);
+			queueCv_.wait_for(lk, std::chrono::milliseconds(50), [&] {
+				return !controlQueue_.empty() || !dataQueue_.empty() || !running_;
+			});
+			// Swap queues out so the lock is only held for the swap, not
+			// while items are processed.
+			controlBatch.swap(controlQueue_);
+			dataBatch.swap(dataQueue_);
+		}
+		// Control first (FIFO within control), then data (FIFO within data).
+		while (!controlBatch.empty()) {
+			processItem(controlBatch.front());
+			controlBatch.pop_front();
+		}
+		while (!dataBatch.empty()) {
+			processItem(dataBatch.front());
+			dataBatch.pop_front();
+		}
+		// Unconditional timer drive (all IO backends): expiry, nonce refresh.
+		std::int64_t now = nowMs();
+		if (now - lastTickMs >= 50) {
+			lastTickMs = now;
+			std::lock_guard<std::recursive_mutex> lk(stateMutex_);
+			expireStale();
+		}
+	}
+}
+
+void TurnServer::processItem(const WorkItem &item) {
 	std::lock_guard<std::recursive_mutex> lk(stateMutex_);
+	switch (item.kind) {
+	case WorkItem::Kind::UdpData:
+		handleUdpPacket(item.data.data(), item.data.size(), item.from);
+		break;
+	case WorkItem::Kind::TcpAccepted:
+		registerTcpConn(item.sock, item.from);
+		break;
+	case WorkItem::Kind::RelayData: {
+		Allocation *a = findAllocByRelaySock(item.sock);
+		if (a) forwardToClient(*a, item.from, item.data.data(), item.data.size());
+		break;
+	}
+	case WorkItem::Kind::TcpConnData:
+		handleTcpConnData(item.sock, item.data.data(), item.data.size());
+		break;
+	case WorkItem::Kind::TcpConnClosed: {
+		auto it = tcpBySock_.find(item.sock);
+		if (it != tcpBySock_.end()) closeTcpConn(it->second);
+		break;
+	}
+	case WorkItem::Kind::TcpConnWritable: {
+		auto it = tcpBySock_.find(item.sock);
+		if (it != tcpBySock_.end()) {
+			if (!flushTcp(*it->second)) closeTcpConn(it->second);
+		}
+		break;
+	}
+	}
+}
+
+void TurnServer::registerTcpConn(socket_t sock, const stice::net::AddrRecord &peer) {
 	auto conn = std::make_unique<TcpConn>();
 	conn->sock = sock;
 	conn->peerAddr = peer;
@@ -1145,31 +1348,21 @@ void TurnServer::ioOnTcpAccepted(socket_t sock, const stice::net::AddrRecord &pe
 	STICE_LOG_INFO("stserver: TCP accept from %s", raw->peerAddr.toString().c_str());
 }
 
-void TurnServer::ioOnRelayData(socket_t relaySock, const unsigned char *data,
-                                std::size_t len, const stice::net::AddrRecord &from) {
-	std::lock_guard<std::recursive_mutex> lk(stateMutex_);
-	Allocation *a = findAllocByRelaySock(relaySock);
-	if (a) forwardToClient(*a, from, data, len);
-}
-
-void TurnServer::ioOnTcpConnData(socket_t connSock, const unsigned char *data,
-                                  std::size_t len) {
-	std::lock_guard<std::recursive_mutex> lk(stateMutex_);
+void TurnServer::handleTcpConnData(socket_t connSock, const unsigned char *data,
+                                    std::size_t len) {
 	auto it = tcpBySock_.find(connSock);
 	if (it == tcpBySock_.end()) {
-		STICE_LOG_DEBUG("stserver: ioOnTcpConnData: unknown sock=%llu len=%zu", (unsigned long long)connSock, len);
+		STICE_LOG_DEBUG("stserver: conn data for unknown sock=%llu len=%zu",
+		                (unsigned long long)connSock, len);
 		return;
 	}
 	TcpConn *conn = it->second;
 	if (conn->isData) {
 		// Raw RFC 6062 data pipe: forward bytes to the paired socket.
-		STICE_LOG_DEBUG("stserver: data pipe sock=%llu len=%zu -> forwarding", (unsigned long long)connSock, len);
 		auto pit = dataPipe_.find(connSock);
 		if (pit != dataPipe_.end()) {
 			auto tit = tcpBySock_.find(pit->second);
 			if (tit != tcpBySock_.end()) sendTcpRaw(*tit->second, data, len);
-		} else {
-			STICE_LOG_DEBUG("stserver: data pipe sock=%llu no peer in dataPipe_", (unsigned long long)connSock);
 		}
 		return;
 	}
@@ -1186,26 +1379,10 @@ void TurnServer::ioOnTcpConnData(socket_t connSock, const unsigned char *data,
 	}
 }
 
-void TurnServer::ioOnTcpConnClosed(socket_t connSock) {
+bool TurnServer::connIsDataSock(socket_t s) const {
 	std::lock_guard<std::recursive_mutex> lk(stateMutex_);
-	auto it = tcpBySock_.find(connSock);
-	if (it == tcpBySock_.end()) return; // already cleaned up
-	closeTcpConn(it->second);
-}
-
-void TurnServer::ioOnTcpConnWritable(socket_t connSock) {
-	std::lock_guard<std::recursive_mutex> lk(stateMutex_);
-	auto it = tcpBySock_.find(connSock);
-	if (it == tcpBySock_.end()) return;
-	TcpConn *conn = it->second;
-	if (!flushTcp(*conn)) {
-		closeTcpConn(conn);
-	}
-}
-
-void TurnServer::ioOnTimerTick() {
-	std::lock_guard<std::recursive_mutex> lk(stateMutex_);
-	expireStale();
+	auto it = tcpBySock_.find(s);
+	return it != tcpBySock_.end() && it->second->isData;
 }
 
 // ---- Event loop -----------------------------------------------------------
@@ -1216,16 +1393,21 @@ void TurnServer::run() {
 		STICE_LOG_ERROR("stserver: no IO backend, cannot run");
 		return;
 	}
+	// Start the business thread before the IO backend so no callback can
+	// enqueue before the consumer is running.
+	businessThread_ = std::thread([this] { businessLoop(); });
 	ioBackend_->start();
-	STICE_LOG_INFO("stserver: running (IO backend started)");
+	STICE_LOG_INFO("stserver: running (IO backend + business thread started)");
 	// Block until stop() is called (sets running_ = false). Poll every 200ms
 	// since stop() just flips an atomic — no condition variable to keep the
 	// signal handler trivially safe.
 	while (running_) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(200));
 	}
-	// Join all IO worker threads.
+	// Stop accepting new events, then join the business thread.
 	ioBackend_->stop();
+	queueCv_.notify_all();
+	if (businessThread_.joinable()) businessThread_.join();
 	STICE_LOG_INFO("stserver: stopped");
 }
 

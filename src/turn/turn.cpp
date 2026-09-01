@@ -54,9 +54,11 @@ void Client::allocate() {
 
 	// RFC 5766 §14.7: REQUESTED-TRANSPORT=UDP(17) for UDP relay.
 	// RFC 6062 §3.2: REQUESTED-TRANSPORT=TCP(6) for TCP allocation.
-	// TCP allocation is used when the control connection itself is TCP and
-	// the caller wants TCP relayed transport (active+passive dual mode).
-	isTcpAllocation_ = (cfg_.transport == TurnTransport::TCP);
+	// RFC 8656 (default): the relay is UDP even when the control connection
+	// to the TURN server is carried over TCP/TLS. This is what browsers and
+	// coturn interoperate with. RFC 6062 TCP allocation is opt-in and only
+	// interoperable between stice agents.
+	isTcpAllocation_ = cfg_.tcpAllocation;
 	std::uint8_t proto = isTcpAllocation_ ? 6 : 17;
 
 	stun::Message m;

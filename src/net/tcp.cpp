@@ -56,8 +56,14 @@ void TcpTransport::close() {
 		sock_ = STICE_INVALID_SOCKET;
 	}
 	state_ = TcpState::Disconnected;
-	sendQueue_.clear();
-	recvBuf_.clear();
+	{
+		std::lock_guard<std::mutex> lk(sendMtx_);
+		sendQueue_.clear();
+	}
+	{
+		std::lock_guard<std::mutex> lk(recvMtx_);
+		recvBuf_.clear();
+	}
 	hasConnectDeadline_ = false;
 }
 
@@ -100,6 +106,14 @@ bool TcpTransport::beginConnect(const AddrRecord &dst, const std::string &sni, b
 #endif
 	int on = 1;
 	setsockopt(sock_, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char *>(&on), sizeof(on));
+	// 512 KiB socket buffers. The OS default (64 KiB on Windows) is too small
+	// for relayed bulk transfers: a burst larger than the send buffer forces
+	// the kernel queue to overflow, dropping segments and triggering
+	// exponential RTO backoff across the multi-hop relay path (measured:
+	// 11 Mbps with 10 s stalls vs 344 Mbps with the buffer raised).
+	int tcpBuf = 512 * 1024;
+	setsockopt(sock_, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char *>(&tcpBuf), sizeof(tcpBuf));
+	setsockopt(sock_, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char *>(&tcpBuf), sizeof(tcpBuf));
 
 	int r = ::connect(sock_, reinterpret_cast<const struct sockaddr *>(&dst.addr), dst.len);
 	if (r == 0) {
@@ -138,6 +152,10 @@ bool TcpTransport::attach(socket_t fd, const AddrRecord &peerAddr) {
 #endif
 	int on = 1;
 	setsockopt(sock_, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char *>(&on), sizeof(on));
+	// Match beginConnect's buffer sizing on accepted sockets.
+	int tcpBuf = 512 * 1024;
+	setsockopt(sock_, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char *>(&tcpBuf), sizeof(tcpBuf));
+	setsockopt(sock_, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char *>(&tcpBuf), sizeof(tcpBuf));
 	state_ = TcpState::Connected;
 	useTls_ = false;
 	STICE_LOG_DEBUG("TCP transport attached to accepted fd (peer=%s)",
@@ -231,7 +249,10 @@ short TcpTransport::onReadable() {
 				return 0;
 			}
 		}
-		recvBuf_.insert(recvBuf_.end(), tmp, tmp + n);
+		{
+			std::lock_guard<std::mutex> lk(recvMtx_);
+			recvBuf_.insert(recvBuf_.end(), tmp, tmp + n);
+		}
 		// Keep looping until EWOULDBLOCK to drain the socket.
 		if (n < static_cast<int>(sizeof(tmp))) return POLLIN;
 	}
@@ -269,6 +290,7 @@ short TcpTransport::driveTlsHandshake() {
 }
 
 short TcpTransport::flushSends() {
+	std::lock_guard<std::mutex> lk(sendMtx_);
 	if (sendQueue_.empty()) return POLLIN;
 	while (!sendQueue_.empty()) {
 		int n;
@@ -307,22 +329,26 @@ short TcpTransport::flushSends() {
 bool TcpTransport::send(const char *data, std::size_t size) {
 	if (state_ == TcpState::Failed || state_ == TcpState::Disconnected)
 		return false;
-	if (framing_ == FramingMode::RFC4571) {
-		// RFC 4571: 2-byte big-endian length prefix.
-		unsigned char hdr[2];
-		hdr[0] = static_cast<unsigned char>(size >> 8);
-		hdr[1] = static_cast<unsigned char>(size & 0xFF);
-		sendQueue_.insert(sendQueue_.end(), hdr, hdr + 2);
+	{
+		std::lock_guard<std::mutex> lk(sendMtx_);
+		if (framing_ == FramingMode::RFC4571) {
+			// RFC 4571: 2-byte big-endian length prefix.
+			unsigned char hdr[2];
+			hdr[0] = static_cast<unsigned char>(size >> 8);
+			hdr[1] = static_cast<unsigned char>(size & 0xFF);
+			sendQueue_.insert(sendQueue_.end(), hdr, hdr + 2);
+		}
+		sendQueue_.insert(sendQueue_.end(), reinterpret_cast<const unsigned char *>(data),
+		                  reinterpret_cast<const unsigned char *>(data) + size);
 	}
-	sendQueue_.insert(sendQueue_.end(), reinterpret_cast<const unsigned char *>(data),
-	                  reinterpret_cast<const unsigned char *>(data) + size);
-	// Try an immediate flush.
+	// Try an immediate flush (takes sendMtx_ itself).
 	if (state_ == TcpState::Connected)
 		flushSends();
 	return true;
 }
 
 int TcpTransport::recv(char *out, std::size_t outSize, AddrRecord & /*peer*/) {
+	std::lock_guard<std::mutex> lk(recvMtx_);
 	if (framing_ == FramingMode::Raw) {
 		// Raw mode: return whatever bytes are available (no framing).
 		if (recvBuf_.empty()) return 0;
