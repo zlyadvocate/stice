@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <sstream>
@@ -60,6 +61,19 @@ Agent::~Agent() {
 	// may be mid-DNS-resolution (no mutex held) when ~Agent runs; joining
 	// ensures it completes before members are destroyed.
 	if (gatherWorker_.joinable()) gatherWorker_.join();
+	// Detach from the PollRegistry FIRST and sync so the poll thread has
+	// finished its current iteration and will never touch this Agent again.
+	// The poll thread reads our members (hasTurnTcp()/turnTcpSocket()/
+	// turnTcpDesiredEvents()/hasTcp()/tcpSocket(), entries_, ...) WITHOUT
+	// Agent::mutex_ while building its pollfd set and dispatching, so no
+	// member mutation below may start before it stops. Running
+	// cancelAllEntries() first raced turnTcpTransport_.reset() (store null
+	// + delete) against the poll thread's unlocked reads, dereferencing a
+	// freed TcpTransport and crashing the process on teardown bursts.
+	if (pollReg_) {
+		pollReg_->remove(this);
+		pollReg_->sync();
+	}
 	cancelAllEntries();
 	if (lifetime_) lifetime_->shutdown();
 	if (mux_) {
@@ -72,12 +86,9 @@ Agent::~Agent() {
 			tcpMux_->removeAgent(local_.iceUfrag);
 		}
 	}
-	// Per-agent PollRegistry: remove self, sync to ensure the poll thread
-	// is not holding a raw pointer to this Agent, then release (delete)
-	// the instance which joins the background thread.
+	// All members are torn down; now release (delete) the PollRegistry,
+	// which joins the background thread.
 	if (pollReg_) {
-		pollReg_->remove(this);
-		pollReg_->sync();
 		pollReg_->release();
 		pollReg_ = nullptr;
 	}
@@ -138,6 +149,32 @@ bool Agent::init(const stice_config_t *cfg, stice_agent_t *self) {
 		                               p ? p : static_cast<uint16_t>(3478)});
 		config_.stun_server_host = nullptr; // prevent use-after-free in gatherCandidatesInternal
 	}
+	// Deep-copy the TURN server array into owned stable storage. The C API
+	// config_.turn_servers points into caller memory (e.g. a temporary array
+	// in the libjuice compat layer) that may dangle after init() returns.
+	// Copying into turnServersInternal_ mirrors addTurnServer's pattern so
+	// host/username/password stay valid for the Agent's lifetime.
+	if (config_.turn_servers && config_.turn_servers_count > 0) {
+		turnServersInternal_.reserve(config_.turn_servers_count);
+		for (int i = 0; i < config_.turn_servers_count; ++i) {
+			const stice_turn_server_t &srv = config_.turn_servers[i];
+			stice_turn_server_t ts = srv;
+			if (srv.host) {
+				turnServerHostStorage_.emplace_back(srv.host);
+				ts.host = turnServerHostStorage_.back().c_str();
+			}
+			if (srv.username) {
+				turnServerUserStorage_.emplace_back(srv.username);
+				ts.username = turnServerUserStorage_.back().c_str();
+			}
+			if (srv.password) {
+				turnServerPassStorage_.emplace_back(srv.password);
+				ts.password = turnServerPassStorage_.back().c_str();
+			}
+			turnServersInternal_.push_back(ts);
+		}
+		config_.turn_servers = turnServersInternal_.data();
+	}
 	// Generate local ufrag/pwd unless caller overrides via set_local_ice_attributes.
 	local_.iceUfrag = generateUfrag();
 	local_.icePwd = generatePwd();
@@ -183,6 +220,9 @@ int Agent::setUDPMux(net::UDPMux *mux) {
 	if (sock_.valid()) {
 		if (pollReg_) {
 			pollReg_->remove(this);
+			// Sync before release: ensure the poll thread has finished its
+			// current iteration on this Agent before sock_.close() below.
+			pollReg_->sync();
 			pollReg_->release();
 			pollReg_ = nullptr;
 		}
@@ -285,10 +325,45 @@ int64_t Agent::nextTimestampMs() const {
 			t = t_nom;
 		}
 	}
+	// Account for in-progress TCP connects. A black-holed connect (e.g.
+	// unroutable TURN-over-TCP server) never fires a poll event, so without
+	// exposing the connect deadline here the poll loop would sleep until its
+	// 60 s clamp and the bookkeeping pass (which detects the timeout) would
+	// run far too late, hanging gathering. Wake exactly at the deadline.
+	if (tcpTransport_ && (tcpTransport_->state() == net::TcpState::Connecting ||
+	                      tcpTransport_->state() == net::TcpState::TlsHandshaking)) {
+		int64_t dl = tcpTransport_->connectDeadlineMs(); // -1 = none (atomic)
+		if (dl > 0) {
+			auto dlTp = std::chrono::steady_clock::time_point{std::chrono::milliseconds(dl)};
+			if (!hasPending || dlTp < t) {
+				hasPending = true;
+				t = dlTp;
+			}
+		}
+	}
+	if (turnTcpTransport_ && (turnTcpTransport_->state() == net::TcpState::Connecting ||
+	                          turnTcpTransport_->state() == net::TcpState::TlsHandshaking)) {
+		int64_t dl = turnTcpTransport_->connectDeadlineMs(); // -1 = none (atomic)
+		if (dl > 0) {
+			auto dlTp = std::chrono::steady_clock::time_point{std::chrono::milliseconds(dl)};
+			if (!hasPending || dlTp < t) {
+				hasPending = true;
+				t = dlTp;
+			}
+		}
+	}
 	// Account for pending CONNECT retry timer (RFC 6062).
 	if (pendingConnectRetry_ && nextConnectRetry_ < t) {
 		hasPending = true;
 		t = nextConnectRetry_;
+	}
+	// Soft gathering deadline: if srflx/relay entries stay pending, poll MUST
+	// wake at gatherStartedAt_ + GatherTimeoutMs so onBookkeeping can force
+	// gathering complete. Otherwise a stuck srflx entry could let the poll
+	// sleep past the deadline and the gathering would never complete.
+	if (!gatheringDone_ && gatherStartedAt_.time_since_epoch().count() != 0) {
+		auto dlTp = gatherStartedAt_ + std::chrono::milliseconds(GatherTimeoutMs);
+		if (!hasPending || dlTp < t) { hasPending = true; t = dlTp; }
 	}
 	if (!hasPending) return 0; // 0 = no pending timer (per PollParticipant contract)
 	return toMs(t);            // absolute; if <= nowMs, computeTimeoutMs clamps to 0
@@ -420,7 +495,17 @@ void Agent::addLocalCandidate(Candidate c) {
 }
 
 void Agent::gatherHostCandidates() {
-	auto addrs = localAddrsUdp(AF_UNSPEC);
+	// UDP gathering disabled (TCP-only ICE testing, RFC 6544): emit no UDP
+	// host candidate at all. A local UDP candidate is the only way a UDP
+	// pair can form (formPairs rejects cross-transport pairs), so skipping
+	// gathering here deterministically removes the UDP path. TCP passive
+	// candidates below are still gathered when a TCPMux is bound.
+	std::vector<net::AddrRecord> addrs;
+	if (config_.disable_udp_gathering) {
+		STICE_LOG_INFO("Agent: UDP gathering disabled, skipping UDP host candidates");
+	} else {
+		addrs = localAddrsUdp(AF_UNSPEC);
+	}
 
 	// Apply interface IP whitelist/blacklist filtering (pion #779).
 	// Whitelist takes precedence: if set, only listed IPs are kept.
@@ -612,10 +697,22 @@ void Agent::createRelayEntry(const stice_turn_server_t &srv, int serverIndex,
 	tc.username = srv.username ? srv.username : "";
 	tc.password = srv.password ? srv.password : "";
 	tc.transport = turn::TurnTransport::UDP;
-	if (srv.transport == STICE_TURN_TRANSPORT_TCP) tc.transport = turn::TurnTransport::TCP;
-	else if (srv.transport == STICE_TURN_TRANSPORT_TLS) {
-		tc.transport = turn::TurnTransport::TLS;
-		tc.sni = srv.host;
+	bool rfc6062Relay = false; // true only for an opt-in RFC 6062 TCP allocation
+	if (srv.transport == STICE_TURN_TRANSPORT_TCP || srv.transport == STICE_TURN_TRANSPORT_TLS) {
+		// RFC 6062 (REQUESTED-TRANSPORT=TCP(6), relaying TCP data
+		// connections) is opt-in via STICE_TURN_TCP_RFC6062=1: only
+		// stice<->stice speaks it. The default is RFC 8656: the relayed
+		// transport stays UDP even though the control connection is carried
+		// over TCP/TLS (what browsers and coturn interoperate with).
+		const char *rfc6062 = std::getenv("STICE_TURN_TCP_RFC6062");
+		rfc6062Relay = rfc6062 && rfc6062[0] == '1';
+		tc.tcpAllocation = rfc6062Relay;
+		if (srv.transport == STICE_TURN_TRANSPORT_TCP) {
+			tc.transport = turn::TurnTransport::TCP;
+		} else {
+			tc.transport = turn::TurnTransport::TLS;
+			tc.sni = srv.host;
+		}
 	}
 	turn::TurnSink sink;
 	net::AddrRecord turnServerAddr = resolved;
@@ -643,7 +740,7 @@ void Agent::createRelayEntry(const stice_turn_server_t &srv, int serverIndex,
 	// set just before allocate() below. For TCP TURN, it is set in
 	// onTurnTcpConnected (via turnTcpAllocStart_).
 	auto allocStart = std::make_shared<std::chrono::steady_clock::time_point>();
-	sink.onAllocated = [lifetime, this, useTcp, serverIndex, allocStart](const net::AddrRecord &relayed, std::uint32_t lifetimeSec) {
+	sink.onAllocated = [lifetime, this, rfc6062Relay, serverIndex, allocStart](const net::AddrRecord &relayed, std::uint32_t lifetimeSec) {
 		LifetimeScope ls(lifetime);
 		if (!ls) return;
 		auto *sa = reinterpret_cast<const sockaddr *>(&relayed.addr);
@@ -668,11 +765,14 @@ void Agent::createRelayEntry(const stice_turn_server_t &srv, int serverIndex,
 		// Add a relay candidate.
 		Candidate c;
 		c.type = CandidateType::Relayed;
-		// RFC 6062 TCP allocation: relayed transport is TCP. The TURN server
-		// listens on the relayed address (passive), and the client can also
-		// actively CONNECT to peers. Mark as TCPPassive since the server
-		// accepts incoming connections on behalf of the client.
-		c.transport = useTcp ? CandidateTransport::TCPPassive : CandidateTransport::UDP;
+		// The relayed candidate transport follows the ALLOCATION protocol,
+		// not the control-connection transport: an RFC 6062 TCP allocation
+		// (opt-in) relays TCP and the server listens on the relayed address
+		// (passive), so the candidate is TCPPassive. RFC 8656 (the default,
+		// including TURN over TCP/TLS control connections) relays UDP, so the
+		// candidate must be a UDP relay candidate even though the control
+		// connection runs over TCP/TLS.
+		c.transport = rfc6062Relay ? CandidateTransport::TCPPassive : CandidateTransport::UDP;
 		c.component = 1;
 		c.resolved = relayed;
 		c.hostname = host;
@@ -787,6 +887,10 @@ void Agent::createRelayEntry(const stice_turn_server_t &srv, int serverIndex,
 		bool useTls = (srv.transport == STICE_TURN_TRANSPORT_TLS);
 		std::string sni = useTls ? std::string(srv.host) : std::string();
 		bool skipVerify = (srv.skip_tls_verify != 0);
+		// Seed the entry's nextTransmission so an Idle relay entry never
+		// reads as time-point-zero (which would poison nextTimestampMs).
+		entry.nextTransmission = std::chrono::steady_clock::now() +
+		                         std::chrono::milliseconds(TcpConnectTimeoutMs / 2);
 		if (!beginTurnTcpConnect(resolved, useTls, sni, skipVerify)) {
 			STICE_LOG_WARN("Agent: TURN TCP connect failed immediately for %s", srv.host);
 		}
@@ -805,6 +909,10 @@ int Agent::gatherCandidates() {
 	std::lock_guard<std::recursive_mutex> lock(mutex_);
 	if (state_ != STICE_STATE_DISCONNECTED && state_ != STICE_STATE_FAILED) return STICE_ERR_FAILED;
 	changeState(STICE_STATE_GATHERING);
+	if (gatherStartedAt_.time_since_epoch().count() == 0)
+	    STICE_LOG_WARN("GATHER-START: gatherCandidates executing, setting gatherStartedAt_ (agent=%p)", (void*)this);
+	gatherStartedAt_ = std::chrono::steady_clock::now(); // soft gathering deadline
+	wakePoll(); // recompute poll deadline: expose soft gathering timeout now
 	// Determine role: controlling if we have a higher ufrag lexicographically
 	// (libjuice's heuristic; pion uses an explicit role setting). For stice,
 	// we follow libjuice: the agent that calls gather first is controlling by
@@ -833,8 +941,11 @@ int Agent::gatherCandidates() {
 	// The worker thread resolves all items' DNS in parallel (via std::async),
 	// eliminating serial getaddrinfo blocking that stalls the poll thread.
 	std::vector<GatherItem> items;
-	// STUN servers.
-	if (!stunServersInternal_.empty()) {
+	// STUN servers. TCP-only ICE skips srflx gathering: it is UDP-based and
+	// would only produce UDP-transport candidates that can never pair.
+	if (config_.disable_udp_gathering) {
+		STICE_LOG_INFO("Agent: UDP gathering disabled, skipping STUN/srflx gathering");
+	} else if (!stunServersInternal_.empty()) {
 		for (const auto &s : stunServersInternal_) {
 			GatherItem item;
 			item.type = GatherItem::Type::Stun;
@@ -851,7 +962,15 @@ int Agent::gatherCandidates() {
 		items.push_back(std::move(item));
 	}
 	// TURN servers: decide eager vs deferred based on pairing strategy.
-	for (int i = 0; i < config_.turn_servers_count; ++i) {
+	// TCP-only ICE skips all TURN allocations: a UDP-transport TURN server
+	// would produce a UDP relayed candidate that can never pair with our
+	// TCP-only locals, and even a TCP allocation reintroduces a relay path
+	// the test means to exclude. Without TURN the connection must succeed
+	// over direct TCP or fail explicitly — no silent relay fallback.
+	if (config_.disable_udp_gathering && config_.turn_servers_count > 0)
+		STICE_LOG_INFO("Agent: UDP gathering disabled, skipping %d TURN server(s)",
+		               config_.turn_servers_count);
+	for (int i = 0; !config_.disable_udp_gathering && i < config_.turn_servers_count; ++i) {
 		const auto &srv = config_.turn_servers[i];
 		bool is_tcp = (srv.transport == STICE_TURN_TRANSPORT_TCP ||
 		               srv.transport == STICE_TURN_TRANSPORT_TLS);
@@ -1455,6 +1574,21 @@ void Agent::formPairs() {
 		for (const auto &remote : remote_.candidates) {
 			if (local.component != remote.component) continue;
 			if (local.resolved.addr.ss_family != remote.resolved.addr.ss_family) continue;
+			// Link-local remote candidates (169.254.0.0/16, fe80::/10) are not
+			// pairable: without a zone scope they are unroutable off-link, and
+			// in same-host / multi-adapter setups (browsers disable mDNS on
+			// localhost pages and expose APIPA host candidates from virtual
+			// adapters) they produce asymmetric self-loop paths whose STUN
+			// checks "succeed" locally while DTLS traffic blackholes. Blocking
+			// them here also covers batch setRemoteDescription candidates and
+			// mDNS-resolved results, which do not pass through
+			// addRemoteCandidate. Loopback (127.0.0.0/8) is deliberately NOT
+			// filtered — local test topologies legitimately use it.
+			if (net::addrIsLinkLocal(reinterpret_cast<const sockaddr *>(&remote.resolved.addr))) {
+				STICE_LOG_DEBUG("formPairs: skipping link-local remote candidate %s",
+				                remote.hostname.c_str());
+				continue;
+			}
 			// RFC 6544 §5.2: TCP candidate pair filtering.
 			// - active-active: illegal (neither side connects)
 			// - passive-passive: illegal (neither side connects)
@@ -1685,7 +1819,7 @@ void Agent::sendStunBinding(StunEntry &e, stun::Class cls, int errorCode,
 	else password = local_.icePwd.c_str();
 	m.encode(password, nullptr, "stice");
 
-	STICE_LOG_DEBUG("sendStunBinding: cls=%d method=%d to=%s tid=%02x%02x%02x%02x useCand=%d",
+	STICE_LOG_WARN("sendStunBinding: cls=%d method=%d to=%s tid=%02x%02x%02x%02x useCand=%d",
 	                static_cast<int>(cls), static_cast<int>(m.method),
 	                e.record.toString().c_str(),
 	                m.transactionID[0], m.transactionID[1], m.transactionID[2], m.transactionID[3],
@@ -1835,6 +1969,17 @@ bool Agent::verifyBindingRequest(const stun::Message &msg) {
 
 CandidatePair *Agent::findOrCreatePair(const net::AddrRecord &src, std::uint32_t priority,
                                        CandidateTransport transport) {
+	// Link-local sources never form pairs (see formPairs for the rationale).
+	// This guards the peer-reflexive path: inbound checks from 169.254/fe80
+	// addresses still get a binding response (the caller sends an error
+	// response so the peer's check fails fast), but no candidate pair is
+	// created, so such a source can never be nominated or become the
+	// selected pair.
+	if (net::addrIsLinkLocal(reinterpret_cast<const sockaddr *>(&src.addr))) {
+		STICE_LOG_DEBUG("findOrCreatePair: ignoring link-local source %s",
+		                src.toString().c_str());
+		return nullptr;
+	}
 	// Look for an existing remote candidate matching `src` AND the transport
 	// the request arrived on. Without the transport check, a UDP remote
 	// candidate at the same address would be wrongly matched to an incoming
@@ -2182,8 +2327,14 @@ void Agent::handleStunMessage(const stun::Message &msg, const net::AddrRecord &s
 	}
 	if (stun::isResponseType(msg.cls)) {
 		// Find the entry with matching transaction ID.
+		bool matched = false;
 		for (auto &e : entries_) {
 			if (std::memcmp(e.transactionID.data(), msg.transactionID.data(), 12) == 0) {
+				matched = true;
+				STICE_LOG_WARN("STUN-RESP: tid=%02x%02x%02x%02x MATCH type=%d from=%s entries=%zu",
+				                msg.transactionID[0], msg.transactionID[1], msg.transactionID[2],
+				                msg.transactionID[3], static_cast<int>(e.type),
+				                src.toString().c_str(), entries_.size());
 				if (e.type == StunEntryType::Server)
 					handleServerReflexiveResponse(msg, src, e);
 				else
@@ -2191,6 +2342,10 @@ void Agent::handleStunMessage(const stun::Message &msg, const net::AddrRecord &s
 				return;
 			}
 		}
+		if (!matched)
+			STICE_LOG_WARN("STUN-RESP: tid=%02x%02x%02x%02x NO-MATCH from=%s entries=%zu",
+			               msg.transactionID[0], msg.transactionID[1], msg.transactionID[2],
+			               msg.transactionID[3], src.toString().c_str(), entries_.size());
 		return;
 	}
 	// Indication: ignore (or treat as keepalive).
@@ -2500,6 +2655,10 @@ void Agent::checkGatheringComplete() {
 	if (pendingRelayAllocations_ > 0) return;
 	if (pendingServerReflexive_ > 0) return;
 	if (gatheringDone_) return;
+	STICE_LOG_WARN("GATHER-DONE: setting gatheringDone_ (pendingSrflx=%d relay=%d cand=%zu state=%d remote_set=%d)",
+	             pendingServerReflexive_, pendingRelayAllocations_,
+	             local_.candidates.size(), static_cast<int>(state_),
+	             (remote_.iceUfrag.empty() || remote_.icePwd.empty()) ? 0 : 1);
 	gatheringDone_ = true;
 	local_.finished = true;
 	emitGatheringDone();
@@ -2727,8 +2886,11 @@ bool Agent::beginTurnTcpConnect(const net::AddrRecord &turnServer, bool useTls,
 		return false;
 	}
 	// Arm an application-layer connect timeout so an unreachable TURN server
-	// does not leave the transport stuck in Connecting forever.
-	turnTcpTransport_->setConnectTimeoutMs(TcpConnectTimeoutMs);
+	// does not leave the transport stuck in Connecting forever. Half the
+	// ICE-TCP timeout: TURN servers are known infrastructure (LAN/deployed
+	// endpoint), and the "connection failure must not hang gathering" tests
+	// expect completion within 5 s even for a black-holed connect.
+	turnTcpTransport_->setConnectTimeoutMs(TcpConnectTimeoutMs / 2);
 	// Register this Agent (with its TURN TCP socket) on its own PollRegistry.
 	// add() is idempotent (deduplicates by pointer).
 	if (pollReg_) pollReg_->add(this);
@@ -2973,7 +3135,35 @@ void Agent::onBookkeeping(int64_t nowMs) {
 	std::lock_guard<std::recursive_mutex> lock(mutex_);
 	auto now = std::chrono::steady_clock::now();
 	(void)nowMs;
+
+	// Soft gathering timeout: if srflx/relay entries stay pending (STUN
+	// server unreachable, or high-load packet loss) gathering must still
+	// complete so the ICE session proceeds; late candidates are trickled.
+		if (!gatheringDone_ && gatherStartedAt_.time_since_epoch().count() == 0) {
+	    // No deadline recorded (gatherCandidates raced past its normal path).
+	    // Seed one now so the soft timeout below still fires and completes
+	    // gathering instead of wedging this stream forever.
+	    gatherStartedAt_ = std::chrono::steady_clock::now();
+	    STICE_LOG_WARN("GATHER: gatherStartedAt_ was NOT SET; deadline seeded (agent=%p)", (void*)this);
+		}
+if (!gatheringDone_ && gatherStartedAt_.time_since_epoch().count() != 0 &&
+	    (now - gatherStartedAt_) > std::chrono::milliseconds(GatherTimeoutMs)) {
+				STICE_LOG_WARN("GATHER-SOFT-TIMEOUT forcing complete after %d ms (pendingSrflx=%d relay=%d)",
+		        static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		            now - gatherStartedAt_).count()),
+		        pendingServerReflexive_, pendingRelayAllocations_);
+pendingRelayAllocations_ = 0;
+		pendingServerReflexive_ = 0;
+		checkGatheringComplete();
+	}
 	STICE_LOG_DEBUG("onBookkeeping: entries=%zu state=%d", entries_.size(), static_cast<int>(state_));
+	if (!gatheringDone_) {
+	    auto ageMs = static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(now - gatherStartedAt_).count());
+	    STICE_LOG_WARN("GATHER-CHECK: gStartSet=%d pendingSrflx=%d relay=%d age=%lldms entries=%zu done=%d cand=%zu state=%d",
+	        gatherStartedAt_.time_since_epoch().count() != 0, pendingServerReflexive_,
+	        pendingRelayAllocations_, ageMs, entries_.size(),
+	        gatheringDone_ ? 1 : 0, local_.candidates.size(), static_cast<int>(state_));
+	}
 
 	// Enforce application-layer TCP connect timeouts. The poll loop may not
 	// deliver onTcpEvents/onTurnTcpEvents for a black-holed connect (no
@@ -2986,6 +3176,14 @@ void Agent::onBookkeeping(int64_t nowMs) {
 	if (turnTcpTransport_ && turnTcpTransport_->connectTimedOut()) {
 		STICE_LOG_WARN("TURN TCP: connect timeout in bookkeeping");
 		turnTcpTransport_->close();
+		// Signal failure to the TURN client so the pending allocation entry
+		// completes and gathering can finish — identical to the onTurnTcpEvents
+		// failure path. Without this, a black-holed connect (unroutable server)
+		// times out here but the TURN entry stays pending forever.
+		if (turnTcpEntry_ && turnTcpEntry_->turn) {
+			turnTcpEntry_->turn->handleInbound(nullptr, 0); // signal failure
+		}
+		turnTcpTransport_.reset();
 	}
 
 	// RFC 6062 CONNECT retry: if a previous CONNECT failed with 447 and the
@@ -3114,7 +3312,10 @@ void Agent::onBookkeeping(int64_t nowMs) {
 			}
 		}
 		// Drive TURN client (Allocate retransmission, refresh, permissions).
-		if (e.type == StunEntryType::Relay && e.turn) {
+		// Skip Cancelled entries (cancelAllEntries during teardown): the
+		// TURN client must not retransmit an allocation being deallocated.
+		if (e.type == StunEntryType::Relay && e.turn &&
+		    e.state != StunEntryState::Cancelled) {
 			auto nextTick = e.turn->tick();
 			if (nextTick != std::chrono::steady_clock::time_point{})
 				e.nextTransmission = nextTick;

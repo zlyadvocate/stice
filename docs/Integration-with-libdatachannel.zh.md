@@ -137,7 +137,7 @@ set(STICE_BUILD_STSERVER OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     stice
     GIT_REPOSITORY https://github.com/zlyadvocate/stice.git
-    GIT_TAG        v0.10.0
+    GIT_TAG        v0.11.0
     GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(stice)
@@ -282,7 +282,7 @@ endif()
 **方法**：
 1. 检查日志前缀：stice 的日志包含 `[stice/...]` 前缀。
 2. 检查中继候选者：stice 支持 RFC 6062 TCP 中继（`tcptype=passive`），libjuice 不支持。
-3. 使用 `stice_get_version()`（原生 API）获取版本号，应返回 `0.10.0`。
+3. 使用 `stice_get_version()`（原生 API）获取版本号，应返回 `0.11.0`。
 
 ### Q6：性能对比
 

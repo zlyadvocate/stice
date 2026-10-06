@@ -31,13 +31,7 @@ int main() {
     setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&v6only, sizeof(v6only));
 
     // Set non-blocking.
-#ifdef _WIN32
-    u_long nbio = 1;
-    ioctlsocket(sock, FIONBIO, &nbio);
-#else
-    int nbio = 1;
-    ioctl(sock, FIONBIO, &nbio);
-#endif
+    stice::net::setNonBlocking(sock);
 
     // Bind to any.
     sockaddr_in6 bind6{};

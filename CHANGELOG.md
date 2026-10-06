@@ -5,6 +5,67 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-10-06
+
+### Added
+- `turn-tcp-suite` (libdatachannel integration suite) case 8: STUN 10% packet-loss
+  stress test (netem `loss 10%` filtered to the STUN path, 100 concurrent pairs)
+  validating stice gathering and STUN retransmission under loss; case 7 build
+  retried 3× and open timeout raised for high-concurrency coturn queuing.
+
+
+### Fixed
+- ICE: link-local candidates no longer break direct connections. Chrome on a
+  multi-adapter host (VMware / disconnected Ethernet) exposes `169.254.x.x`
+  APIPA host candidates; same-host loopback made STUN checks succeed over a
+  self-loop path and the pair got nominated before healthy pairs, after which
+  DTLS could never complete its handshake (30 s timeout, no video). Fixes:
+  - `addrIsLocal`/new `addrIsLinkLocal` recognize IPv4-mapped IPv6
+    addresses, closing a leak where dual-stack sockets enumerate `169.254.x.x`
+    as `::ffff:169.254.x.x` and bypassed the IPv4 link-local checks.
+  - `formPairs` skips link-local remote candidates, and `findOrCreatePair`
+    refuses link-local peer-reflexive sources (loopback is deliberately still
+    allowed — local test topologies use it).
+- TURN over TCP: the relayed candidate now follows the **allocation protocol**
+  rather than the control-connection transport, completing the 0.10.1 RFC 8656
+  default: a UDP-relay allocation carried over a TCP/TLS control connection
+  emits a UDP `typ relay` candidate (previously emitted `tcptype passive` TCP,
+  so two stice agents paired passive↔passive and never connected —
+  `test_integration` TURN-TCP and the stserver TURN-TCP stress were stuck).
+- `STICE_TURN_TCP_RFC6062=1` is now actually read (was documented but never
+  implemented): it opts a TCP/TLS-controlled TURN server into an RFC 6062
+  TCP allocation (`REQUESTED-TRANSPORT=6`); `test_coturn_bench`'s `turn-tcp`
+  mode relies on it.
+- stserver: RFC 8656 over a TCP/TLS control connection now works end to end.
+  A UDP-relay allocation created on a TCP control connection is additionally
+  keyed by that control socket (control-plane requests — CreatePermission,
+  ChannelBind, Refresh, Send, ChannelData — previously failed with
+  `437 Allocation Mismatch`), keeps its control socket, and peer data is
+  forwarded back over the control connection instead of a UDP path the client
+  never had.
+
+- ICE gathering could wedge indefinitely under load: when `gatherCandidates`
+  hit an early-return or `onBookkeeping` ran before a deadline was seeded, the
+  soft-gathering timeout never armed, so a stream waiting on an srflx response
+  stayed in `GATHERING` until the caller's own timeout. Now `gatherStartedAt_`
+  is seeded on both paths and the poll wake interval is clamped to 1 s (was
+  15/60 s), so a wedged stream is force-completed after `GatherTimeoutMs` (15 s).
+- Diagnostic logging to locate wedged streams: `GATHER-DONE` (pending/relay/
+  cand/state/remote_set), extended `GATHER-CHECK`, `SOFT-TIMEOUT`, and
+  `STUN-RESP` `MATCH`/`NO-MATCH` on the agent's STUN socket.
+- UDP sockets now raise `SO_RCVBUF`/`SO_SNDBUF` to 4 MiB; `udp_mux` logs
+  `UDPMUX-ROUTE` and broadcasts STUN without a USERNAME to listening agents.
+
+### Changed
+- `test_turn.cpp`: the two RFC 6062 wire-format tests now opt in via
+  `cfg.tcpAllocation = true` (transport=TCP alone means RFC 8656 since 0.10.1).
+- `test_coturn_bench.cpp`: default coturn host updated to `192.168.3.223`.
+
+- `DEBUG_FAST` ICE check RTO initial 400→500 ms (RFC 5389 recommended minimum),
+  more robust under congestion.
+- `test_pairing_strategy.cpp`: DEBUG_FAST `rto_initial` assertion synced
+  400→500 to match the RTO change.
+
 ## [0.10.1] - 2026-08-31
 
 ### Added

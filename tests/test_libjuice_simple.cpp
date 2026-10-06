@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -87,6 +88,11 @@ int main(int argc, char **argv) {
     juice_get_local_description(agent1, sdp1, sizeof(sdp1));
     printf("\nLocal description (agent1):\n%s\n", sdp1);
 
+    // Start gathering. stice's juice-compat uses explicit gathering (like
+    // juice_gather_candidates in test_libjuice_bench / interop clients):
+    // juice_get_local_description alone does NOT trigger candidate gathering.
+    juice_gather_candidates(agent1);
+
     // Wait for gathering
     int timeout = 10;
     while (!gathering_done && timeout > 0) {
@@ -117,8 +123,8 @@ int main(int argc, char **argv) {
         memset(data, 'A', sizeof(data));
 
         int sent = 0;
-        int start_time = GetTickCount();
-        while (GetTickCount() - start_time < test_duration * 1000) {
+        clock_t start_time = clock();
+        while (clock() - start_time < test_duration * CLOCKS_PER_SEC) {
             juice_send(agent1, data, sizeof(data));
             sent++;
             Sleep(10); // 100 packets per second

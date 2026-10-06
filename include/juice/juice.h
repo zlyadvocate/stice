@@ -100,6 +100,10 @@ typedef enum juice_concurrency_mode {
 typedef enum juice_ice_tcp_mode {
 	JUICE_ICE_TCP_MODE_NONE = 0,
 	JUICE_ICE_TCP_MODE_ACTIVE,
+	// Values 2/3 are binary-compatible with stice_ice_tcp_mode_t; the
+	// forwarding in juice_compat.cpp static_casts them directly.
+	JUICE_ICE_TCP_MODE_PASSIVE = 2, // local passive: requires a TCPMux
+	JUICE_ICE_TCP_MODE_SO = 3,      // simultaneous-open: listen AND dial
 } juice_ice_tcp_mode_t;
 
 typedef struct juice_config {
@@ -120,6 +124,12 @@ typedef struct juice_config {
 	juice_cb_candidate_t cb_candidate;
 	juice_cb_gathering_done_t cb_gathering_done;
 	juice_cb_recv_t cb_recv;
+
+	// Disable UDP candidate gathering (TCP-only ICE, RFC 6544): when
+	// non-zero, no UDP host/srflx/TURN candidate is gathered, so UDP pairs
+	// can never form. Requires ice_tcp_mode (PASSIVE/SO need a TCPMux, see
+	// juice_agent_use_tcp_mux) — otherwise ICE fails explicitly.
+	int disable_udp_gathering;
 
 	void *user_ptr;
 
@@ -145,6 +155,17 @@ JUICE_EXPORT int juice_set_local_ice_attributes(juice_agent_t *agent, const char
 JUICE_EXPORT const char *juice_state_to_string(juice_state_t state);
 JUICE_EXPORT int juice_mux_listen(const char *bind_address, int local_port, juice_cb_mux_incoming_t cb, void *user_ptr);
 JUICE_EXPORT int juice_set_ice_tcp_mode(juice_agent_t *agent, juice_ice_tcp_mode_t ice_tcp_mode);
+
+// TCPMux: share a single TCP listener socket across agents for ICE-TCP
+// passive/SO mode (RFC 6544). Create the mux once, bind each agent to it
+// BEFORE juice_gather_candidates, and set the agent's ice_tcp_mode to
+// PASSIVE or SO via juice_set_ice_tcp_mode so local TCP passive candidates
+// are gathered on the mux's listener address.
+typedef struct juice_tcp_mux juice_tcp_mux_t;
+
+JUICE_EXPORT juice_tcp_mux_t *juice_create_tcp_mux(const char *bind_address, uint16_t port);
+JUICE_EXPORT void juice_destroy_tcp_mux(juice_tcp_mux_t *mux);
+JUICE_EXPORT int juice_agent_use_tcp_mux(juice_agent_t *agent, juice_tcp_mux_t *mux);
 
 // ICE server
 

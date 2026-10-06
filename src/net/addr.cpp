@@ -75,6 +75,44 @@ bool addrIsLocal(const struct sockaddr *sa) {
 		auto *in6 = reinterpret_cast<const sockaddr_in6 *>(sa);
 		if (IN6_IS_ADDR_LOOPBACK(&in6->sin6_addr)) return true;
 		if (IN6_IS_ADDR_LINKLOCAL(&in6->sin6_addr)) return true;
+		// Dual-stack sockets enumerate IPv4 addresses as v4-mapped
+		// (::ffff:a.b.c.d). IPv6 link-local above does NOT match
+		// ::ffff:169.254.x, so those leaked through the enumeration
+		// filter and reappeared as plain IPv4 host candidates after
+		// unmapping. Unwrap here so all v4-mapped addresses follow the
+		// IPv4 rules.
+		if (IN6_IS_ADDR_V4MAPPED(&in6->sin6_addr)) {
+			in_addr v4;
+			std::memcpy(&v4, &in6->sin6_addr.s6_addr[12], sizeof(v4));
+			uint32_t a = ntohl(v4.s_addr);
+			if ((a & 0xFF000000u) == 0x7F000000u) return true;
+			if ((a & 0xFFFF0000u) == 0xA9FE0000u) return true;
+		}
+		return false;
+	}
+	return false;
+}
+
+bool addrIsLinkLocal(const struct sockaddr *sa) {
+	if (!sa) return false;
+	if (sa->sa_family == AF_INET) {
+		auto *in = reinterpret_cast<const sockaddr_in *>(sa);
+		uint32_t a = ntohl(in->sin_addr.s_addr);
+		// 169.254.0.0/16 (IPv4 link-local / APIPA)
+		return (a & 0xFFFF0000u) == 0xA9FE0000u;
+	}
+	if (sa->sa_family == AF_INET6) {
+		auto *in6 = reinterpret_cast<const sockaddr_in6 *>(sa);
+		// fe80::/10 (IPv6 link-local)
+		if (IN6_IS_ADDR_LINKLOCAL(&in6->sin6_addr)) return true;
+		// v4-mapped ::ffff:169.254.x (dual-stack enumeration) follows the
+		// IPv4 rule — see addrIsLocal.
+		if (IN6_IS_ADDR_V4MAPPED(&in6->sin6_addr)) {
+			in_addr v4;
+			std::memcpy(&v4, &in6->sin6_addr.s6_addr[12], sizeof(v4));
+			uint32_t a = ntohl(v4.s_addr);
+			return (a & 0xFFFF0000u) == 0xA9FE0000u;
+		}
 		return false;
 	}
 	return false;

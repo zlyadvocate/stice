@@ -71,7 +71,7 @@ IcePairingConfig makeIcePairingConfig(IcePairingProfile profile) {
 		c.tcp_nomination_precheck = std::chrono::milliseconds(0);
 		c.tcp_relay_fallback = TcpRelayFallbackMode::ALWAYS_ENABLE;
 		c.reselect_policy = LinkReselectPolicy::RFC8445;
-		c.rto_initial = std::chrono::milliseconds(400);
+		c.rto_initial = std::chrono::milliseconds(500); // >= RFC 5389 min RTO; 400ms too aggressive under load
 		c.max_check_retransmit = 3;
 		c.keepalive_udp = std::chrono::milliseconds(8000);
 		c.keepalive_tcp_relay = std::chrono::milliseconds(4000);

@@ -68,6 +68,13 @@ public:
 	// state_ == Connecting/TlsHandshaking.
 	void setConnectTimeoutMs(int timeoutMs);
 
+	// Absolute steady-clock ms of the connect deadline. Returns INT64_MAX
+	// when no deadline is set. Lets the poll loop wake exactly when a
+	// black-holed connect (no writable event ever fires) must time out.
+	int64_t connectDeadlineMs() const {
+		return connectDeadlineMs_.load(std::memory_order_acquire);
+	}
+
 	// Set the framing mode. Must be called before send/recv. Default: RFC4571.
 	void setFramingMode(FramingMode mode) { framing_ = mode; }
 	FramingMode framingMode() const { return framing_; }
@@ -134,11 +141,12 @@ private:
 	std::vector<unsigned char> recvBuf_;
 	mutable std::mutex recvMtx_;
 
-	// Application-layer connect deadline. Set by setConnectTimeoutMs. When
-	// the poll loop calls onWritable/onReadable while still Connecting/
-	// TlsHandshaking past this deadline, the transport transitions to Failed.
-	std::chrono::steady_clock::time_point connectDeadline_{};
-	bool hasConnectDeadline_ = false;
+	// Application-layer connect deadline (absolute steady-clock ms, -1 =
+	// none). Single atomic so the poll thread can read it race-free while
+	// the worker thread arms it (previously a non-atomic bool + time_point
+	// pair could tear, making the poll loop miss the wakeup and sleep the
+	// full 60 s clamp).
+	std::atomic<int64_t> connectDeadlineMs_{-1};
 };
 
 } // namespace stice::net

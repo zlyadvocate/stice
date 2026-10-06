@@ -123,6 +123,12 @@ constexpr int LastStunRetransmissionTimeoutMs = 500 * 16; // 8000
 constexpr int MaxStunCheckRetransmissions = 6;            // ~39.5s total
 constexpr int MaxStunServerRetransmissions = 5;
 constexpr int StunTcpTimeoutMs = 8000;
+// Soft gathering timeout. If srflx/relay entries stay pending (STUN server
+// unreachable, or high-load packet loss) the gathering MUST still complete so
+// the ICE session can proceed; late candidates are trickled. Mirrors libjuice
+// completing gathering even when no srflx is obtained. 15s bounds the worst
+// case while letting the normal 500ms-exp-backoff srflx path finish.
+constexpr int GatherTimeoutMs = 15000;
 // Application-layer TCP connect timeout. Prevents an active TCP connect to an
 // unresponsive remote (e.g. black-holed address) from hanging indefinitely;
 // the poll loop only fires onWritable when the kernel completes the connect,
@@ -556,6 +562,7 @@ private:
 	Description local_;
 	Description remote_;
 	bool gatheringDone_ = false;
+	std::chrono::steady_clock::time_point gatherStartedAt_{}; // soft gathering deadline
 	bool remoteGatheringDone_ = false;
 	int pendingRelayAllocations_ = 0;
 	int pendingServerReflexive_ = 0;

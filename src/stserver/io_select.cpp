@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // Author: zlyadvocate
-// Version: 0.10.1
+// Version: 0.11.0
 // SelectBackend: B plan implementation — control plane / data plane
 // separation with a thread pool.
 //
@@ -102,7 +102,7 @@ public:
 	void stop() override {
 		if (!running_.exchange(false)) return;
 		// Signal workers to stop.
-		for (auto &r : tcpWorkerRunning_) r = false;
+		std::fill(tcpWorkerRunning_.begin(), tcpWorkerRunning_.end(), false);
 		// Join all threads.
 		if (controlThread_.joinable()) controlThread_.join();
 		for (auto &t : tcpWorkers_) {
@@ -324,7 +324,11 @@ private:
 				break;
 			}
 			if (n > 0) {
+#ifdef _WIN32
 				STICE_LOG_INFO("stserver: worker%d select returned %d (rfds=%d wfds=%d)", workerId, n, (int)rfds.fd_count, (int)wfds.fd_count);
+#else
+				STICE_LOG_INFO("stserver: worker%d select returned %d", workerId, n);
+#endif
 			}
 
 			// Process readable connections.

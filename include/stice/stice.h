@@ -182,6 +182,16 @@ typedef struct stice_config {
 	// initiate outbound TCP connections to remote passive candidates.
 	int disable_active_tcp;
 
+	// Disable UDP candidate gathering: when non-zero, the agent gathers TCP
+	// candidates only. UDP host candidates, STUN server-reflexive gathering
+	// and TURN allocations are all skipped, so no UDP-transport local
+	// candidate exists and UDP pairs can never form (RFC 6544 ICE-TCP-only
+	// testing). The agent must have ICE-TCP enabled via
+	// stice_set_ice_tcp_mode and — for PASSIVE/SO roles — a TCPMux bound
+	// via stice_agent_use_tcp_mux, otherwise nothing is gathered and ICE
+	// fails explicitly (no silent fallback to another transport).
+	int disable_udp_gathering;
+
 	// mDNS mode (default: STICE_MDNS_MODE_DISABLED).
 	stice_multicast_dns_mode_t multicast_dns_mode;
 	// Optional: custom mDNS hostname. If NULL, a random UUID.local is generated.

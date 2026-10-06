@@ -850,6 +850,9 @@ TEST_CASE("TURN over TCP sends Allocate request", "[turn][tcp]") {
 	TurnHarness h;
 	h.init();
 	h.cfg.transport = TurnTransport::TCP;
+	// RFC 6062 TCP allocation is opt-in since 0.10.1 (transport=TCP alone
+	// now means RFC 8656: UDP relay over a TCP control connection).
+	h.cfg.tcpAllocation = true;
 	// Re-init with TCP transport.
 	TurnSink sink;
 	sink.sendRaw = [&h](const unsigned char *d, std::size_t n) {
@@ -1270,6 +1273,8 @@ TEST_CASE("RFC 6062: TCP allocation sends REQUESTED-TRANSPORT=6", "[turn][rfc606
 	TurnHarness h;
 	h.init();
 	h.cfg.transport = TurnTransport::TCP;
+	// RFC 6062 TCP allocation is opt-in since 0.10.1.
+	h.cfg.tcpAllocation = true;
 	TurnSink sink;
 	sink.sendRaw = [&h](const unsigned char *d, std::size_t n) {
 		h.sent.emplace_back(d, d + n);

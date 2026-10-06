@@ -98,13 +98,7 @@ bool MDnsClient::init(MulticastDNSMode mode, const std::string &hostname,
 	}
 
 	// Set non-blocking.
-#ifdef _WIN32
-	u_long nbio = 1;
-	ioctlsocket(sock_, FIONBIO, &nbio);
-#else
-	int nbio = 1;
-	ioctl(sock_, FIONBIO, &nbio);
-#endif
+	setNonBlocking(sock_);
 
 	// Join multicast group 224.0.0.251.
 	ip_mreq mreq{};

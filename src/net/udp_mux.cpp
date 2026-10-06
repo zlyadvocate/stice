@@ -213,6 +213,7 @@ void UDPMux::routePacket(const char *buf, int len, const AddrRecord &src) {
 			}
 		}
 
+		STICE_LOG_WARN("UDPMUX-ROUTE: STUN resp/ind %dB from=%s agents=%zu", len, src.toString().c_str(), agentsByUfrag_.size());
 		// STUN message without USERNAME (response, indication, or decode
 		// failure): broadcast to all agents. Only the agent with a matching
 		// transaction ID will process it.

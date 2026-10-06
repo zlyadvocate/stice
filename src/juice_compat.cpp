@@ -56,6 +56,7 @@ juice_agent_t *juice_create(const juice_config_t *config) {
 	sc.cb_gathering_done =
 	    reinterpret_cast<stice_cb_gathering_done_t>(config->cb_gathering_done);
 	sc.cb_recv = reinterpret_cast<stice_cb_recv_t>(config->cb_recv);
+	sc.disable_udp_gathering = config->disable_udp_gathering;
 	sc.user_ptr = config->user_ptr;
 
 	return (juice_agent_t *)stice_create(&sc);
@@ -136,10 +137,22 @@ const char *juice_state_to_string(juice_state_t state) {
 }
 
 int juice_set_ice_tcp_mode(juice_agent_t *agent, juice_ice_tcp_mode_t ice_tcp_mode) {
-	// juice_ice_tcp_mode_t values (NONE=0, ACTIVE=1) map directly to
-	// stice_ice_tcp_mode_t (NONE=0, ACTIVE=1, PASSIVE=2, SO=3).
+	// juice_ice_tcp_mode_t values (NONE=0, ACTIVE=1, PASSIVE=2, SO=3) map
+	// directly to stice_ice_tcp_mode_t.
 	return stice_set_ice_tcp_mode((stice_agent_t *)agent,
 	                              static_cast<stice_ice_tcp_mode_t>(ice_tcp_mode));
+}
+
+juice_tcp_mux_t *juice_create_tcp_mux(const char *bind_address, uint16_t port) {
+	return (juice_tcp_mux_t *)stice_create_tcp_mux(bind_address, port);
+}
+
+void juice_destroy_tcp_mux(juice_tcp_mux_t *mux) {
+	stice_destroy_tcp_mux((stice_tcp_mux_t *)mux);
+}
+
+int juice_agent_use_tcp_mux(juice_agent_t *agent, juice_tcp_mux_t *mux) {
+	return stice_agent_use_tcp_mux((stice_agent_t *)agent, (stice_tcp_mux_t *)mux);
 }
 
 // ---------------------------------------------------------------------------

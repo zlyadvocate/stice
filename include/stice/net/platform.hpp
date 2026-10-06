@@ -39,7 +39,7 @@ using socket_t = int;
 using nfds_t = nfds_t;
 #define STICE_INVALID_SOCKET (-1)
 #define sticePoll poll
-#define sticeClosesocket close
+#define sticeClosesocket ::close
 #define sticeSockerrno errno
 #define STICE_SEWOULDBLOCK EWOULDBLOCK
 #define STICE_SEINPROGRESS EINPROGRESS
@@ -52,6 +52,18 @@ using nfds_t = nfds_t;
 namespace stice::net {
 inline bool wouldBlock() {
 	return sticeSockerrno == STICE_SEWOULDBLOCK || sticeSockerrno == STICE_SEAGAIN;
+}
+
+// Portable non-blocking mode. Windows: ioctlsocket(FIONBIO); POSIX: fcntl(O_NONBLOCK).
+inline bool setNonBlocking(socket_t s) {
+#ifdef _WIN32
+	u_long nbio = 1;
+	return ioctlsocket(s, FIONBIO, &nbio) == 0;
+#else
+	int flags = ::fcntl(s, F_GETFL, 0);
+	if (flags < 0) return false;
+	return ::fcntl(s, F_SETFL, flags | O_NONBLOCK) == 0;
+#endif
 }
 } // namespace stice::net
 

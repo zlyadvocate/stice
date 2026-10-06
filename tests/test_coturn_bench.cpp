@@ -2,10 +2,12 @@
 // Bandwidth / latency benchmark of the stice client against a coturn server.
 //
 // Usage: test_coturn_bench [host] [port] [user] [pass] [modes]
-//   Defaults: host=192.168.3.233 port=3478 user=testuser pass=123456
+//   Defaults: host=192.168.3.223 port=3478 user=testuser pass=123456
 //   modes: comma-separated subset of ice-udp,ice-tcp,turn-udp,turn-tcp
-//   ("rfc6062" is accepted as an alias of turn-tcp; in stice a TCP TURN
-//   transport always requests a TCP allocation, i.e. RFC 6062.)
+//   ("rfc6062" is accepted as an alias of turn-tcp; turn-tcp enables the
+//   STICE_TURN_TCP_RFC6062=1 opt-in so the benchmark exercises the RFC 6062
+//   CONNECT data-connection path; without it TURN over TCP defaults to the
+//   RFC 8656 UDP-relay-over-TCP-control mode.)
 //
 // Modes and topologies (both agents run in this process):
 //   ice-udp  : direct ICE over UDP (host+srflx candidates, coturn as STUN)
@@ -30,6 +32,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -38,6 +41,7 @@
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -197,7 +201,7 @@ struct ModeResult {
 };
 
 struct BenchParams {
-	const char *host = "192.168.3.233";
+	const char *host = "192.168.3.223";
 	uint16_t port = 3478;
 	const char *user = "testuser";
 	const char *pass = "123456";

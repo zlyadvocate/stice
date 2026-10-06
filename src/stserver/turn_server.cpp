@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // Author: zlyadvocate
-// Version: 0.10.1
+// Version: 0.11.0
 // stserver TURN/STUN server implementation.
 //
 // Implements STUN Binding (RFC 5389), TURN Allocate/Refresh/CreatePermission/
@@ -752,7 +752,12 @@ void TurnServer::handleAllocate(Message &req, const AddrRecord &src, TcpConn *tc
 		a->relayPort = port;
 		a->relaySock = std::move(rs);
 		buildRelayedAddr(port, a->relayedAddr);
-		a->controlSock = STICE_INVALID_SOCKET;
+		// RFC 8656: the allocation's 5-tuple is the control connection it was
+		// created on, regardless of the relayed transport. Keep the TCP/TLS
+		// control socket so the control plane (CreatePermission, ChannelBind,
+		// Refresh, Send, ChannelData) and peer-data forwarding can find and
+		// reach this allocation.
+		a->controlSock = tcpConn ? tcpConn->sock : STICE_INVALID_SOCKET;
 	}
 
 	std::uint32_t lifetime = allocationLifetime_;
@@ -779,6 +784,12 @@ void TurnServer::handleAllocate(Message &req, const AddrRecord &src, TcpConn *tc
 	} else {
 		allocByControlSock_[a->controlSock] = raw;
 	}
+	// RFC 8656 over a TCP/TLS control connection: a UDP-relay allocation is
+	// reachable from BOTH its relay socket (peer data plane) and its control
+	// connection (control plane + ChannelData). Key it by the control socket
+	// as well so handleTcpFrame finds it. destroyAllocation cleans both maps.
+	if (tcpConn && a->controlSock != STICE_INVALID_SOCKET)
+		allocByControlSock_[a->controlSock] = raw;
 	allocations_[key] = std::move(a);
 
 	if (tcpConn) sendTcp(*tcpConn, resp);
@@ -953,12 +964,18 @@ void TurnServer::handleChannelDataFrame(const unsigned char *data, std::size_t s
 
 void TurnServer::forwardToClient(Allocation &alloc, const AddrRecord &peer,
                                  const unsigned char *data, std::size_t size) {
+	// The path back to the client is the control connection the allocation was
+	// created on (its 5-tuple, RFC 8656 §2.2), NOT the relayed transport. A
+	// control socket means TCP/TLS control (both RFC 6062 TCP allocations and
+	// RFC 8656 UDP-relay allocations over TCP/TLS control); no control socket
+	// means the client is reached over UDP.
+	const bool controlIsTcp = (alloc.controlSock != STICE_INVALID_SOCKET);
 	// Prefer a bound channel for this peer (full IP:port).
 	for (const auto &c : alloc.channels) {
 		if (c.peer == peer) {
 			stice::bytes frame;
 			if (wrapChannelData(c.number, data, size, frame) > 0) {
-				if (alloc.transport == SOCK_STREAM) {
+				if (controlIsTcp) {
 					auto it = tcpBySock_.find(alloc.controlSock);
 					if (it != tcpBySock_.end()) sendTcpRaw(*it->second, frame.data(), frame.size());
 				} else {
@@ -980,7 +997,7 @@ void TurnServer::forwardToClient(Allocation &alloc, const AddrRecord &peer,
 			writeXorAddress(ind, AttrType::XorPeerAddress, peer, ind.transactionID);
 			addData(ind, data, size);
 			ind.encode(nullptr, nullptr, "stserver");
-			if (alloc.transport == SOCK_STREAM) {
+			if (controlIsTcp) {
 				auto it = tcpBySock_.find(alloc.controlSock);
 				if (it != tcpBySock_.end()) sendTcp(*it->second, ind);
 			} else {

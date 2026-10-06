@@ -42,6 +42,10 @@ uint16_t addrPort(const struct sockaddr *sa);
 void addrSetPort(struct sockaddr *sa, uint16_t port);
 bool addrIsAny(const struct sockaddr *sa);
 bool addrIsLocal(const struct sockaddr *sa);
+// Link-local only (IPv4 169.254.0.0/16, IPv6 fe80::/10). Unlike addrIsLocal,
+// loopback is NOT included: loopback remote candidates are legitimate in
+// local test topologies (e.g. stserver/TURN on 127.0.0.1).
+bool addrIsLinkLocal(const struct sockaddr *sa);
 // Convert a v4-mapped IPv6 sockaddr (::ffff:a.b.c.d) back to IPv4 in place.
 bool addrUnmapInet6V4Mapped(struct sockaddr *sa, socklen_t &len);
 bool addrMapInet6V4Mapped(struct sockaddr_storage &ss, socklen_t &len);

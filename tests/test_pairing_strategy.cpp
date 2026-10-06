@@ -150,7 +150,7 @@ TEST_CASE("Pairing profile factory produces expected configs", "[pairing][profil
 		REQUIRE(c.pre_allocate_tcp_relay == true);
 		REQUIRE(c.early_phase_max_concurrent == 4);
 		REQUIRE(c.early_phase_duration.count() == 1500);
-		REQUIRE(c.rto_initial.count() == 400);
+		REQUIRE(c.rto_initial.count() == 500);
 		REQUIRE(c.max_check_retransmit == 3);
 	}
 

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.13)
 project(stice
-	VERSION 0.10.0
+	VERSION 0.11.0
 	LANGUAGES CXX
 	DESCRIPTION "C++17 ICE + TURN client (ported from pion/webrtc), libjuice replacement"
 	HOMEPAGE_URL "https://github.com/zlyadvocate/stice")

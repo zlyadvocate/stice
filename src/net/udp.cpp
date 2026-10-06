@@ -116,18 +116,13 @@ static socket_t createForAddrinfo(const UdpSocketConfig &cfg, const struct addri
 		setsockopt(sock, IPPROTO_IPV6, IPV6_MTU_DISCOVER, &val, sizeof(val));
 #endif
 #endif
-	// 1 MiB buffers.
-	int bufsize = 1 * 1024 * 1024;
+	// 4 MiB buffers: UDPMux shares one socket across 100+ agents, so
+	// concurrent srflx STUN responses burst far past the default.
+	int bufsize = 4 * 1024 * 1024;
 	setsockopt(sock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char *>(&bufsize), sizeof(bufsize));
 	setsockopt(sock, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char *>(&bufsize), sizeof(bufsize));
 
-#ifdef _WIN32
-	u_long nbio = 1;
-	if (ioctlsocket(sock, FIONBIO, &nbio) != 0) {
-#else
-	int nbio = 1;
-	if (ioctl(sock, FIONBIO, &nbio) != 0) {
-#endif
+	if (!setNonBlocking(sock)) {
 		STICE_LOG_ERROR("Setting non-blocking mode on UDP socket failed");
 		sticeClosesocket(sock);
 		return STICE_INVALID_SOCKET;
@@ -201,8 +196,11 @@ int UdpSocket::recvfrom(char *buf, std::size_t size, AddrRecord &src) {
 			addrUnmapInet6V4Mapped(reinterpret_cast<struct sockaddr *>(&src.addr), src.len);
 			return len;
 		}
-		if (sticeSockerrno == STICE_SECONNRESET || sticeSockerrno == WSAENETRESET ||
-		    sticeSockerrno == ECONNREFUSED) {
+		if (sticeSockerrno == STICE_SECONNRESET || sticeSockerrno == ECONNREFUSED
+#ifdef _WIN32
+		    || sticeSockerrno == WSAENETRESET
+#endif
+		) {
 			// Windows: ICMP port-unreachable stored, ignore.
 			continue;
 		}

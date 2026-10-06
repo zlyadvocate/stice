@@ -20,6 +20,7 @@
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -64,24 +65,29 @@ void TcpTransport::close() {
 		std::lock_guard<std::mutex> lk(recvMtx_);
 		recvBuf_.clear();
 	}
-	hasConnectDeadline_ = false;
+	connectDeadlineMs_.store(-1, std::memory_order_release);
 }
 
 bool TcpTransport::connectTimedOut() const {
-	if (!hasConnectDeadline_) return false;
+	int64_t dl = connectDeadlineMs_.load(std::memory_order_acquire);
+	if (dl <= 0) return false;
 	if (state_ != TcpState::Connecting && state_ != TcpState::TlsHandshaking)
 		return false;
-	return std::chrono::steady_clock::now() >= connectDeadline_;
+	int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                    std::chrono::steady_clock::now().time_since_epoch())
+	                    .count();
+	return nowMs >= dl;
 }
 
 void TcpTransport::setConnectTimeoutMs(int timeoutMs) {
 	if (timeoutMs <= 0) {
-		hasConnectDeadline_ = false;
+		connectDeadlineMs_.store(-1, std::memory_order_release);
 		return;
 	}
-	connectDeadline_ = std::chrono::steady_clock::now() +
-	                   std::chrono::milliseconds(timeoutMs);
-	hasConnectDeadline_ = true;
+	int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                    std::chrono::steady_clock::now().time_since_epoch())
+	                    .count();
+	connectDeadlineMs_.store(nowMs + timeoutMs, std::memory_order_release);
 }
 
 bool TcpTransport::beginConnect(const AddrRecord &dst, const std::string &sni, bool useTls,
@@ -97,13 +103,7 @@ bool TcpTransport::beginConnect(const AddrRecord &dst, const std::string &sni, b
 		state_ = TcpState::Failed;
 		return false;
 	}
-#ifdef _WIN32
-	u_long nbio = 1;
-	ioctlsocket(sock_, FIONBIO, &nbio);
-#else
-	int nbio = 1;
-	ioctl(sock_, FIONBIO, &nbio);
-#endif
+	setNonBlocking(sock_);
 	int on = 1;
 	setsockopt(sock_, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char *>(&on), sizeof(on));
 	// 512 KiB socket buffers. The OS default (64 KiB on Windows) is too small
@@ -143,13 +143,7 @@ bool TcpTransport::attach(socket_t fd, const AddrRecord &peerAddr) {
 	// Ensure non-blocking + TCP_NODELAY (caller should have done this, but
 	// be defensive — accept()ed sockets inherit the listener's flags on
 	// some platforms).
-#ifdef _WIN32
-	u_long nbio = 1;
-	ioctlsocket(sock_, FIONBIO, &nbio);
-#else
-	int nbio = 1;
-	ioctl(sock_, FIONBIO, &nbio);
-#endif
+	setNonBlocking(sock_);
 	int on = 1;
 	setsockopt(sock_, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char *>(&on), sizeof(on));
 	// Match beginConnect's buffer sizing on accepted sockets.

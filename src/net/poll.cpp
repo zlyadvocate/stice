@@ -64,13 +64,7 @@ PollRegistry::PollRegistry() {
 		STICE_LOG_WARN("PollRegistry: interrupt socket creation failed errno=%d", sticeSockerrno);
 	}
 	if (interruptSock_ != STICE_INVALID_SOCKET) {
-#ifdef _WIN32
-		u_long nbio = 1;
-		ioctlsocket(interruptSock_, FIONBIO, &nbio);
-#else
-		int nbio = 1;
-		ioctl(interruptSock_, FIONBIO, &nbio);
-#endif
+		setNonBlocking(interruptSock_);
 		sockaddr_in bind4{};
 		bind4.sin_family = AF_INET;
 		bind4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -167,7 +161,14 @@ void PollRegistry::sync() {
 }
 
 int64_t PollRegistry::computeTimeoutMs(int64_t nowMs) {
-	int64_t next = nowMs + 60000; // default 60s
+	// Default clamp: if a participant's nextTimestampMs() races and reads
+	// a not-yet-set gatherStartedAt_ (no soft-gathering deadline exposed),
+	// the poll still wakes within 1s so onBookkeeping can force gathering
+	// complete promptly. 1s (not 15s) is chosen because under 100 concurrent
+	// streams one agent's srflx response occasionally is not consumed in
+	// time by its own socket poll; a shorter wake lets the soft timeout
+	// complete gathering instead of wedging the whole scenario.
+	int64_t next = nowMs + 1000;
 	std::lock_guard<std::mutex> lock(mutex_);
 	for (auto *p : participants_) {
 		int64_t t = p->nextTimestampMs();
@@ -175,7 +176,7 @@ int64_t PollRegistry::computeTimeoutMs(int64_t nowMs) {
 	}
 	int64_t timeout = next - nowMs;
 	if (timeout < 0) timeout = 0;
-	if (timeout > 60000) timeout = 60000;
+	if (timeout > 1000) timeout = 1000;
 	return timeout;
 }
 

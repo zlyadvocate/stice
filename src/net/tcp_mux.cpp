@@ -21,6 +21,7 @@
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <ifaddrs.h>
@@ -263,13 +264,7 @@ bool TCPMux::init(const std::string &bindAddress, std::uint16_t port) {
 	}
 
 	// Non-blocking.
-#ifdef _WIN32
-	u_long nbio = 1;
-	ioctlsocket(listenSock_, FIONBIO, &nbio);
-#else
-	int nbio = 1;
-	ioctl(listenSock_, FIONBIO, &nbio);
-#endif
+	setNonBlocking(listenSock_);
 
 	// SO_REUSEADDR.
 	int reuse = 1;

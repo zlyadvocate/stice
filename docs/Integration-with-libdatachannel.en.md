@@ -137,7 +137,7 @@ set(STICE_BUILD_STSERVER OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     stice
     GIT_REPOSITORY https://github.com/zlyadvocate/stice.git
-    GIT_TAG        v0.10.0
+    GIT_TAG        v0.11.0
     GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(stice)
@@ -282,7 +282,7 @@ endif()
 **Methods**:
 1. Check log prefix: stice's logs contain the `[stice/...]` prefix.
 2. Check relayed candidates: stice supports RFC 6062 TCP relay (`tcptype=passive`), libjuice does not.
-3. Use `stice_get_version()` (native API) to get the version number, should return `0.10.0`.
+3. Use `stice_get_version()` (native API) to get the version number, should return `0.11.0`.
 
 ### Q6: Performance comparison
 
