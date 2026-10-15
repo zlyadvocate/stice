@@ -41,6 +41,27 @@ enum class MulticastDNSMode {
 // address is empty on failure/timeout.
 using MDnsQueryCallback = std::function<void(const std::string &address)>;
 
+// Is `ss` a plausible mDNS sender? An mDNS answer can only come from a unicast
+// host address on the local link, so a multicast / unspecified / broadcast
+// source is impossible and must never be honoured - answers are accepted purely
+// by matching the answer NAME to a pending query, so an impossible-looking
+// sender is exactly the cheap injection vector this closes.
+//
+// Both address families are covered:
+//   IPv4 : rejects 0.0.0.0 and 224.0.0.0/3 - the multicast block (224/4) plus the
+//          reserved class E block (240/4, which contains 255.255.255.255);
+//          neither can be a unicast host address
+//   IPv6 : rejects ff00::/8 and ::, and applies the IPv4 rules to an embedded
+//          v4 address - both ::ffff:a.b.c.d (IPv4-mapped) and the deprecated
+//          IPv4-compatible ::a.b.c.d - so a dual-stack peer cannot smuggle in a
+//          source the IPv4 branch rejects
+//   other: rejected (an unknown family is never a valid mDNS source)
+//
+// Exposed (rather than file-local) so it can be unit-tested directly: the
+// function is pure and its boundary rules are exactly what a regression test
+// needs to pin down.
+bool mdnsSourceIsPlausible(const sockaddr_storage &ss);
+
 class MDnsClient {
 public:
 	MDnsClient();

@@ -74,9 +74,14 @@ void UDPMux::removeAgent(const std::string &ufrag) {
 	auto it = agentsByUfrag_.find(ufrag);
 	if (it == agentsByUfrag_.end()) return;
 
-	// Remove all address-map entries that point to this agent.
+	// Remove address-map entries that still point to this agent. agentsByAddr_
+	// keeps one entry per remote address; another agent may have overwritten
+	// the same key, so only erase when it still refers to this agent.
 	for (const auto &key : it->second->remoteAddressKeys) {
-		agentsByAddr_.erase(key);
+		auto addrIt = agentsByAddr_.find(key);
+		if (addrIt != agentsByAddr_.end() && addrIt->second == it->second) {
+			agentsByAddr_.erase(addrIt);
+		}
 	}
 	agentsByUfrag_.erase(it);
 	STICE_LOG_INFO("UDPMux: removed agent ufrag=%s", ufrag.c_str());
@@ -132,6 +137,13 @@ bool UDPMux::boundAddr(AddrRecord &out) const {
 
 int UDPMux::setDiffserv(int ds) {
 	return sock_.setDiffserv(ds);
+}
+
+int UDPMux::sendtoWithDiffserv(const char *data, std::size_t size,
+                               const AddrRecord &dst, int ds) {
+	// Delegated to the shared socket so the set/send/reset window is serialized
+	// across every agent multiplexed on it.
+	return sock_.sendtoWithDiffserv(data, size, dst, ds);
 }
 
 int64_t UDPMux::nextTimestampMs() const {

@@ -21,6 +21,7 @@
 #endif
 
 #include <cstdio>
+#include <array>
 #include <cstring>
 
 namespace stice::crypto {
@@ -330,17 +331,20 @@ std::array<unsigned char, SHA256_SIZE> hmacSha256(const unsigned char *key, std:
 // CRC32 (IEEE 802.3, poly 0xEDB88320) — matches zlib crc32 / STUN FINGERPRINT.
 // ---------------------------------------------------------------------------
 uint32_t crc32(const unsigned char *data, std::size_t len) {
-	static uint32_t table[256];
-	static bool init = false;
-	if (!init) {
+	// C++11 magic-static lambda: the table is initialized exactly once with
+	// guaranteed thread-safe initialization, eliminating the data race that
+	// the previous hand-rolled `static bool init` caused when several gather
+	// worker threads called crc32() concurrently for the first time (TSan).
+	static const auto table = []() -> std::array<uint32_t, 256> {
+		std::array<uint32_t, 256> t{};
 		for (uint32_t i = 0; i < 256; ++i) {
 			uint32_t c = i;
 			for (int k = 0; k < 8; ++k)
 				c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-			table[i] = c;
+			t[i] = c;
 		}
-		init = true;
-	}
+		return t;
+	}();
 	uint32_t crc = 0xFFFFFFFFu;
 	for (std::size_t i = 0; i < len; ++i)
 		crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);

@@ -7,6 +7,7 @@
 #include "stice/net/addr.hpp"
 #include "stice/net/platform.hpp"
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -46,6 +47,13 @@ public:
 	              const AddrRecord *dsts, std::size_t count);
 	int sendtoSelf(const char *data, std::size_t size); // wake a poll loop
 	int setDiffserv(int ds);
+	// setDiffserv(ds) -> sendto -> setDiffserv(0) as ONE atomic operation.
+	// DSCP/TOS is per-socket state and UDPMux shares one socket across agents,
+	// so an unserialized set/send/reset window lets one agent's TOS mark leak
+	// into another agent's datagram (and the reset clobber a concurrent set).
+	// Serializing on the socket is what makes it correct for every sharer.
+	// ds < 0 means "leave TOS alone" and takes the plain sendto path.
+	int sendtoWithDiffserv(const char *data, std::size_t size, const AddrRecord &dst, int ds);
 	uint16_t port() const;
 	bool boundAddr(AddrRecord &out) const;
 	// Enumerate local candidate addresses (host candidates). family may be AF_UNSPEC.
@@ -56,6 +64,8 @@ public:
 private:
 	socket_t sock_ = STICE_INVALID_SOCKET;
 	int family_ = AF_UNSPEC;
+	// Serializes the diffserv set/send/reset window (see sendtoWithDiffserv).
+	mutable std::mutex diffservMtx_;
 };
 
 } // namespace stice::net

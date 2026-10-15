@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // Author: zlyadvocate
-// Version: 0.11.0
+// Version: 0.12.3
 #include "stice/stserver/config.hpp"
 
 #include "stice/log.hpp"
@@ -85,7 +85,17 @@ bool Config::load(const std::string &path) {
 
 	std::string userVal, passVal, usersVal;
 	std::string line;
+	bool firstLine = true;
 	while (std::getline(f, line)) {
+		if (firstLine) {
+			firstLine = false;
+			// Strip a UTF-8 BOM: an editor-saved BOM prefixes the first key's
+			// name and made the parser silently fall through to the unknown-key
+			// branch, so the server ran on defaults while the file looked right.
+			if (line.size() >= 3 && (unsigned char)line[0] == 0xEF &&
+			    (unsigned char)line[1] == 0xBB && (unsigned char)line[2] == 0xBF)
+				line.erase(0, 3);
+		}
 		// Strip comments: a '#' starts a comment only at the beginning of the
 		// (trimmed) line. We don't support inline trailing comments to avoid
 		// mangling passwords that contain '#'.
@@ -100,6 +110,7 @@ bool Config::load(const std::string &path) {
 
 		long long num = 0;
 		if (nk == "listenaddress") listenAddress = val;
+		else if (nk == "relayaddress") relayAddress = val;
 		else if (nk == "udpport") {
 			if (!parseRange(val, "udp_port", 1, 65535, num)) return false;
 			udpPort = static_cast<std::uint16_t>(num);
@@ -116,6 +127,9 @@ bool Config::load(const std::string &path) {
 		} else if (nk == "allocationlifetime") {
 			if (!parseRange(val, "allocation_lifetime", 10, 86400, num)) return false;
 			allocationLifetime = static_cast<std::uint32_t>(num);
+		} else if (nk == "noncelifetimesec") {
+			if (!parseRange(val, "nonce_lifetime_sec", 1, 86400, num)) return false;
+			nonceLifetimeSec = static_cast<std::uint32_t>(num);
 		} else if (nk == "relayportbegin") {
 			if (!parseRange(val, "relay_port_begin", 1024, 65535, num)) return false;
 			relayPortBegin = static_cast<std::uint16_t>(num);

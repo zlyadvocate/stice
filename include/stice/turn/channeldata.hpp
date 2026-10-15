@@ -60,7 +60,7 @@ std::size_t unwrapChannelData(const unsigned char *buf, std::size_t size,
                               std::uint16_t &channel, const unsigned char *&outData,
                               std::size_t &frameSize);
 
-// Pick a random channel number in 0x4000..0x4FFF.
+// Pick a random channel number in 0x4000..0x7FFF (RFC 5766/8656 range).
 std::uint16_t randomChannelNumber();
 
 } // namespace stice::turn

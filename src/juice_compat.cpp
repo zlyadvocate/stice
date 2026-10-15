@@ -8,7 +8,19 @@
 #include <juice/juice.h>   // the compatibility header we just created
 #include <stice/stice.h>   // the real stice API
 
+#include <cstdlib>
 #include <vector>
+
+// libjuice's src/tls.c honors JUICE_TURN_TLS_NO_VERIFY (accepting '1'/'t'/'T')
+// to disable TURN/TLS certificate verification. stice models the same knob as
+// the skip_tls_verify field on stice_turn_server_t, so map the env var through
+// here to keep this drop-in replacement faithful — the examples that test
+// against self-signed certs (turnstreamer, turn-tcp-suite, stun-turn-modes)
+// rely on it. Unset or any other value keeps the secure default 0.
+static int turnTlsSkipVerify() {
+	const char *v = std::getenv("JUICE_TURN_TLS_NO_VERIFY");
+	return (v && (v[0] == '1' || v[0] == 't' || v[0] == 'T')) ? 1 : 0;
+}
 
 // ---------------------------------------------------------------------------
 // Agent lifecycle
@@ -43,7 +55,7 @@ juice_agent_t *juice_create(const juice_config_t *config) {
 			sturn[i].port = config->turn_servers[i].port;
 			sturn[i].transport =
 			    static_cast<stice_turn_transport_t>(config->turn_servers[i].transport);
-			sturn[i].skip_tls_verify = 0;
+			sturn[i].skip_tls_verify = turnTlsSkipVerify();
 		}
 		sc.turn_servers = sturn.data();
 	}
@@ -96,7 +108,7 @@ int juice_add_turn_server(juice_agent_t *agent, const juice_turn_server_t *turn_
 	st.password = turn_server->password;
 	st.port = turn_server->port;
 	st.transport = static_cast<stice_turn_transport_t>(turn_server->transport);
-	st.skip_tls_verify = 0;
+	st.skip_tls_verify = turnTlsSkipVerify();
 	return stice_add_turn_server((stice_agent_t *)agent, &st);
 }
 

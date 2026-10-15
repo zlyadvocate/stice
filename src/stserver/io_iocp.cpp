@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // Author: zlyadvocate
-// Version: 0.11.0
+// Version: 0.12.3
 // IocpBackend: D plan implementation — Windows IOCP (Input/Output Completion
 // Port) based async IO with a dynamic worker thread pool.
 //
@@ -233,7 +233,13 @@ public:
 		// Erasing here would free the OverlappedCtx while an IOCP completion
 		// packet for it may still be queued, causing a use-after-free in
 		// the worker thread's CONTAINING_RECORD call.
-		::CancelIo(reinterpret_cast<HANDLE>(s));
+		// CancelIoEx (not CancelIo): the pending recv was posted by a WORKER
+		// thread, and CancelIo only cancels ops issued by the CALLING thread —
+		// a no-op here. The uncancelled recv then survived the socket close,
+		// its abort completion landed after the handle was recycled by a new
+		// relay socket, and the stale-completion re-post (see the worker error
+		// branch) created a second in-flight recv on the new socket.
+		::CancelIoEx(reinterpret_cast<HANDLE>(s), nullptr);
 		std::lock_guard<std::mutex> lk(relayMutex_);
 		relaySockets_.erase(s);
 	}
@@ -261,7 +267,9 @@ public:
 		// Mark the conn removed first so completion handlers do not
 		// re-post a recv on a socket handle that may be closed and
 		// recycled by a new connection.
-		::CancelIo(reinterpret_cast<HANDLE>(s));
+		// CancelIoEx: see removeRelaySocket — CancelIo cannot cancel the
+		// worker-thread-posted recv.
+		::CancelIoEx(reinterpret_cast<HANDLE>(s), nullptr);
 		{
 			std::lock_guard<std::mutex> lk(tcpConnMutex_);
 			tcpConns_.erase(s);
@@ -300,7 +308,15 @@ private:
 
 		auto *raw = ctx.get();
 		{
+			// At most ONE in-flight WSARecvFrom per socket, enforced atomically
+			// with the insert. Overwriting an existing ctx would free it while
+			// its overlapped op is still pending: the allocator hands the same
+			// block to the new ctx, both ops then share one buffer, and two
+			// completions deliver the same datagram bytes (also losing the
+			// earlier one). Observed as "negative loss" (rx > sent) under
+			// teardown churn.
 			std::lock_guard<std::mutex> lk(ctxMutex_);
+			if (ctxs_.count(s) > 0) return;
 			ctxs_[s] = std::move(ctx);
 		}
 
@@ -331,7 +347,8 @@ private:
 			    err == WSAEADDRNOTAVAIL || err == WSAECONNRESET ||
 			    err == WSAEMSGSIZE || err == WSAENETUNREACH ||
 			    err == WSAEHOSTUNREACH || err == WSAENETDOWN ||
-			    err == WSAETIMEDOUT || err == WSAEWOULDBLOCK;
+			    err == WSAETIMEDOUT || err == WSAEWOULDBLOCK ||
+			    err == WSAEFAULT; // 10014: invalidated/partially-registered
 			if (!transient || attempt >= 8) {
 				STICE_LOG_ERROR("stserver: WSARecvFrom failed on sock %llu: %d", static_cast<unsigned long long>(s), err);
 				std::lock_guard<std::mutex> lk(ctxMutex_);
@@ -356,7 +373,10 @@ private:
 
 		auto *raw = ctx.get();
 		{
+			// Same single-in-flight invariant as postRecvFrom: never overwrite
+			// a ctx whose op is still pending (shared-buffer double delivery).
 			std::lock_guard<std::mutex> lk(ctxMutex_);
+			if (ctxs_.count(s) > 0) return;
 			ctxs_[s] = std::move(ctx);
 		}
 
@@ -457,18 +477,31 @@ private:
 				// single transient error permanently deafens that socket
 				// (measured: after one client teardown the server stopped
 				// responding to any Allocate).
+				// Identity guard: re-post ONLY when this completion belongs
+				// to the socket's CURRENT ctx. A stale ctx (aborted op whose
+				// handle was already recycled by a new relay socket) must
+				// never trigger a re-post — that created a second in-flight
+				// recv sharing the new ctx's buffer, and the two completions
+				// then delivered the same datagram twice (negative loss).
+				bool wasCurrent = false;
 				{
 					std::lock_guard<std::mutex> lk(ctxMutex_);
 					for (auto it = ctxs_.begin(); it != ctxs_.end(); ++it) {
-						if (it->second.get() == ctx) { ctxs_.erase(it); break; }
+						if (it->second.get() == ctx) {
+							ctxs_.erase(it);
+							wasCurrent = true;
+							break;
+						}
 					}
 				}
-				if (running_ && s == udpListener_) {
-					postRecvFrom(s);
-				} else if (running_) {
-					// Relay socket: only re-post if still registered.
-					std::lock_guard<std::mutex> lk(relayMutex_);
-					if (relaySockets_.count(s) > 0) postRecvFrom(s);
+				if (running_ && wasCurrent) {
+					if (s == udpListener_) {
+						postRecvFrom(s);
+					} else {
+						// Relay socket: only re-post if still registered.
+						std::lock_guard<std::mutex> lk(relayMutex_);
+						if (relaySockets_.count(s) > 0) postRecvFrom(s);
+					}
 				}
 			}
 			continue;

@@ -45,6 +45,13 @@ public:
 	// Returns the number of bytes currently buffered (not yet consumed).
 	std::size_t buffered() const { return buf_.size() - consumed_; }
 
+	// Take the not-yet-consumed bytes and reset the buffer. Used at the
+	// CONNECTION-BIND hand-off: a STUN frame is self-delimited and does NOT
+	// consume the whole TCP segment, so the bytes after the bind response are
+	// already the head of the RFC 4571 data stream and must be re-framed by the
+	// caller instead of being parsed as more self-delimited STUN frames.
+	bytes takeBuffered();
+
 private:
 	bytes buf_;
 	std::size_t consumed_ = 0;

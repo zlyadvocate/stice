@@ -64,6 +64,11 @@ namespace stice::ice {
 // which sets alive=false and blocks until inFlight drops to zero,
 // guaranteeing no callback is executing (or will execute) before
 // destruction proceeds.
+// Budget for LifetimeGuard::shutdown() to drain in-flight async scopes before
+// ~Agent gives up, proceeds, and reports it loudly. Kept BOUNDED on purpose: a
+// wedged scope-holder must not be able to hang teardown forever.
+constexpr int LifetimeDrainTimeoutMs = 5000;
+
 class LifetimeGuard {
 public:
 	std::atomic<bool> alive{true};
@@ -89,13 +94,21 @@ public:
 		}
 	}
 
-	void shutdown() {
+	// Drain in-flight async scopes. BOUNDED on purpose: a scope-holder that is
+	// itself wedged (e.g. a poll-thread callback stuck behind a lock) must not be
+	// able to hang teardown forever - that was the failure mode behind
+	// "tearing down A" never returning. Returns true when everything drained;
+	// false means we gave up and the caller proceeds anyway (a deliberately
+	// bounded hang -> diagnosable failure trade-off, because the leaked thread
+	// may still reference this agent).
+	bool shutdown(int timeoutMs = LifetimeDrainTimeoutMs) {
 		alive.store(false, std::memory_order_release);
 		std::unique_lock<std::mutex> lock(cvMutex);
-		cv.wait(lock, [this] {
+		return cv.wait_for(lock, std::chrono::milliseconds(timeoutMs), [this] {
 			return inFlight.load(std::memory_order_acquire) == 0;
 		});
 	}
+	int inFlightCount() const { return static_cast<int>(inFlight.load(std::memory_order_acquire)); }
 };
 
 // RAII scope guard for LifetimeGuard. Construct at the top of each async
@@ -135,17 +148,43 @@ constexpr int GatherTimeoutMs = 15000;
 // so a silent peer would otherwise never advance. Aligned with the ICE-TCP
 // check retransmission budget (StunTcpTimeoutMs).
 constexpr int TcpConnectTimeoutMs = 8000;
+// Bounded wait for the parallel DNS phase of the gather worker. getaddrinfo has
+// no timeout of its own, so an unresponsive resolver must never be able to pin
+// the worker (and therefore stice_destroy) indefinitely: after this the item is
+// treated as unresolved and its resolver thread is abandoned (it touches no
+// Agent state).
+constexpr int GatherDnsTimeoutMs = 5000;
+// Bounded wait in ~Agent for the gather worker to exit after cancellation. The
+// DNS phase is bounded/detachable and the entry-building phase now acquires the
+// agent lock with a bounded budget too (GatherLockTimeoutMs), so the worker can
+// never sit on a LifetimeScope indefinitely; this budget covers both.
+constexpr int GatherWorkerJoinTimeoutMs = 3000;
+// Budget for the gather worker to acquire Agent::mutex_ in its entry-building
+// phase. std::recursive_mutex has no timed lock, so this is a try_lock poll loop.
+// Bounding it is what keeps the worker's LifetimeScope hold time finite - without
+// it, a wedged mutex holder left that scope alive forever and ~Agent's drain
+// blocked on it permanently (the "tearing down A" hang).
+constexpr int GatherLockTimeoutMs = 1000;
 constexpr int StunPacingTimeMs = 50; // Ta
 constexpr int StunKeepalivePeriodMs = 15000;
+// RFC 8863 (Patiently Awaiting Connectivity) recommends the PAC timer be the
+// agent's connectivity check transaction timeout, i.e. 39.5 s.
 constexpr int IcePacTimeoutMs = 39500;
 constexpr int ConsentTimeoutMs = 30000;
+// RFC 7675 §5.1: the consent check period is randomized within [0.8, 1.2] x the
+// basic period, "SHOULD set a default interval of 5 seconds" -> 4-6 s, and
+// "MUST NOT set the period between checks to less than 4 seconds".
+constexpr int DefaultConsentCheckPeriodMs = 5000;
 constexpr int MinConsentCheckPeriodMs = 4000;
 constexpr int MaxConsentCheckPeriodMs = 6000;
 // Idle consent freshness: when no application data has flowed for
 // IdleThresholdMs, stretch the consent check interval to IdleConsentCheckMs
-// to reduce traffic on quiescent sessions. Must stay well below
-// ConsentTimeoutMs so consent never silently expires.
-constexpr int IdleConsentCheckMs = 15000;
+// to reduce traffic on quiescent sessions. Kept within ~1/3 of
+// ConsentTimeoutMs so that at least three checks land inside the 30 s window
+// even with packet loss (RFC 7675 expects ~5-7 checks in that window; a 15 s
+// interval left only two chances and made premature consent expiry under loss
+// materially more likely).
+constexpr int IdleConsentCheckMs = 10000;
 constexpr int IdleThresholdMs = 30000;
 constexpr int NominationTimeoutMs = 2000;
 // Nomination delay by candidate type (aligned with pion-ice defaultNominationDelay).
@@ -188,12 +227,26 @@ struct StunEntry {
 	bool transactionIdExpired = true;
 	// For TURN RELAY entries: the underlying TURN client.
 	std::unique_ptr<turn::Client> turn;
-	// For CHECK entries that go via a relay, pointer to the RELAY entry.
-	StunEntry *relayEntry = nullptr;
-	// For TURN RELAY entries: allocation start time for RTT measurement.
-	// Set just before the first allocate() call; used in onAllocated to
-	// compute the allocation RTT for relay priority dynamic correction.
-	std::chrono::steady_clock::time_point allocateStartTime{};
+	// For TURN RELAY entries over TCP/TLS: dedicated control transport +
+	// self-delimiting frame reassembler. Per-entry ownership lets multiple
+	// TCP/TLS TURN servers allocate concurrently (the old agent-wide single
+	// turnTcpTransport_ allowed one). shared_ptr because the entry's sendRaw
+	// closure also holds it: if the relay entry is ever reset/erased while a
+	// TURN client callback still routes through sendRaw, the transport stays
+	// alive until every owner drops it (no UAF).
+	std::shared_ptr<net::TcpTransport> turnTcp;
+	turn::StunConn turnTcpConn;
+	bool tcpTurn = false; // entry uses a TCP/TLS control connection
+	// TLS parameters of the control connection (inherited by the RFC 6062
+	// data connection so turns: relay does not silently downgrade to plain).
+	bool turnTcpUseTls = false;
+	std::string turnTcpSni;
+	bool turnTcpSkipVerify = false;
+	// Terminal-event guard: pendingRelayAllocations_ is decremented exactly
+	// once per relay entry, by the first of onAllocated/onFailed that fires.
+	std::shared_ptr<std::atomic<bool>> relayCounted;
+	// Shared allocation-start time for RTT-based relay priority correction.
+	std::shared_ptr<std::chrono::steady_clock::time_point> allocStart;
 };
 
 struct AgentConfig {
@@ -254,16 +307,18 @@ public:
 	bool hasTcp() const override { return tcpTransport_ != nullptr; }
 	socket_t tcpSocket() const override;
 	short tcpDesiredEvents() const override;
-	bool hasTurnTcp() const override { return turnTcpTransport_ != nullptr; }
-	socket_t turnTcpSocket() const override;
-	short turnTcpDesiredEvents() const override;
+	// Indexed TURN-TCP slots: one control transport per TCP/TLS relay entry
+	// (base-class legacy single-slot hooks stay at their defaults).
+	int turnTcpSlotCount() const override;
+	socket_t turnTcpSocketAt(int i) const override;
+	short turnTcpDesiredEventsAt(int i) const override;
+	void onTurnTcpEventsSock(socket_t sock, short events) override;
 	bool hasTurnDataTcp() const override;
 	socket_t turnDataTcpSocket() const override;
 	short turnDataDesiredEvents() const override;
 	int64_t nextTimestampMs() const override;
 	void onUdpReadable() override;
 	void onTcpEvents(short events) override;
-	void onTurnTcpEvents(short events) override;
 	void onTurnDataTcpEvents(short events) override;
 	void onBookkeeping(int64_t nowMs) override;
 
@@ -329,7 +384,9 @@ private:
 	// on a dedicated thread, then create StunEntry objects under the mutex.
 	// This eliminates serial getaddrinfo blocking that stalls the poll thread.
 	void gatherCandidatesWorker(std::vector<struct GatherItem> items,
-	                            std::shared_ptr<LifetimeGuard> lifetime);
+	                            std::shared_ptr<LifetimeGuard> lifetime,
+	                            std::shared_ptr<std::atomic<bool>> cancel,
+	                            std::shared_ptr<std::atomic<bool>> done);
 	// Create a STUN server-reflexive entry from a pre-resolved address.
 	void createServerReflexiveEntry(const std::string &host, uint16_t port,
 	                                const net::AddrRecord &resolved);
@@ -395,25 +452,45 @@ private:
 	void handleInboundTcpPacket(const char *data, int len, const net::AddrRecord &src);
 	// Demultiplex inbound TURN TCP: self-delimited STUN / ChannelData frames
 	// parsed by StunConn, then routed to the TURN client.
-	void handleInboundTurnTcp();
+	void handleInboundTurnTcp(StunEntry &entry);
+	// Find the first relay entry that uses a TCP/TLS control connection (the
+	// RFC 6062 machinery drives one TCP allocation at a time per agent).
+	StunEntry *findTcpTurnEntry();
+	const StunEntry *findTcpTurnEntry() const;
 	// --- UDPMux helpers ---
 	// Send a UDP packet via the agent's own socket or the shared mux socket.
-	int sendUdp(const char *data, std::size_t size, const net::AddrRecord &dst);
+	// `control=true` marks STUN connectivity signalling (ICE checks /
+	// keepalives / binding responses / TURN control frames). When the socket
+	// backs up (SO_SNDBUF full under a bulk-data flood), control frames are
+	// queued and flushed ahead of bulk data on the next onBookkeeping pass, so
+	// signalling is never dropped by application flooding on UDP transports.
+	int sendUdp(const char *data, std::size_t size, const net::AddrRecord &dst,
+	            bool control = false);
+	// Drain the UDP control-frame queue with priority (sendUdp control=true
+	// frames refused by a backed-up socket). Called from onBookkeeping.
+	void flushUdpControlQueue();
 	// Send a RFC 4571-framed packet over the TCP transport (if connected).
 	// If the pair's local candidate is TCPPassive and a TCPMux is set,
 	// routes through the TCPMux's established connection instead.
-	int sendTcp(const char *data, std::size_t size, const CandidatePair *pair = nullptr);
+	// `control=true` sends via the control-frame queue (STUN signalling),
+	// which is flushed ahead of queued bulk application data so connectivity
+	// checks are never starved by an application flood.
+	int sendTcp(const char *data, std::size_t size, const CandidatePair *pair = nullptr,
+	            bool control = false);
 	// Check if a candidate pair uses TCP transport.
 	bool pairIsTcp(const CandidatePair *p) const;
 	// Check if a candidate pair uses TURN TCP-relayed transport (RFC 6062).
 	// Such pairs route data through turnDataConn_ instead of tcpTransport_.
 	bool pairIsTurnTcpRelay(const CandidatePair *p) const;
-	// Begin a TURN over TCP/TLS connection to the TURN server. Called from
-	// gatherRelay when the transport is TCP or TLS. Returns false on failure.
-	bool beginTurnTcpConnect(const net::AddrRecord &turnServer, bool useTls,
-	                         const std::string &sni, bool skipVerify);
-	// Called when the TURN TCP transport becomes connected or fails.
-	void onTurnTcpConnected();
+	// Begin a TURN over TCP/TLS connection for one relay entry. Called from
+	// createRelayEntry when the transport is TCP or TLS. The transport is
+	// stored in the entry (per-server), so multiple TCP/TLS TURN servers
+	// connect concurrently. Returns false on immediate failure.
+	bool beginTurnTcpConnect(StunEntry &entry, const net::AddrRecord &turnServer,
+	                         bool useTls, const std::string &sni, bool skipVerify);
+	// Called when a relay entry's TCP transport becomes connected: sends the
+	// buffered Allocate request now that the control connection is ready.
+	void onTurnTcpConnected(StunEntry &entry);
 	// Enumerate local addresses via the agent's socket or the shared mux socket.
 	std::vector<net::AddrRecord> localAddrsUdp(int family = AF_UNSPEC) const;
 	// Get the bound address via the agent's socket or the shared mux socket.
@@ -479,6 +556,9 @@ private:
 
 	mutable std::recursive_mutex mutex_;
 	net::UdpSocket sock_;
+	// Diagnostic: local UDP bound port (set after socket bind) so log lines
+	// identify which peer (A/B) is acting. 0 until bound.
+	std::uint16_t diagLocalPort_ = 0;
 	// Optional shared UDP mux. When non-null, the agent sends/receives through
 	// the mux's shared socket instead of its own sock_.
 	net::UDPMux *mux_ = nullptr;
@@ -489,17 +569,6 @@ private:
 	std::unique_ptr<net::TcpTransport> tcpTransport_;
 	net::AddrRecord tcpPeerAddr_;
 	std::string tcpSni_;
-	// TURN over TCP/TLS transport (separate from ICE-TCP tcpTransport_).
-	// Uses Raw framing mode (no RFC 4571 prefix); StunConn handles parsing.
-	std::unique_ptr<net::TcpTransport> turnTcpTransport_;
-	turn::StunConn turnStunConn_;
-	// Pointer to the TURN StunEntry (so we can route received data to the
-	// correct TURN client). Set when beginTurnTcpConnect succeeds.
-	StunEntry *turnTcpEntry_ = nullptr;
-	// Shared allocation-start-time pointer for TURN-over-TCP RTT measurement.
-	// Set in gatherRelay (TCP path), populated in onTurnTcpConnected, consumed
-	// in the onAllocated lambda.
-	std::shared_ptr<std::chrono::steady_clock::time_point> turnTcpAllocStart_;
 	// RFC 6062 TCP allocation data connection. Separate TCP connection to the
 	// TURN server, bound via CONNECTION-BIND. After binding, raw application
 	// data (STUN checks + app data) flows end-to-end through the TURN server.
@@ -530,14 +599,39 @@ private:
 	// sending CONNECT simultaneously before ICE role conflict resolution
 	// (487) can occur, which would cause the TURN server to reject one.
 	// Falls back to mode_==Controlling when remote ufrag is unavailable.
+	//
+	// INTEROP CAVEAT - NON-STANDARD CONNECT. RFC 6062 / RFC 6544 do not define
+	// a ufrag comparison: there, the candidate roles (active dials, passive
+	// listens) decide who sends CONNECT, and the server itself may dial the
+	// peer. The rule below is stice's own convention (mirrored from libjuice),
+	// so this TCP-relay link is only known to interoperate with peers that
+	// implement the same rule, i.e. stice <-> stice and stice <-> libjuice.
+	// Against a generic RFC 6062 implementation either both sides send CONNECT
+	// (one is rejected) or neither does, and the relayed TCP pair never comes
+	// up. Do not treat this path as a general RFC 6062 client.
 	bool shouldInitiateTcpConnect() const;
 
 	// RFC 6062 CONNECT retry state. The TURN server may return 447 (Connection
 	// Timeout or Failure) if the peer's relay listener isn't fully ready when
 	// the CONNECT is processed. We retry up to MaxConnectRetries times with
-	// ConnectRetryDelayMs between attempts.
-	static constexpr int MaxConnectRetries = 3;
-	static constexpr int ConnectRetryDelayMs = 500;
+	// ConnectRetryDelayMs between attempts, so the retry budget spans
+	// MaxConnectRetries * ConnectRetryDelayMs = 20 s.
+	//
+	// The delay used to be 500 ms, i.e. a 1.5 s total window - far too short:
+	// before a CONNECT can succeed the peer must finish its own TCP allocation,
+	// CREATE_PERMISSION and CONNECTION-ATTEMPT handling, which under load takes
+	// longer than 1.5 s, so the first 447 was already terminal and the relay pair
+	// failed although the peer became ready moments later.
+	//
+	// The spacing is now >= 10 s as RFC 6062 §4.3 requires of the client's retry
+	// pacing. An interval below 10 s (a 5 s x 3 compromise) was rejected: the
+	// RFC's floor governs how fast a client may re-issue CONNECT, and compliance
+	// wins over the small latency saving there. MaxConnectRetries is reduced 3 -> 2
+	// so the worst-case wait before a genuinely dead pair is detected stays close
+	// to the previous budget (20 s vs 15 s) and does not fight the profile's
+	// fast-failure tuning (tight RTO / max_check_retransmit).
+	static constexpr int MaxConnectRetries = 2;
+	static constexpr int ConnectRetryDelayMs = 10000;
 	int connectRetries_ = 0;
 	net::AddrRecord pendingConnectPeer_;
 	bool pendingConnectRetry_ = false;
@@ -548,6 +642,27 @@ private:
 	// once the allocation transitions to Allocated. Reset to false when
 	// a new TCP allocation begins or after the data connection is bound.
 	bool tcpConnectSent_ = false;
+	// pion-mode: defer the RFC 6062 CONNECT until the local CreatePermission
+	// for the peer has completed (turn::hasPermission). Mirrors pion's
+	// createPermission-before-Connect so the TURN server has the permission
+	// it needs to forward CONNECTION-ATTEMPT (RFC 6062 §4.4), eliminating the
+	// race where coturn returns CONNECT success but never forwards ATTEMPT
+	// because the permission wasn't installed yet.
+	bool pendingConnectWaitPerm_ = false;
+
+	// RFC 6062 data-connection (CONNECTION-BIND) retry state. The TURN server
+	// may close the data TCP connection before CONNECTION-BIND completes if
+	// the peer's CREATE_PERMISSION has not been processed yet (coturn:
+	// "tcp_peer_accept_connection: peer has no permission to connect"). This
+	// is a transient ordering race; retrying the data connect a few times with
+	// a short delay lets the permission propagate and the bind succeed.
+	static constexpr int MaxTurnDataConnectRetries = 4;
+	static constexpr int TurnDataRetryDelayMs = 300;
+	int turnDataRetryCount_ = 0;
+	bool pendingTurnDataRetry_ = false;
+	std::chrono::steady_clock::time_point nextTurnDataRetry_{};
+	std::uint32_t turnDataRetryConnId_ = 0;
+	net::AddrRecord turnDataRetryPeer_;
 
 	// NAT 1:1 IP address rewrite mapper.
 	std::unique_ptr<AddressRewriteMapper> addrRewrite_;
@@ -567,7 +682,7 @@ private:
 	int pendingRelayAllocations_ = 0;
 	int pendingServerReflexive_ = 0;
 
-	std::vector<StunEntry> entries_;
+	std::deque<StunEntry> entries_;
 	std::vector<std::unique_ptr<CandidatePair>> pairs_;
 	std::vector<CandidatePair *> orderedPairs_;
 	CandidatePair *selectedPair_ = nullptr;
@@ -579,6 +694,20 @@ private:
 	std::chrono::steady_clock::time_point pacTimestamp_{};
 	std::chrono::steady_clock::time_point nominationTimestamp_{};
 	std::chrono::steady_clock::time_point nextTick_{};
+	// UDP control-frame queue: control frames refused by a backed-up socket are
+	// held here and drained by flushUdpControlQueue() on the poll loop ahead of
+	// bulk data, so ICE/TURN signalling is not dropped under a data flood.
+	// Guarded by udpCtrlMutex_ (control-frame send sites include the gather
+	// worker, which runs off-thread).
+	std::deque<std::pair<net::AddrRecord, std::vector<unsigned char>>> udpCtrlQueue_;
+	std::mutex udpCtrlMutex_;
+	// Serializes outbound socket writes that happen OUTSIDE the main mutex_
+	// (Agent::send fast paths). Mirrors libjuice send_mutex: the app send
+	// loop runs concurrently with the poll thread, so sendto / relayTurnTcp
+	// writes must not race a socket close/rebuild. Writes stay inside the
+	// ICE lock only for the snapshot; the actual socket write takes sendMutex_.
+	std::mutex sendMutex_;
+
 	// Time when the agent entered CONNECTING (checking started). Used for
 	// acceptance min wait calculation, aligned with pion-ice selector.startTime.
 	std::chrono::steady_clock::time_point checkingStartTime_{};
@@ -589,11 +718,29 @@ private:
 	// Last time application data was sent or received. Used to detect idle
 	// sessions and stretch the consent freshness interval (P1-2).
 	std::chrono::steady_clock::time_point lastAppDataAt_{};
+	// RFC 8863 (Patiently Awaiting Connectivity): deadline until which the agent
+	// must NOT transition Running -> Failed even though every pair has already
+	// failed. Zero means "no PAC wait in progress". Armed the first time the
+	// checklist is found fully failed while CONNECTING, cleared as soon as any
+	// pair is no longer Failed (connectivity is being attempted again) and once
+	// the transition happens. Exposed through nextTimestampMs() so the poll
+	// thread wakes exactly at the deadline.
+	std::chrono::steady_clock::time_point pacDeadline_{};
 
 	// Worker thread for parallel candidate gathering. Resolves all STUN/TURN
-	// server DNS in parallel, then creates entries under the mutex. Joined in
-	// ~Agent and at restart.
+	// server DNS in parallel, then creates entries under the mutex. Stopped in
+	// ~Agent with a BOUNDED wait (see gatherCancel_/gatherWorkerDone_) and at
+	// restart. An unbounded join here used to hang stice_destroy whenever the
+	// worker got stuck.
 	std::thread gatherWorker_;
+	// Cancellation / completion flags handed to the gather worker BY VALUE.
+	// shared_ptr so the worker can safely read and set them even if it outlives
+	// a bounded-join teardown - the Agent's raw `this` must not be dereferenced
+	// once the worker has been asked to stop.
+	std::shared_ptr<std::atomic<bool>> gatherCancel_ =
+		std::make_shared<std::atomic<bool>>(false);
+	std::shared_ptr<std::atomic<bool>> gatherWorkerDone_ =
+		std::make_shared<std::atomic<bool>>(false);
 
 	// Per-agent PollRegistry instance (per-agent independent thread model).
 	// Each Agent owns its own PollRegistry + background thread, aligned with

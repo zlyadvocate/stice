@@ -85,6 +85,9 @@ public:
 
 	// Send a packet (RFC 4571 framed) over this connection.
 	int send(const char *data, std::size_t size);
+	// Send a CONTROL frame (STUN signalling) that jumps ahead of queued bulk
+	// data, so an application flood can never starve connectivity checks.
+	int sendControl(const char *data, std::size_t size);
 
 	// Close the connection and mark as closed.
 	void close() {
@@ -147,7 +150,11 @@ public:
 
 	// Send a packet to `dst` over the established TCP connection for that
 	// remote address. Returns bytes sent on success, <0 on failure.
-	int sendto(const char *data, std::size_t size, const AddrRecord &dst);
+	// `control=true` sends via the control queue (STUN signalling), which is
+	// flushed ahead of queued bulk application data — connectivity checks
+	// must never be starved by an application flood.
+	int sendto(const char *data, std::size_t size, const AddrRecord &dst,
+	           bool control = false);
 
 	// Get the bound address of the listener (for candidate generation).
 	bool boundAddr(AddrRecord &out) const;

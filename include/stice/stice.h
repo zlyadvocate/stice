@@ -191,6 +191,14 @@ typedef struct stice_config {
 	// via stice_agent_use_tcp_mux, otherwise nothing is gathered and ICE
 	// fails explicitly (no silent fallback to another transport).
 	int disable_udp_gathering;
+	// relay-only local candidate gathering (default 0). Skips host and srflx
+	// UDP candidate collection but still performs TURN allocations, so local
+	// candidates are only Relayed. Yields relay+relay pairings for TURN modes
+	// instead of the default host->relay pairing (which sends from the client
+	// UDP socket to the peer relayed address and can be dropped when server
+	// permissions are relayed-granularity). Unlike disable_udp_gathering this
+	// does NOT skip TURN allocations.
+	int relay_only_local;
 
 	// mDNS mode (default: STICE_MDNS_MODE_DISABLED).
 	stice_multicast_dns_mode_t multicast_dns_mode;

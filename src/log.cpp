@@ -17,8 +17,9 @@ Logger &Logger::instance() {
 }
 
 void Logger::setLevel(stice_log_level_t level) {
-	std::lock_guard<std::mutex> lock(mutex_);
-	level_ = level;
+	// Relaxed store: level is set once at startup (before worker threads run);
+	// shouldLog() reads it lock-free on every hot-path call site.
+	level_.store(static_cast<int>(level), std::memory_order_relaxed);
 }
 
 void Logger::setHandler(stice_log_cb_t cb) {
@@ -27,11 +28,13 @@ void Logger::setHandler(stice_log_cb_t cb) {
 }
 
 void Logger::log(stice_log_level_t level, const char *fmt, ...) {
+	// Fast lock-free rejection (callers normally guard via shouldLog(), this
+	// covers direct callers and keeps the common disabled case lock-free).
+	if (!shouldLog(level))
+		return;
 	stice_log_cb_t cb;
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
-		if (level < level_)
-			return;
 		cb = cb_;
 	}
 	if (!cb)

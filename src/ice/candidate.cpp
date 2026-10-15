@@ -140,6 +140,22 @@ std::string Candidate::computeFoundation(CandidateType type, const std::string &
 	return buf;
 }
 
+// libjuice appends "raddr 0.0.0.0 rport 0" to srflx/relay candidates purely so
+// old Firefox builds accept the line, but the address it advertises is FALSE.
+// RFC 8839 §5.1.1 wants the real base address, or no raddr/rport at all. It is
+// therefore a compatibility hack rather than protocol output: default-on (interop
+// first, matching libjuice) with an opt-out for a strict peer:
+//     set STICE_SDP_RADDR_HACK=0
+static bool sdpRaddrHackEnabled() {
+	static const bool enabled = [] {
+		const char *v = std::getenv("STICE_SDP_RADDR_HACK");
+		if (!v || !v[0]) return true;
+		const char c = v[0];
+		return !(c == '0' || c == 'n' || c == 'N' || c == 'f' || c == 'F');
+	}();
+	return enabled;
+}
+
 std::string Candidate::toSdp() const {
 	// a=candidate:<foundation> <component> <transport> <priority> <host> <port> typ <type>[ tcptype active|passive|so][ raddr .. rport ..]
 	char buf[512];
@@ -148,8 +164,9 @@ std::string Candidate::toSdp() const {
 	if (transport == CandidateTransport::TCPActive) suffix += " tcptype active";
 	else if (transport == CandidateTransport::TCPPassive) suffix += " tcptype passive";
 	else if (transport == CandidateTransport::TCPSimultaneousOpen) suffix += " tcptype so";
-	// libjuice appends "raddr 0.0.0.0 rport 0" for srflx/relay for Firefox compatibility.
-	if (type == CandidateType::ServerReflexive || type == CandidateType::Relayed) {
+	// Firefox-compatibility hack (see sdpRaddrHackEnabled above).
+	if ((type == CandidateType::ServerReflexive || type == CandidateType::Relayed) &&
+		sdpRaddrHackEnabled()) {
 		suffix += " raddr 0.0.0.0 rport 0";
 	}
 	std::snprintf(buf, sizeof(buf), "a=candidate:%s %d %s %u %s %s typ %s%s",

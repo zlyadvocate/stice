@@ -80,6 +80,10 @@ public:
 
 	// Set DSCP on the shared socket.
 	int setDiffserv(int ds);
+	// Atomic set -> send -> reset of the DSCP/TOS window on the shared socket.
+	// Serialized on the socket, so concurrent agents cannot interleave their
+	// per-socket TOS state. ds < 0 means "leave TOS alone".
+	int sendtoWithDiffserv(const char *data, std::size_t size, const AddrRecord &dst, int ds);
 
 	// Get the shared socket handle (for logging only).
 	socket_t socketHandle() const { return sock_.valid() ? sock_.handle() : STICE_INVALID_SOCKET; }

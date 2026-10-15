@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Copyright (c) 2019-2026 zlyadvocate
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
@@ -69,7 +69,7 @@ bool hasDuplicate(const struct sockaddr *addr, const std::vector<AddrRecord> &re
 		} else if (addr->sa_family == AF_INET6) {
 			auto *a = reinterpret_cast<const sockaddr_in6 *>(addr);
 			auto *b = reinterpret_cast<const sockaddr_in6 *>(rsa);
-			if (std::memcmp(&a->sin6_addr, &b->sin6_addr, 8) == 0) return true;
+			if (std::memcmp(&a->sin6_addr, &b->sin6_addr, 16) == 0) return true; // full 128-bit compare
 		}
 	}
 	return false;
@@ -107,20 +107,53 @@ static socket_t createForAddrinfo(const UdpSocketConfig &cfg, const struct addri
 		int disabled = 0;
 		setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<const char *>(&disabled), sizeof(disabled));
 	}
-	// Set DF flag (Linux IP_MTU_DISCOVER; others IP_DONTFRAG).
+	// Don't-Fragment policy, set explicitly on every platform so the two builds
+	// behave identically: ALLOW IP fragmentation.
+	//   * Linux: IP_PMTUDISC_DONT. The default (IP_PMTUDISC_WANT) derives DF
+	//     from the route, and stserver's relay sockets historically ran with
+	//     IP_PMTUDISC_DO (DF forced), which made cross-host 8 KiB ChannelData
+	//     fail with EMSGSIZE. Pinning DONT is the safe, explicit policy.
+	//   * Windows: IP_DONTFRAG defaults to FALSE, but set it explicitly rather
+	//     than depending on the platform default (a stray TRUE would silently
+	//     drop large relayed datagrams the same way).
+	//   * Other POSIX (macOS/BSD): IP_DONTFRAG is also a boolean DF switch.
 #ifdef __linux__
-	int val = IP_PMTUDISC_DO;
+	int val = IP_PMTUDISC_DONT;
 	setsockopt(sock, IPPROTO_IP, IP_MTU_DISCOVER, &val, sizeof(val));
 #ifdef IPV6_MTU_DISCOVER
 	if (ai->ai_family == AF_INET6)
 		setsockopt(sock, IPPROTO_IPV6, IPV6_MTU_DISCOVER, &val, sizeof(val));
 #endif
+#else
+	int dontFrag = 0; // 0 = fragmentation allowed
+#ifdef IP_DONTFRAG
+	setsockopt(sock, IPPROTO_IP, IP_DONTFRAG,
+	           reinterpret_cast<const char *>(&dontFrag), sizeof(dontFrag));
 #endif
-	// 4 MiB buffers: UDPMux shares one socket across 100+ agents, so
-	// concurrent srflx STUN responses burst far past the default.
-	int bufsize = 4 * 1024 * 1024;
+#ifdef IPV6_DONTFRAG
+	if (ai->ai_family == AF_INET6)
+		setsockopt(sock, IPPROTO_IPV6, IPV6_DONTFRAG,
+		           reinterpret_cast<const char *>(&dontFrag), sizeof(dontFrag));
+#endif
+#endif
+	// 16 MiB buffers: UDPMux shares one socket across 100+ agents, so
+	// concurrent srflx STUN responses burst far past the default; high-rate
+	// application data (e.g. tight loopback sends at 200+ MB/s) momentarily
+	// exceeds a small socket buffer and the kernel drops datagrams.
+	// NOTE: Linux clamps SO_RCVBUF/SO_SNDBUF to net.core.rmem_max/wmem_max
+	// (default 212992 = 208 KiB) - the effective buffer can be far smaller
+	// than requested, which turns bursts into drops. Verified below.
+	int bufsize = 16 * 1024 * 1024;
 	setsockopt(sock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char *>(&bufsize), sizeof(bufsize));
 	setsockopt(sock, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char *>(&bufsize), sizeof(bufsize));
+#if defined(__linux__)
+	int actual = 0;
+	socklen_t alen = sizeof(actual);
+	if (getsockopt(sock, SOL_SOCKET, SO_RCVBUF, &actual, &alen) == 0 &&
+	    actual < bufsize / 2) {
+		STICE_LOG_WARN("UDP SO_RCVBUF clamped to %d (requested %d); raise net.core.rmem_max for high-rate data", actual, bufsize);
+	}
+#endif
 
 	if (!setNonBlocking(sock)) {
 		STICE_LOG_ERROR("Setting non-blocking mode on UDP socket failed");
@@ -152,8 +185,8 @@ static socket_t createForAddrinfo(const UdpSocketConfig &cfg, const struct addri
 			uint16_t port = nextPortInRange(cfg.portBegin, cfg.portEnd);
 			addrSetPort(reinterpret_cast<struct sockaddr *>(&ss), port);
 			if (bindAddr(ss, len)) return sock;
-		} while ((sticeSockerrno == EADDRINUSE || sticeSockerrno == EACCES) && retries-- > 0);
-		STICE_LOG_WARN("UDP socket binding failed on port range [%hu,%hu]", cfg.portBegin, cfg.portEnd);
+		} while ((sticeSockerrno == STICE_SEADDRINUSE || sticeSockerrno == STICE_SEACCES) && retries-- > 0);
+		STICE_LOG_WARN("UDP socket binding failed on port range [%hu,%hu] errno=%d", cfg.portBegin, cfg.portEnd, sticeSockerrno);
 	}
 	sticeClosesocket(sock);
 	return STICE_INVALID_SOCKET;
@@ -196,12 +229,11 @@ int UdpSocket::recvfrom(char *buf, std::size_t size, AddrRecord &src) {
 			addrUnmapInet6V4Mapped(reinterpret_cast<struct sockaddr *>(&src.addr), src.len);
 			return len;
 		}
-		if (sticeSockerrno == STICE_SECONNRESET || sticeSockerrno == ECONNREFUSED
-#ifdef _WIN32
-		    || sticeSockerrno == WSAENETRESET
-#endif
-		) {
-			// Windows: ICMP port-unreachable stored, ignore.
+		if (sticeSockerrno == STICE_SECONNRESET || sticeSockerrno == STICE_SECONNREFUSED
+		    || sticeSockerrno == STICE_SENETRESET) {
+			// ICMP port-unreachable stored by the local stack and reported on
+			// the next recvfrom (WSAECONNRESET/WSAECONNREFUSED/WSAENETRESET on
+			// Windows, ECONNREFUSED on Linux); ignore and retry.
 			continue;
 		}
 		return -1;
@@ -271,6 +303,21 @@ int UdpSocket::sendBatch(const char *const *data, const std::size_t *sizes,
 	}
 	return sent;
 #endif
+}
+
+// Atomic set -> send -> reset of the socket's DSCP/TOS. DSCP is per-socket
+// state and UDPMux shares one socket across many agents, so an unserialized
+// window would let one agent's mark leak into another agent's datagram (and
+// the trailing reset would clobber a concurrent set). ds < 0 means "leave TOS
+// alone" and needs no serialization at all.
+int UdpSocket::sendtoWithDiffserv(const char *data, std::size_t size,
+                                  const AddrRecord &dst, int ds) {
+	if (ds < 0) return sendto(data, size, dst);
+	std::lock_guard<std::mutex> lk(diffservMtx_);
+	setDiffserv(ds);
+	int n = sendto(data, size, dst);
+	setDiffserv(0);
+	return n;
 }
 
 int UdpSocket::setDiffserv(int ds) {
@@ -379,3 +426,4 @@ std::vector<AddrRecord> UdpSocket::localAddrs(int family) const {
 }
 
 } // namespace stice::net
+

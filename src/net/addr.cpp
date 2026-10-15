@@ -9,6 +9,7 @@
 
 #include "stice/log.hpp"
 
+#include <cstdio>
 #include <cstring>
 
 #ifdef _WIN32
@@ -153,32 +154,80 @@ bool addrMapInet6V4Mapped(struct sockaddr_storage &ss, socklen_t &len) {
 
 bool addrEqual(const struct sockaddr *a, const struct sockaddr *b, bool comparePorts) {
 	if (!a || !b) return a == b;
-	if (a->sa_family != b->sa_family) return false;
-	if (a->sa_family == AF_INET) {
-		auto *la = reinterpret_cast<const sockaddr_in *>(a);
-		auto *lb = reinterpret_cast<const sockaddr_in *>(b);
-		if (la->sin_addr.s_addr != lb->sin_addr.s_addr) return false;
-		if (comparePorts && la->sin_port != lb->sin_port) return false;
-		return true;
-	}
-	if (a->sa_family == AF_INET6) {
-		auto *la = reinterpret_cast<const sockaddr_in6 *>(a);
-		auto *lb = reinterpret_cast<const sockaddr_in6 *>(b);
-		if (std::memcmp(&la->sin6_addr, &lb->sin6_addr, 16) != 0) return false;
-		if (comparePorts && la->sin6_port != lb->sin6_port) return false;
-		return true;
-	}
-	return false;
+	// Normalize v4-mapped IPv6 (::ffff:a.b.c.d) to plain IPv4 before comparing:
+	// both spell the SAME peer, and a dual-stack socket hands out the mapped
+	// form. Every current caller unmaps first (addrUnmapInet6V4Mapped), so this
+	// is defence in depth - an unmapped address reaching a comparison must not
+	// look like a different peer. AddrRecord::hash() applies the identical
+	// normalization so "equal" and "same hash" stay consistent for containers.
+	unsigned char na[16] = {0}, nb[16] = {0};
+	int fa = 0, fb = 0;
+	uint16_t pa = 0, pb = 0;
+	auto normalize = [](const struct sockaddr *sa, unsigned char *out, int &fam,
+	                    uint16_t &port) -> bool {
+		if (sa->sa_family == AF_INET) {
+			auto *in = reinterpret_cast<const sockaddr_in *>(sa);
+			fam = AF_INET;
+			std::memcpy(out, &in->sin_addr, 4);
+			port = in->sin_port;
+			return true;
+		}
+		if (sa->sa_family == AF_INET6) {
+			auto *in6 = reinterpret_cast<const sockaddr_in6 *>(sa);
+			fam = AF_INET6;
+			std::memcpy(out, &in6->sin6_addr, 16);
+			port = in6->sin6_port;
+			if (IN6_IS_ADDR_V4MAPPED(&in6->sin6_addr)) {
+				fam = AF_INET;
+				std::memcpy(out, &in6->sin6_addr.s6_addr[12], 4);
+			}
+			return true;
+		}
+		return false; // unsupported family: not equal to anything
+	};
+	if (!normalize(a, na, fa, pa) || !normalize(b, nb, fb, pb)) return false;
+	if (fa != fb) return false;
+	const std::size_t n = (fa == AF_INET) ? 4u : 16u;
+	if (std::memcmp(na, nb, n) != 0) return false;
+	if (comparePorts && pa != pb) return false;
+	return true;
 }
 
 std::string addrToString(const struct sockaddr *sa) {
 	if (!sa) return {};
-	char node[64];
-	char serv[8];
+	char node[64] = {0};
+	char serv[8] = {0};
 	if (getnameinfo(sa, addrLen(sa), node, sizeof(node), serv, sizeof(serv),
-	                NI_NUMERICHOST | NI_NUMERICSERV | NI_DGRAM) != 0)
-		return {};
-	std::string s = node;
+	                NI_NUMERICHOST | NI_NUMERICSERV | NI_DGRAM) != 0) {
+		// getnameinfo rejects some legal inputs it cannot render - a link-local
+		// IPv6 address without a scope id is the common case on Windows. Falling
+		// back to inet_ntop keeps the address visible instead of collapsing the
+		// whole string to empty (which made every log line about that peer blank).
+		if (sa->sa_family == AF_INET) {
+			auto *in = reinterpret_cast<const sockaddr_in *>(sa);
+			if (!inet_ntop(AF_INET, &in->sin_addr, node, sizeof(node))) return {};
+			std::snprintf(serv, sizeof(serv), "%u", ntohs(in->sin_port));
+		} else if (sa->sa_family == AF_INET6) {
+			auto *in6 = reinterpret_cast<const sockaddr_in6 *>(sa);
+			if (!inet_ntop(AF_INET6, &in6->sin6_addr, node, sizeof(node))) return {};
+			std::snprintf(serv, sizeof(serv), "%u", ntohs(in6->sin6_port));
+		} else {
+			return {};
+		}
+	}
+	std::string s;
+	// An IPv6 literal is bracketed when a port is appended (RFC 5952 §6 /
+	// RFC 3986 §3.2.2): "2001:db8::1:3478" is ambiguous because the address
+	// itself contains colons; "[2001:db8::1]:3478" is not. A link-local scope id
+	// follows the RFC 6874 form ("[fe80::1%3]:5353"). This is a diagnostic /
+	// display helper only - SDP carries the bare host and the port separately.
+	if (sa->sa_family == AF_INET6) {
+		s = "[";
+		s += node;
+		s += "]";
+	} else {
+		s = node;
+	}
 	s += ":";
 	s += serv;
 	return s;
@@ -195,24 +244,37 @@ std::string AddrRecord::toString() const {
 }
 
 uint64_t AddrRecord::hash(bool withPort) const {
-	// djb2 variant
+	// djb2 variant. v4-mapped IPv6 is hashed as the plain IPv4 address it embeds,
+	// matching addrEqual()'s normalization - equal keys must hash equally, or a
+	// container lookup could miss the entry it just compared as equal. Hash
+	// values for every non-mapped address are unchanged.
 	uint64_t h = 5381;
 	auto *sa = reinterpret_cast<const sockaddr *>(&addr);
-	h = ((h << 5) + h) + static_cast<uint64_t>(sa->sa_family);
-	h = ((h << 5) + h) + static_cast<uint64_t>(socktype);
-	if (sa->sa_family == AF_INET) {
+	int family = sa->sa_family;
+	unsigned char bytes[16] = {0};
+	std::size_t nbytes = 0;
+	uint16_t port = 0;
+	if (family == AF_INET) {
 		auto *in = reinterpret_cast<const sockaddr_in *>(sa);
-		uint32_t a = in->sin_addr.s_addr;
-		h = ((h << 5) + h) + (a & 0xFF);
-		h = ((h << 5) + h) + ((a >> 8) & 0xFF);
-		h = ((h << 5) + h) + ((a >> 16) & 0xFF);
-		h = ((h << 5) + h) + ((a >> 24) & 0xFF);
-		if (withPort) h = ((h << 5) + h) + ntohs(in->sin_port);
-	} else if (sa->sa_family == AF_INET6) {
+		std::memcpy(bytes, &in->sin_addr, 4);
+		nbytes = 4;
+		port = in->sin_port;
+	} else if (family == AF_INET6) {
 		auto *in6 = reinterpret_cast<const sockaddr_in6 *>(sa);
-		for (int i = 0; i < 16; ++i) h = ((h << 5) + h) + in6->sin6_addr.s6_addr[i];
-		if (withPort) h = ((h << 5) + h) + ntohs(in6->sin6_port);
+		port = in6->sin6_port;
+		if (IN6_IS_ADDR_V4MAPPED(&in6->sin6_addr)) {
+			family = AF_INET;
+			std::memcpy(bytes, &in6->sin6_addr.s6_addr[12], 4);
+			nbytes = 4;
+		} else {
+			std::memcpy(bytes, &in6->sin6_addr, 16);
+			nbytes = 16;
+		}
 	}
+	h = ((h << 5) + h) + static_cast<uint64_t>(family);
+	h = ((h << 5) + h) + static_cast<uint64_t>(socktype);
+	for (std::size_t i = 0; i < nbytes; ++i) h = ((h << 5) + h) + bytes[i];
+	if (withPort) h = ((h << 5) + h) + ntohs(port);
 	return h;
 }
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // Author: zlyadvocate
-// Version: 0.11.0
+// Version: 0.12.3
 // EpollBackend: D plan implementation on Linux — epoll-based async IO with
 // a dynamic worker thread pool.
 //
@@ -41,9 +41,11 @@
 #include <chrono>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -168,8 +170,11 @@ public:
 
 	void removeRelaySocket(socket_t s) override {
 		::epoll_ctl(epollFd_, EPOLL_CTL_DEL, s, nullptr);
-		std::lock_guard<std::mutex> lk(relayMutex_);
-		relaySockets_.erase(s);
+		{
+			std::lock_guard<std::mutex> lk(relayMutex_);
+			relaySockets_.erase(s);
+		}
+		dropDrainLock(s);
 	}
 
 	void addTcpConn(socket_t s, bool hasWritePending) override {
@@ -188,8 +193,11 @@ public:
 
 	void removeTcpConn(socket_t s) override {
 		::epoll_ctl(epollFd_, EPOLL_CTL_DEL, s, nullptr);
-		std::lock_guard<std::mutex> lk(writePendingMutex_);
-		writePending_.erase(s);
+		{
+			std::lock_guard<std::mutex> lk(writePendingMutex_);
+			writePending_.erase(s);
+		}
+		dropDrainLock(s);
 	}
 
 	void setTcpConnWritePending(socket_t s, bool pending) override {
@@ -323,41 +331,55 @@ private:
 
 	void drainRelay(socket_t s) {
 		unsigned char buf[BufferSize];
+		auto lock = drainLockFor(s);
 		while (true) {
 			sockaddr_storage addr;
 			socklen_t addrLen = sizeof(addr);
-			int n = ::recvfrom(s, reinterpret_cast<char *>(buf), sizeof(buf), 0,
-			                   reinterpret_cast<sockaddr *>(&addr), &addrLen);
-			if (n > 0) {
-				stice::net::AddrRecord peer;
-				std::memcpy(&peer.addr, &addr, addrLen);
-				peer.len = addrLen;
-				peer.socktype = SOCK_DGRAM;
-				owner_->ioOnRelayData(s, buf, static_cast<std::size_t>(n), peer);
-				continue;
+			int n;
+			{
+				// Same per-socket serialization as drainTcpConn: keep the
+				// recvfrom + dispatch atomic so datagram order is preserved.
+				std::lock_guard<std::mutex> g(*lock);
+				n = ::recvfrom(s, reinterpret_cast<char *>(buf), sizeof(buf), 0,
+				               reinterpret_cast<sockaddr *>(&addr), &addrLen);
+				if (n > 0) {
+					stice::net::AddrRecord peer;
+					std::memcpy(&peer.addr, &addr, addrLen);
+					peer.len = addrLen;
+					peer.socktype = SOCK_DGRAM;
+					owner_->ioOnRelayData(s, buf, static_cast<std::size_t>(n), peer);
+				}
 			}
-			if (n == 0) return;
-			if (wouldBlock()) return;
-			// Error on UDP relay socket — log but don't close (may be
-			// transient, e.g. ICMP port unreachable from a previous peer).
-			if (errno == ECONNREFUSED) return;
+			if (n > 0) continue;
+			// n == 0 (closed) or n < 0 (transient/error, e.g. EAGAIN or
+			// ECONNREFUSED from a previous peer): every path returns here.
 			return;
 		}
 	}
 
 	void drainTcpConn(socket_t s) {
 		unsigned char buf[BufferSize];
+		auto lock = drainLockFor(s);
 		while (true) {
-			int n = ::recv(s, reinterpret_cast<char *>(buf), sizeof(buf), 0);
-			if (n > 0) {
-				owner_->ioOnTcpConnData(s, buf, static_cast<std::size_t>(n));
-				continue;
+			int n;
+			{
+				// recv + dispatch must be atomic w.r.t. other workers on THIS
+				// socket, otherwise the queue order can differ from the read
+				// order (see drainLocks_). Different sockets still drain in
+				// parallel: the lock is per socket, not global.
+				std::lock_guard<std::mutex> g(*lock);
+				n = ::recv(s, reinterpret_cast<char *>(buf), sizeof(buf), 0);
+				if (n > 0)
+					owner_->ioOnTcpConnData(s, buf, static_cast<std::size_t>(n));
 			}
+			if (n > 0) continue;
 			if (n == 0) {
+				dropDrainLock(s);
 				owner_->ioOnTcpConnClosed(s);
 				return;
 			}
 			if (wouldBlock()) return;
+			dropDrainLock(s);
 			owner_->ioOnTcpConnClosed(s);
 			return;
 		}
@@ -399,6 +421,36 @@ private:
 	// Sockets with pending write data.
 	std::mutex writePendingMutex_;
 	std::set<socket_t> writePending_;
+
+	// Per-socket serialization of the recv+dispatch pair.
+	//
+	// All workers block in epoll_wait() on ONE shared epoll fd, so a readable
+	// edge on a socket is delivered to several workers at once. They then run
+	// drainTcpConn() concurrently: the kernel still hands each ::recv() a
+	// disjoint byte range, but the subsequent ioOnTcpConnData() calls are NOT
+	// serialized, so chunk N+1 can be enqueued before chunk N. The business
+	// thread replays the queue in order and therefore writes a REORDERED byte
+	// stream to the peer. On the transparent RFC 6062 data pipe that corrupts
+	// the tunnel -- whole frames arrive swapped and, because a chunk boundary
+	// is not frame aligned, mid-frame splices pull the peer's RFC 4571 cursor
+	// off the frame boundary. The peer then reads payload bytes as a length
+	// (0x7878 == the soak fill byte), merges frames and reports rx > tx.
+	// Holding a per-socket mutex across recv+dispatch makes the enqueue order
+	// match the read order again, without serializing different sockets.
+	std::mutex drainLockMapMutex_;
+	std::map<socket_t, std::shared_ptr<std::mutex>> drainLocks_;
+
+	std::shared_ptr<std::mutex> drainLockFor(socket_t s) {
+		std::lock_guard<std::mutex> lk(drainLockMapMutex_);
+		auto &m = drainLocks_[s];
+		if (!m) m = std::make_shared<std::mutex>();
+		return m;
+	}
+
+	void dropDrainLock(socket_t s) {
+		std::lock_guard<std::mutex> lk(drainLockMapMutex_);
+		drainLocks_.erase(s);
+	}
 };
 
 // Factory function for epoll backend (called by createIoBackend in io_select.cpp).

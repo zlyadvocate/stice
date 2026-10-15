@@ -394,16 +394,73 @@ void MDnsClient::sendPendingQueries() {
 
 	// Send queries for active entries.
 	for (const auto &q : active) {
-		// Send both A and AAAA queries.
-		auto pkt = encodeQuery(q.hostname, kDnsTypeA);
-		::sendto(sock_, reinterpret_cast<const char *>(pkt.data()), static_cast<int>(pkt.size()), 0,
-		         reinterpret_cast<const struct sockaddr *>(&mcastAddr4_), sizeof(mcastAddr4_));
+		// Send BOTH A and AAAA queries - the comment here always claimed this but
+		// only the A query was ever sent, which made IPv6 (.local -> AAAA)
+		// resolution impossible while the response handler already accepted both
+		// record types. An AAAA question over the IPv4 mDNS transport is valid:
+		// the record type, not the transport, selects what a responder answers.
+		for (std::uint16_t type : {kDnsTypeA, kDnsTypeAAAA}) {
+			auto pkt = encodeQuery(q.hostname, type);
+			::sendto(sock_, reinterpret_cast<const char *>(pkt.data()),
+			         static_cast<int>(pkt.size()), 0,
+			         reinterpret_cast<const struct sockaddr *>(&mcastAddr4_),
+			         sizeof(mcastAddr4_));
+		}
 	}
 
 	// Fire timeout callbacks.
 	for (auto &to : timedOut) {
 		if (to.second) to.second("");
 	}
+}
+
+// Definition; the contract lives in mdns.hpp (it is exposed so it can be
+// unit-tested). This client's transport is IPv4 (224.0.0.251) today, so the
+// IPv6 branch is defence in depth: it keeps the check correct if an
+// IPv6/dual-stack mDNS socket is added later, and it closes the hole where any
+// family other than AF_INET used to be accepted unconditionally.
+bool mdnsSourceIsPlausible(const sockaddr_storage &ss) {
+	if (ss.ss_family == AF_INET) {
+		const auto *a4 = reinterpret_cast<const sockaddr_in *>(&ss);
+		const std::uint32_t s = ntohl(a4->sin_addr.s_addr);
+		if (s == 0u) return false;                            // 0.0.0.0 unspecified
+		// 224.0.0.0/3 covers the multicast block (224/4) AND the reserved class E
+		// block (240/4, which contains the limited broadcast 255.255.255.255).
+		// Neither can be a unicast host address, so a packet claiming to come
+		// from one is never a real mDNS answer.
+		if ((s & 0xE0000000u) == 0xE0000000u) return false;
+		return true;
+	}
+	if (ss.ss_family == AF_INET6) {
+		const auto *a6 = reinterpret_cast<const sockaddr_in6 *>(&ss);
+		const unsigned char *b = a6->sin6_addr.s6_addr;
+		if (b[0] == 0xFF) return false; // ff00::/8 multicast (includes ff02::fb)
+		bool allZero = true;
+		for (int i = 0; i < 16; ++i) {
+			if (b[i] != 0) { allZero = false; break; }
+		}
+		if (allZero) return false;      // :: unspecified
+		// IPv4-embedded IPv6 forms carry a v4 address, so the v4 rules apply to
+		// it: ::ffff:a.b.c.d (IPv4-mapped) and the deprecated IPv4-compatible
+		// ::a.b.c.d. Without this a peer on a dual-stack socket could smuggle in
+		// exactly the sources the AF_INET branch rejects.
+		const bool v4Compat = (b[10] == 0x00 && b[11] == 0x00);
+		const bool v4Mapped = (b[10] == 0xFF && b[11] == 0xFF);
+		bool v4Embedded = (v4Compat || v4Mapped);
+		for (int i = 0; i < 10 && v4Embedded; ++i) {
+			if (b[i] != 0) v4Embedded = false;
+		}
+		if (v4Embedded) {
+			const std::uint32_t s = (static_cast<std::uint32_t>(b[12]) << 24) |
+			                        (static_cast<std::uint32_t>(b[13]) << 16) |
+			                        (static_cast<std::uint32_t>(b[14]) << 8) |
+			                        static_cast<std::uint32_t>(b[15]);
+			if (s == 0u) return false;                            // embeds 0.0.0.0
+			if ((s & 0xE0000000u) == 0xE0000000u) return false;    // embeds 224.0.0.0/3
+		}
+		return true;
+	}
+	return false; // unknown family: never a valid mDNS source
 }
 
 void MDnsClient::run() {
@@ -435,12 +492,21 @@ void MDnsClient::run() {
 		}
 #endif
 
-		sockaddr_in src{};
+		sockaddr_storage src{};
 		socklen_t srcLen = sizeof(src);
 		int len = ::recvfrom(sock_, reinterpret_cast<char *>(buf), sizeof(buf), 0,
 		                     reinterpret_cast<struct sockaddr *>(&src), &srcLen);
 		if (len <= 0) {
 			sendPendingQueries();
+			continue;
+		}
+
+		// Source sanity check before parsing. See mdnsSourceIsPlausible(): it
+		// covers both address families (and rejects an unknown family), so a
+		// packet from an impossible sender is dropped up front rather than being
+		// matched against a pending query purely by its answer name.
+		if (!mdnsSourceIsPlausible(src)) {
+			STICE_LOG_DEBUG("mDNS: ignoring packet from invalid source");
 			continue;
 		}
 
@@ -526,10 +592,18 @@ void MDnsClient::run() {
 
 				// Send response to the multicast group (or unicast to the querier).
 				auto resp = encodeResponse(hdr.id, hostnameDot_, q.type, localAddr_);
-				sockaddr_in dst = src;
+				// This client owns an IPv4 mDNS transport, so only an IPv4 querier
+				// has a reachable reply path. (A non-IPv4 source is already
+				// filtered out by mdnsSourceIsPlausible for the families this
+				// socket could deliver; being explicit here keeps a future
+				// non-IPv4 source from ever being answered through the IPv4
+				// multicast group.)
+				if (src.ss_family != AF_INET) continue;
+				const auto *s4 = reinterpret_cast<const sockaddr_in *>(&src);
+				sockaddr_in dst = *s4;
 				// If the querier used the standard mDNS port, respond via multicast;
 				// otherwise respond unicast.
-				if (ntohs(src.sin_port) == kMDnsPort) {
+				if (ntohs(s4->sin_port) == kMDnsPort) {
 					dst = mcastAddr4_;
 				}
 				::sendto(sock_, reinterpret_cast<const char *>(resp.data()),

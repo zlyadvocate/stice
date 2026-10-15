@@ -15,15 +15,22 @@
 using socket_t = SOCKET;
 using nfds_t = ULONG;
 #define STICE_INVALID_SOCKET INVALID_SOCKET
-#define sticePoll WSAPoll
+// sticePoll is backed by wepoll (IOCP-based, more reliable than WSAPoll) on
+// Windows. Implemented in src/net/wepoll_poll.cpp.
+int sticePoll(struct pollfd *fds, nfds_t nfds, int timeout);
 #define sticeClosesocket closesocket
 #define sticeSockerrno ((int)WSAGetLastError())
 #define STICE_SEWOULDBLOCK WSAEWOULDBLOCK
 #define STICE_SEINPROGRESS WSAEINPROGRESS
 #define STICE_SECONNRESET WSAECONNRESET
+#define STICE_SECONNREFUSED WSAECONNREFUSED
+#define STICE_SENETRESET WSAENETRESET
 #define STICE_SEMSGSIZE WSAEMSGSIZE
 #define STICE_SEAGAIN WSAEWOULDBLOCK
 #define STICE_SEINTR WSAEINTR
+#define STICE_SENOBUFS WSAENOBUFS
+#define STICE_SEADDRINUSE WSAEADDRINUSE
+#define STICE_SEACCES WSAEACCES
 #else
 #include <arpa/inet.h>
 #include <errno.h>
@@ -38,15 +45,29 @@ using nfds_t = ULONG;
 using socket_t = int;
 using nfds_t = nfds_t;
 #define STICE_INVALID_SOCKET (-1)
+#ifdef __linux__
+// sticePoll is backed by the native epoll(7) API on Linux (implemented in
+// src/net/epoll_poll.cpp): the synchronous one-shot waits (e.g. the
+// server-reflexive STUN resolution in stun/client.cpp) then use the same
+// readiness model as the PollRegistry event loop and the Windows wepoll
+// backend. Other POSIX platforms (macOS/BSD) keep poll(2).
+int sticePoll(struct pollfd *fds, nfds_t nfds, int timeout);
+#else
 #define sticePoll poll
+#endif
 #define sticeClosesocket ::close
 #define sticeSockerrno errno
 #define STICE_SEWOULDBLOCK EWOULDBLOCK
 #define STICE_SEINPROGRESS EINPROGRESS
 #define STICE_SECONNRESET ECONNRESET
+#define STICE_SECONNREFUSED ECONNREFUSED
+#define STICE_SENETRESET ENETRESET
 #define STICE_SEMSGSIZE EMSGSIZE
 #define STICE_SEAGAIN EAGAIN
 #define STICE_SEINTR EINTR
+#define STICE_SENOBUFS ENOBUFS
+#define STICE_SEADDRINUSE EADDRINUSE
+#define STICE_SEACCES EACCES
 #endif
 
 namespace stice::net {

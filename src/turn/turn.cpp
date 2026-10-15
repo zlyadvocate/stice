@@ -45,6 +45,45 @@ void Client::init(TurnConfig cfg, TurnSink sink) {
 	cfg_ = std::move(cfg);
 	sink_ = std::move(sink);
 	state_ = AllocState::Idle;
+	failedEmitted_ = false;
+	nonceRetries_ = 0;
+}
+
+bool Client::handleAuthError(const stun::Message &msg, int code, bool retryAuthed) {
+	// Centralized 401/438 handling shared by all request types. Returns true
+	// when the request should be re-sent with refreshed credentials.
+	if (code == stun::StunErrorUnauthenticated) {
+		// 401 while we already sent credentials is a wrong-password failure
+		// for Allocate (would loop forever); for follow-up requests it is
+		// normally a rotated nonce — re-capture and retry bounded.
+		if (creds_ && !retryAuthed) return false;
+		if (++nonceRetries_ > MaxNonceRetries) return false;
+		if (!creds_) creds_ = stun::Credentials{};
+		creds_->username = cfg_.username;
+		creds_->realm = stun::getString(msg, stun::AttrType::Realm);
+		creds_->nonce = stun::getString(msg, stun::AttrType::Nonce);
+		return true;
+	}
+	if (code == stun::StunErrorStaleNonce) {
+		// Bound the nonce-refresh loop across ALL transaction types (previously
+		// only Allocate counted, so refresh/permission/channelbind could loop
+		// against a misbehaving server).
+		if (++nonceRetries_ > MaxNonceRetries) return false;
+		if (creds_) creds_->nonce = stun::getString(msg, stun::AttrType::Nonce);
+		return true;
+	}
+	return false;
+}
+
+void Client::failAllocation(int errorCode, const std::string &reason) {
+	// Terminal: transition to Failed and emit onFailed AT MOST ONCE per
+	// allocation. The Agent decrements its pending-relay counter in the
+	// callback; a second emission would underflow it.
+	if (failedEmitted_) return;
+	failedEmitted_ = true;
+	state_ = AllocState::Failed;
+	pending_.clear();
+	if (sink_.onFailed) sink_.onFailed(errorCode, reason);
 }
 
 void Client::allocate() {
@@ -67,7 +106,7 @@ void Client::allocate() {
 	m.newTransactionID();
 	allocateTid_ = m.transactionID;
 	stun::addRequestedTransport(m, proto);
-	sendRequest(m);
+	prepareRequest(m);
 
 	auto now = std::chrono::steady_clock::now();
 	PendingTx tx;
@@ -78,6 +117,10 @@ void Client::allocate() {
 	pending_[tidKey(m.transactionID)] = std::move(tx);
 
 	nextTick_ = now + std::chrono::milliseconds(TurnRtoMs);
+	sendPrepared(m);
+	log(STICE_LOG_LEVEL_DEBUG, "ALLOC-SENT state=%d tid=%02x%02x%02x%02x tcpAlloc=%d",
+	    static_cast<int>(state_), allocateTid_[0], allocateTid_[1], allocateTid_[2], allocateTid_[3],
+	    static_cast<int>(isTcpAllocation_));
 }
 
 void Client::applyCredentials(stun::Message &m) {
@@ -88,6 +131,11 @@ void Client::applyCredentials(stun::Message &m) {
 }
 
 void Client::sendRequest(stun::Message &m) {
+	prepareRequest(m);
+	sendPrepared(m);
+}
+
+void Client::prepareRequest(stun::Message &m) {
 	applyCredentials(m);
 	if (creds_ && !creds_->username.empty()) {
 		m.encode(cfg_.password.c_str(), &*creds_, "stice");
@@ -98,16 +146,32 @@ void Client::sendRequest(stun::Message &m) {
 		log(STICE_LOG_LEVEL_DEBUG, "TURN sendRequest: unauth method=%d raw=%zu bytes",
 		    static_cast<int>(m.method), m.raw.size());
 	}
-	if (sink_.sendRaw) sink_.sendRaw(m.raw.data(), m.raw.size());
+}
+
+void Client::sendPrepared(const stun::Message &m) {
+	log(STICE_LOG_LEVEL_DEBUG, "TURN-SEND method=%d cls=%d tid=%02x%02x%02x%02x raw=%zu",
+	    static_cast<int>(m.method), static_cast<int>(m.cls),
+	    m.transactionID[0], m.transactionID[1], m.transactionID[2], m.transactionID[3],
+	    m.raw.size());
+	if (sink_.sendRaw) {
+		int n = sink_.sendRaw(m.raw.data(), m.raw.size());
+		if (n <= 0)
+			log(STICE_LOG_LEVEL_WARN, "TURN sendPrepared: sendRaw failed n=%d method=%d",
+			    n, static_cast<int>(m.method));
+	}
 }
 
 void Client::sendRefresh(std::uint32_t lifetime) {
+	// In-flight guard (see refreshTidFresh_): the transaction timer owns
+	// retransmission, so a second Refresh must not be issued while one is
+	// outstanding. Callers that MUST bypass it clear the flag first (deallocate).
+	if (refreshTidFresh_) return;
 	stun::Message m;
 	m.method = stun::Method::Refresh;
 	m.cls = stun::Class::Request;
 	m.newTransactionID();
 	stun::addLifetime(m, lifetime);
-	sendRequest(m);
+	prepareRequest(m);
 	auto now = std::chrono::steady_clock::now();
 	PendingTx tx;
 	tx.kind = PendingTx::Kind::Refresh;
@@ -115,17 +179,37 @@ void Client::sendRefresh(std::uint32_t lifetime) {
 	tx.nextRetransmitAt = now + std::chrono::milliseconds(TurnRtoMs);
 	tx.rawBytes = m.raw;
 	pending_[tidKey(m.transactionID)] = std::move(tx);
+	refreshTidFresh_ = true;
+	// Push the periodic deadline past the retransmit window. The definitive
+	// schedule is set from the response's LIFETIME on success; this exists so
+	// tick() stops returning a past-due time (which made the poll loop spin and
+	// re-send on every iteration).
+	refreshAt_ = now + std::chrono::milliseconds(TurnRtoMs);
+	sendPrepared(m);
 }
 
 void Client::deallocate() {
 	if (state_ != AllocState::Allocated) return;
+	// The deallocating Refresh(0) must not be swallowed by the in-flight guard.
+	refreshTidFresh_ = false;
 	sendRefresh(0);
-	state_ = AllocState::Idle;
+	// Deallocated (not Idle): the allocation is torn down; late Refresh(0)
+	// responses must NOT re-arm the refresh timer (that previously
+	// "resurrected" a deleted allocation until the next refresh fired on a
+	// dead allocation). Terminal event emission is guarded by the sink-side
+	// at-most-once contract, not by this state.
+	state_ = AllocState::Deallocated;
 }
 
 PeerBinding &Client::getBinding(const net::AddrRecord &peer) {
+	// Keyed on the FULL peer transport address (IP + port). RFC 5766 §11 keys a
+	// permission on the peer IP but a channel binding on the peer transport
+	// address; keying bindings on IP alone made every same-IP/different-port
+	// peer share one PeerBinding - and therefore one channel number - so
+	// ChannelData for one peer could be delivered to another. Permissions stay
+	// IP-granular via hasPermission().
 	for (auto &b : bindings_)
-		if (addrEqualNoPort(b.peer, peer)) return b;
+		if (b.peer == peer) return b;
 	PeerBinding b;
 	b.peer = peer;
 	bindings_.push_back(std::move(b));
@@ -148,7 +232,7 @@ void Client::sendCreatePermission(const net::AddrRecord &peer) {
 	m.cls = stun::Class::Request;
 	m.newTransactionID();
 	stun::writeXorAddress(m, stun::AttrType::XorPeerAddress, peer, m.transactionID);
-	sendRequest(m);
+	prepareRequest(m);
 
 	b.permissionTid = m.transactionID;
 	b.permissionTidFresh = true;
@@ -160,12 +244,24 @@ void Client::sendCreatePermission(const net::AddrRecord &peer) {
 	tx.nextRetransmitAt = now + std::chrono::milliseconds(TurnRtoMs);
 	tx.rawBytes = m.raw;
 	pending_[tidKey(m.transactionID)] = std::move(tx);
+	sendPrepared(m);
 }
 
 void Client::sendChannelBind(const net::AddrRecord &peer) {
 	auto &b = getBinding(peer);
 	if (b.channelTidFresh) return;
-	if (b.channel == 0) b.channel = randomChannelNumber();
+	if (b.channel == 0) {
+		// F3: pick a random channel number, skipping ones already bound to a
+		// different peer (a collision would silently mis-route ChannelData).
+		for (int attempt = 0; attempt < 8; ++attempt) {
+			std::uint16_t c = randomChannelNumber();
+			bool taken = false;
+			for (const auto &ob : bindings_)
+				if (&ob != &b && ob.channel == c) { taken = true; break; }
+			if (!taken) { b.channel = c; break; }
+		}
+		if (b.channel == 0) b.channel = randomChannelNumber(); // exhausted: best effort
+	}
 
 	stun::Message m;
 	m.method = stun::Method::ChannelBind;
@@ -173,7 +269,7 @@ void Client::sendChannelBind(const net::AddrRecord &peer) {
 	m.newTransactionID();
 	stun::writeXorAddress(m, stun::AttrType::XorPeerAddress, peer, m.transactionID);
 	stun::addChannelNumber(m, b.channel);
-	sendRequest(m);
+	prepareRequest(m);
 
 	b.channelTid = m.transactionID;
 	b.channelTidFresh = true;
@@ -185,39 +281,89 @@ void Client::sendChannelBind(const net::AddrRecord &peer) {
 	tx.nextRetransmitAt = now + std::chrono::milliseconds(TurnRtoMs);
 	tx.rawBytes = m.raw;
 	pending_[tidKey(m.transactionID)] = std::move(tx);
+	sendPrepared(m);
 }
 
-void Client::sendData(const net::AddrRecord &peer, const unsigned char *data, std::size_t size) {
-	if (state_ != AllocState::Allocated) return;
+int Client::prepareChannelData(const net::AddrRecord &peer, const unsigned char *data,
+                               std::size_t size, bytes &out) const {
+	if (state_ != AllocState::Allocated) return -1;
+	for (const auto &b : bindings_) {
+		if (b.peer == peer) {
+			if (!b.channelReady) return 0;
+			std::size_t n = wrapChannelData(b.channel, data, size, out);
+			if (n == 0) return -1;
+			return 1;
+		}
+	}
+	return 0; // no binding yet -> fall back to sendData
+}
+
+int Client::sendData(const net::AddrRecord &peer, const unsigned char *data, std::size_t size) {
+	if (state_ != AllocState::Allocated) return -1;
 	auto &b = getBinding(peer);
 
-	// Ensure permission exists; create one if missing.
-	if (!b.permissionPermitted) {
+	// Ensure a permission exists; create one if missing. The check is
+	// IP-granular (hasPermission), because a TURN permission authorises the
+	// peer IP - while the binding this data belongs to is address-granular.
+	if (!hasPermission(peer)) {
 		if (!b.permissionTidFresh) sendCreatePermission(peer);
-		// Buffer the data until CreatePermission completes.
+		// Buffer the data until CreatePermission completes (D1): bound the
+		// pending buffer so a stalled CreatePermission (slow/lost response or
+		// TCP head-of-line blocking) cannot grow unboundedly. When full, drop
+		// the oldest packet and report backpressure to the caller.
+		const std::size_t kMaxPendingDataPkts = 512;
+		if (b.pendingData.size() >= kMaxPendingDataPkts) {
+			b.pendingData.erase(b.pendingData.begin());
+			log(STICE_LOG_LEVEL_WARN,
+				    "TURN sendData: pending buffer full, dropping oldest packet (backpressure)");
+		}
 		b.pendingData.emplace_back(data, data + size);
-		log(STICE_LOG_LEVEL_DEBUG, "TURN sendData: buffered %zu bytes (permission pending)", size);
-		return;
+		log(STICE_LOG_LEVEL_DEBUG, "TURN sendData: BUFFERED %zu bytes peer=%s (permission pending, perm=%d chan=%d chanReady=%d)",
+		    size, peer.toString().c_str(), b.permissionPermitted ? 1 : 0,
+		    (int)b.channel, b.channelReady ? 1 : 0);
+		return static_cast<int>(size); // accepted; flushed on permission success
 	}
 
 	if (b.channelReady) {
 		// ChannelData path (preferred).
 		bytes frame;
-		wrapChannelData(b.channel, data, size, frame);
-		if (sink_.sendRaw) sink_.sendRaw(frame.data(), frame.size());
-	} else {
-		// Send indication (no auth needed beyond FINGERPRINT).
-		stun::Message m;
-		m.method = stun::Method::Send;
-		m.cls = stun::Class::Indication;
-		m.newTransactionID();
-		stun::writeXorAddress(m, stun::AttrType::XorPeerAddress, peer, m.transactionID);
-		stun::addData(m, data, size);
-		m.encode(nullptr, nullptr, "stice");
-		if (sink_.sendRaw) sink_.sendRaw(m.raw.data(), m.raw.size());
-		// Kick off ChannelBind so future sends use ChannelData.
-		if (b.channel == 0) sendChannelBind(peer);
+		if (!wrapChannelData(b.channel, data, size, frame)) {
+			log(STICE_LOG_LEVEL_ERROR,
+			    "TURN sendData: payload too large for ChannelData (F1)");
+			return -1; // reject oversized payload rather than truncate
+		}
+		if (!sink_.sendRaw) return -1;
+		{
+			int r = sink_.sendRaw(frame.data(), frame.size());
+			log(STICE_LOG_LEVEL_DEBUG, "TURN sendData: SENT-CHDATA %zu bytes peer=%s ch=%u ret=%d",
+			    size, peer.toString().c_str(), (int)b.channel, r);
+			return r;
+		}
 	}
+	// Send indication (no auth needed beyond FINGERPRINT).
+	// F1: DATA's length field is 16-bit; reject oversized payloads instead of
+	// silently truncating (callers must fragment). 4-byte header + XOR-PEER-
+	// ADDRESS (8+8) + FINGERPRINT (8) + padding: the STUN message length field
+	// is also 16-bit, so the whole envelope must stay < 65536 bytes.
+	if (size > 0xFFFF - 40) {
+		log(STICE_LOG_LEVEL_ERROR, "TURN sendData: payload too large for Send indication (F1)");
+		return -1;
+	}
+	stun::Message m;
+	m.method = stun::Method::Send;
+	m.cls = stun::Class::Indication;
+	m.newTransactionID();
+	stun::writeXorAddress(m, stun::AttrType::XorPeerAddress, peer, m.transactionID);
+	stun::addData(m, data, size);
+	m.encode(nullptr, nullptr, "stice");
+	int ret = -1;
+	if (sink_.sendRaw) ret = sink_.sendRaw(m.raw.data(), m.raw.size());
+	log(STICE_LOG_LEVEL_DEBUG, "TURN sendData: SENT-SEND-IND %zu bytes peer=%s ret=%d perm=%d chanReady=%d",
+	    size, peer.toString().c_str(), ret, b.permissionPermitted ? 1 : 0,
+	    b.channelReady ? 1 : 0);
+	// Kick off ChannelBind so future sends use ChannelData.
+	if (b.channel == 0) sendChannelBind(peer);
+	return ret;
 }
 
 void Client::handleInbound(const unsigned char *data, std::size_t size) {
@@ -232,15 +378,15 @@ void Client::handleInbound(const unsigned char *data, std::size_t size) {
 		// Transport failure signal from the Agent (TCP connection lost or
 		// TLS handshake failure). Transition to Failed and notify the sink
 		// so the Agent can decrement pendingRelayAllocations_ and complete
-		// gathering. This must handle ALL non-terminal states, including
-		// Idle (TCP path: allocate() hasn't been called yet because the
-		// connection never completed).
+		// gathering. Must handle ALL non-terminal states, including Idle
+		// (TCP path: allocate() hasn't run because the connection never
+		// completed). failAllocation is idempotent, so an allocation that
+		// already succeeded here (Allocated) still fires onFailed exactly
+		// once — without the guard the Agent's counter would underflow.
 		if (state_ != AllocState::Failed) {
 			log(STICE_LOG_LEVEL_WARN, "TURN transport failure (state=%d)",
 			    static_cast<int>(state_));
-			state_ = AllocState::Failed;
-			pending_.clear();
-			if (sink_.onFailed) sink_.onFailed(0, "transport failure");
+			failAllocation(0, "transport failure");
 		}
 		return;
 	}
@@ -257,6 +403,10 @@ void Client::handleInbound(const unsigned char *data, std::size_t size) {
 		log(STICE_LOG_LEVEL_WARN, "TURN handleInbound: STUN decode failed (%zu bytes)", size);
 		return;
 	}
+	log(STICE_LOG_LEVEL_DEBUG, "TURN-IN method=%d cls=%d tid=%02x%02x%02x%02x pending=%zu state=%d",
+	    static_cast<int>(m.method), static_cast<int>(m.cls),
+	    m.transactionID[0], m.transactionID[1], m.transactionID[2], m.transactionID[3],
+	    pending_.size(), static_cast<int>(state_));
 	log(STICE_LOG_LEVEL_DEBUG, "TURN handleInbound: method=%d cls=%d tid=%02x%02x%02x%02x pending=%zu",
 	    static_cast<int>(m.method), static_cast<int>(m.cls),
 	    m.transactionID[0], m.transactionID[1], m.transactionID[2], m.transactionID[3],
@@ -273,8 +423,15 @@ void Client::handleInbound(const unsigned char *data, std::size_t size) {
 void Client::handleStunResponse(const stun::Message &m) {
 	auto it = pending_.find(tidKey(m.transactionID));
 	if (it == pending_.end()) {
-		log(STICE_LOG_LEVEL_WARN, "TURN handleStunResponse: no pending TID match (tid=%02x%02x%02x%02x)",
-		    m.transactionID[0], m.transactionID[1], m.transactionID[2], m.transactionID[3]);
+		std::string keys;
+		for (const auto &[k, tx] : pending_) {
+			if (!keys.empty()) keys += ",";
+			keys += k.substr(0, 8);
+		}
+		log(STICE_LOG_LEVEL_WARN,
+		    "TURN handleStunResponse: no pending TID match (tid=%02x%02x%02x%02x method=%d cls=%d) pending=%zu keys=[%s]",
+		    m.transactionID[0], m.transactionID[1], m.transactionID[2], m.transactionID[3],
+		    static_cast<int>(m.method), static_cast<int>(m.cls), pending_.size(), keys.c_str());
 		return;
 	}
 	log(STICE_LOG_LEVEL_DEBUG, "TURN handleStunResponse: matched pending tx kind=%d",
@@ -291,19 +448,23 @@ void Client::handleStunResponse(const stun::Message &m) {
 		handleAllocateResponse(m, isError);
 		break;
 	case PendingTx::Kind::Refresh:
+		// Clear the in-flight tid before dispatch so a retry can start a new one.
+		refreshTidFresh_ = false;
 		pending_.erase(it);
 		handleRefreshResponse(m, isError);
 		break;
 	case PendingTx::Kind::CreatePermission:
 		// Clear the in-flight tid before dispatch so a retry can start a new one.
+		// Bindings are full-address keyed now, so match the exact peer.
 		for (auto &b : bindings_)
-			if (addrEqualNoPort(b.peer, tx.peer)) { b.permissionTidFresh = false; break; }
+			if (b.peer == tx.peer) { b.permissionTidFresh = false; break; }
 		pending_.erase(it);
 		handleCreatePermissionResponse(m, isError, tx.peer);
 		break;
 	case PendingTx::Kind::ChannelBind:
+		// Clear the in-flight tid before dispatch so a retry can start a new one.
 		for (auto &b : bindings_)
-			if (addrEqualNoPort(b.peer, tx.peer)) { b.channelTidFresh = false; break; }
+			if (b.peer == tx.peer) { b.channelTidFresh = false; break; }
 		pending_.erase(it);
 		handleChannelBindResponse(m, isError, tx.peer);
 		break;
@@ -320,53 +481,36 @@ void Client::handleAllocateResponse(const stun::Message &msg, bool isError) {
 		int code = 0;
 		std::string reason;
 		stun::readErrorCode(msg, code, reason);
-		log(STICE_LOG_LEVEL_DEBUG, "TURN allocate error response: code=%d reason=%s", code, reason.c_str());
-		if (code == stun::StunErrorUnauthenticated) {
-			// If we already sent credentials, a 401 means authentication
-			// failed (wrong username/password). Don't retry — this would
-			// cause an infinite 401 loop. Aligned with pion-turn, which
-			// treats a second 401 as a fatal auth failure.
-			if (creds_) {
-				log(STICE_LOG_LEVEL_ERROR, "TURN allocate auth failed: credentials rejected (401)");
-				state_ = AllocState::Failed;
-				if (sink_.onFailed) sink_.onFailed(code, "authentication failed: " + reason);
+		log(STICE_LOG_LEVEL_WARN, "TURN-ALLOC-ERR code=%d reason=%s", code, reason.c_str());
+		if (code == stun::StunErrorUnauthenticated || code == stun::StunErrorStaleNonce) {
+			// Centralized: 401-captured (first) / 438-nonce-refresh, bounded by
+			// MaxNonceRetries. A 401 after we already sent credentials is a
+			// wrong-password fatal (retrying would loop forever).
+			if (handleAuthError(msg, code, /*retryAuthed=*/false)) {
+				log(STICE_LOG_LEVEL_DEBUG, "TURN auth retry: code=%d nonce_len=%zu",
+				    code, creds_ ? creds_->nonce.size() : 0u);
+				state_ = AllocState::Idle;
+				allocate();
 				return;
 			}
-			creds_ = stun::Credentials{};
-			creds_->username = cfg_.username;
-			creds_->realm = stun::getString(msg, stun::AttrType::Realm);
-			creds_->nonce = stun::getString(msg, stun::AttrType::Nonce);
-			log(STICE_LOG_LEVEL_DEBUG, "TURN 401 retry: user=%s realm=%s nonce_len=%zu",
-			    creds_->username.c_str(), creds_->realm.c_str(), creds_->nonce.size());
-			// Retry allocate with credentials.
-			state_ = AllocState::Idle;
-			allocate();
-			return;
-		}
-		if (code == stun::StunErrorStaleNonce) {
-			// Guard against infinite 438 loops: limit nonce refreshes.
-			if (++nonceRetries_ > MaxNonceRetries) {
-				log(STICE_LOG_LEVEL_ERROR, "TURN allocate failed: too many stale nonce retries");
-				state_ = AllocState::Failed;
-				if (sink_.onFailed) sink_.onFailed(code, "stale nonce loop");
-				return;
-			}
-			if (creds_) creds_->nonce = stun::getString(msg, stun::AttrType::Nonce);
-			state_ = AllocState::Idle;
-			allocate();
+			log(STICE_LOG_LEVEL_ERROR, "TURN allocate auth failed: code=%d reason=%s",
+			    code, reason.c_str());
+			failAllocation(code, code == stun::StunErrorUnauthenticated && creds_
+			                     ? "authentication failed: " + reason
+			                     : ("allocate failed: " + reason));
 			return;
 		}
 		log(STICE_LOG_LEVEL_ERROR, "TURN allocate failed: %d %s", code, reason.c_str());
-		state_ = AllocState::Failed;
-		if (sink_.onFailed) sink_.onFailed(code, reason);
+		failAllocation(code, reason);
 		return;
 	}
-	// Success: read XOR-RELAYED-ADDRESS and LIFETIME.
+	// Success: read XOR-RELAYED-ADDRESS and LIFETIME. Reset the nonce-retry
+	// budget — the credential path is proven working (aligned with pion).
+	nonceRetries_ = 0;
 	net::AddrRecord relayed;
 	if (!stun::readXorAddress(msg, stun::AttrType::XorRelayedAddress, relayed, msg.transactionID)) {
 		log(STICE_LOG_LEVEL_ERROR, "TURN allocate success missing XOR-RELAYED-ADDRESS");
-		state_ = AllocState::Failed;
-		if (sink_.onFailed) sink_.onFailed(0, "missing relayed address");
+		failAllocation(0, "missing relayed address");
 		return;
 	}
 	relayedAddr_ = relayed;
@@ -390,30 +534,20 @@ void Client::handleRefreshResponse(const stun::Message &msg, bool isError) {
 		int code = 0;
 		std::string reason;
 		stun::readErrorCode(msg, code, reason);
-		// 438 StaleNonce: update nonce and retry (aligned with pion-turn's
-		// refreshAllocation which retries up to 3 times on errTryAgain).
-		if (code == stun::StunErrorStaleNonce) {
-			if (creds_) creds_->nonce = stun::getString(msg, stun::AttrType::Nonce);
-			log(STICE_LOG_LEVEL_DEBUG, "TURN refresh 438 StaleNonce, retrying with new nonce");
-			sendRefresh(lifetime_);
-			return;
-		}
-		// 401 Unauthenticated: re-capture realm/nonce and retry.
-		if (code == stun::StunErrorUnauthenticated) {
-			if (!creds_) creds_ = stun::Credentials{};
-			creds_->username = cfg_.username;
-			creds_->realm = stun::getString(msg, stun::AttrType::Realm);
-			creds_->nonce = stun::getString(msg, stun::AttrType::Nonce);
-			log(STICE_LOG_LEVEL_DEBUG, "TURN refresh 401, retrying with credentials");
+		if (handleAuthError(msg, code, /*retryAuthed=*/true)) {
+			log(STICE_LOG_LEVEL_DEBUG, "TURN refresh auth refresh: code=%d, retrying", code);
 			sendRefresh(lifetime_);
 			return;
 		}
 		log(STICE_LOG_LEVEL_ERROR, "TURN refresh failed: %d %s", code, reason.c_str());
-		state_ = AllocState::Failed;
-		if (sink_.onFailed) sink_.onFailed(code, "refresh failed: " + reason);
+		failAllocation(code, "refresh failed: " + reason);
 		return;
 	}
-	// Refresh succeeded. Server may return a smaller lifetime.
+	// Refresh succeeded: credentials proven, reset the nonce-retry budget.
+	nonceRetries_ = 0;
+	// A success response to Refresh(0) (deallocate) must NOT re-arm the
+	// refresh timer — the allocation is gone (C2: Deallocated terminal).
+	if (state_ == AllocState::Deallocated) return;
 	std::uint32_t lt = cfg_.requestedLifetime;
 	stun::readLifetime(msg, lt);
 	lifetime_ = lt;
@@ -428,6 +562,10 @@ void Client::handleCreatePermissionResponse(const stun::Message &msg, bool isErr
                                             const net::AddrRecord &peer) {
 	auto &b = getBinding(peer);
 	if (!isError) {
+		// Any authenticated success proves the credential path works, so the
+		// nonce-retry budget must track CONSECUTIVE failures only (aligned with
+		// the Allocate/Refresh success paths).
+		nonceRetries_ = 0;
 		b.permissionPermitted = true;
 		b.permissionRefreshAt = std::chrono::steady_clock::now() + std::chrono::seconds(120);
 		// Flush any data that was buffered while permission was pending.
@@ -458,30 +596,29 @@ void Client::handleCreatePermissionResponse(const stun::Message &msg, bool isErr
 	int code = 0;
 	std::string reason;
 	stun::readErrorCode(msg, code, reason);
-	if (code == stun::StunErrorStaleNonce) {
-		if (creds_) creds_->nonce = stun::getString(msg, stun::AttrType::Nonce);
-		// Retry.
-		b.permissionTidFresh = false;
-		sendCreatePermission(peer);
-		return;
-	}
-	if (code == stun::StunErrorUnauthenticated) {
-		// Should not happen post-allocate, but handle anyway.
-		if (!creds_) creds_ = stun::Credentials{};
-		creds_->username = cfg_.username;
-		creds_->realm = stun::getString(msg, stun::AttrType::Realm);
-		creds_->nonce = stun::getString(msg, stun::AttrType::Nonce);
+	if (handleAuthError(msg, code, /*retryAuthed=*/true)) {
+		// 438/401 with a refreshed nonce: retry the permission request.
 		b.permissionTidFresh = false;
 		sendCreatePermission(peer);
 		return;
 	}
 	log(STICE_LOG_LEVEL_WARN, "TURN CreatePermission failed: %d %s", code, reason.c_str());
+	// Terminal permission failure: drop the data buffered while it was pending so
+	// a later successful permission cannot flush long-stale packets.
+	if (!b.pendingData.empty()) {
+		log(STICE_LOG_LEVEL_DEBUG, "TURN CreatePermission failed: dropping %zu stale buffered packets",
+		    b.pendingData.size());
+		b.pendingData.clear();
+	}
 }
 
 void Client::handleChannelBindResponse(const stun::Message &msg, bool isError,
                                        const net::AddrRecord &peer) {
 	auto &b = getBinding(peer);
 	if (!isError) {
+		// See handleCreatePermissionResponse: only consecutive auth failures
+		// should count against the nonce-retry budget.
+		nonceRetries_ = 0;
 		b.channelReady = true;
 		b.channelRefreshAt = std::chrono::steady_clock::now() + std::chrono::seconds(300);
 		return;
@@ -489,8 +626,7 @@ void Client::handleChannelBindResponse(const stun::Message &msg, bool isError,
 	int code = 0;
 	std::string reason;
 	stun::readErrorCode(msg, code, reason);
-	if (code == stun::StunErrorStaleNonce) {
-		if (creds_) creds_->nonce = stun::getString(msg, stun::AttrType::Nonce);
+	if (handleAuthError(msg, code, /*retryAuthed=*/true)) {
 		b.channelTidFresh = false;
 		sendChannelBind(peer);
 		return;
@@ -529,13 +665,30 @@ void Client::handleChannelData(const unsigned char *data, std::size_t size) {
 	std::size_t frameSize = 0;
 	std::size_t dataLen = unwrapChannelData(data, size, channel, payload, frameSize);
 	if (dataLen == 0) return;
-	// Look up the peer for this channel.
+	// Look up the peer for this channel. RFC 8656 ChannelData carries no peer
+	// address; the channel number is assigned by the SENDING client and only
+	// meaningful to that client + the server. In the ICE-over-TURN topology the
+	// two agents each pick their own (independent) channel number, so the
+	// RECEIVING client cannot find this channel in its own table. In the common
+	// per-agent single-peer case, fall back to the sole binding; otherwise drop
+	// (no way to disambiguate multiple peers without the peer address).
 	for (auto &b : bindings_) {
 		if (b.channel == channel) {
 			if (sink_.onData) sink_.onData(b.peer, payload, dataLen);
 			return;
 		}
 	}
+	if (bindings_.size() == 1) {
+		log(STICE_LOG_LEVEL_WARN,
+		    "TURN handleChannelData: channel %u not in local table (peer channel); "
+		    "falling back to sole binding peer=%s",
+		    (int)channel, bindings_.front().peer.toString().c_str());
+		if (sink_.onData) sink_.onData(bindings_.front().peer, payload, dataLen);
+		return;
+	}
+	log(STICE_LOG_LEVEL_WARN,
+	    "TURN handleChannelData: unknown channel %u with %zu bindings, dropping %zu bytes",
+	    (int)channel, bindings_.size(), dataLen);
 }
 
 // --- RFC 6062 TCP allocation ---
@@ -551,7 +704,7 @@ void Client::sendConnect(const net::AddrRecord &peer) {
 	m.cls = stun::Class::Request;
 	m.newTransactionID();
 	stun::writeXorAddress(m, stun::AttrType::XorPeerAddress, peer, m.transactionID);
-	sendRequest(m);
+	prepareRequest(m);
 	auto now = std::chrono::steady_clock::now();
 	PendingTx tx;
 	tx.kind = PendingTx::Kind::Connect;
@@ -560,6 +713,7 @@ void Client::sendConnect(const net::AddrRecord &peer) {
 	tx.nextRetransmitAt = now + std::chrono::milliseconds(TurnRtoMs);
 	tx.rawBytes = m.raw;
 	pending_[tidKey(m.transactionID)] = std::move(tx);
+	sendPrepared(m);
 	log(STICE_LOG_LEVEL_INFO, "TURN CONNECT: sent to peer=%s",
 	    peer.toString().c_str());
 }
@@ -621,10 +775,16 @@ std::chrono::steady_clock::time_point Client::tick() {
 	auto now = std::chrono::steady_clock::now();
 	nextTick_ = std::chrono::steady_clock::time_point::max();
 
-	// Unified retransmission for ALL pending transactions (aligned with
-	// pion-turn's Transaction.StartRtxTimer: RTO=200ms, doubling to 1600ms,
-	// max 7 retransmissions). Previously only Allocate had retransmission;
-	// CreatePermission/ChannelBind/Refresh would hang silently on packet loss.
+	// Unified transaction timer for ALL pending transactions.
+	//
+	// UDP (RFC 5389 §7.2.1): RTO=200ms, doubling to 1600ms, max 7 retransmits.
+	// TCP/TLS (RFC 8656 §7): the transport is already reliable, so we MUST NOT
+	// retransmit the application-layer transaction (a duplicate Allocate/
+	// CreatePermission on the same control connection confuses servers like
+	// coturn). We only run the timeout-to-failure clock (~TurnRtoMs * 2^7 =
+	// the same overall budget as UDP) and fail the transaction when no
+	// response arrives, which in turn drives the Agent's transport-loss path.
+	const bool reliable = cfg_.transport != TurnTransport::UDP;
 	for (auto it = pending_.begin(); it != pending_.end();) {
 		auto &tx = it->second;
 		if (now >= tx.nextRetransmitAt) {
@@ -636,24 +796,46 @@ std::chrono::steady_clock::time_point Client::tick() {
 				switch (kind) {
 				case PendingTx::Kind::Allocate:
 					log(STICE_LOG_LEVEL_ERROR, "TURN allocate timeout after %d retransmits", TurnMaxRtxCount);
-					state_ = AllocState::Failed;
-					if (sink_.onFailed) sink_.onFailed(0, "allocate timeout");
+					failAllocation(0, "allocate timeout");
 					return {};
 				case PendingTx::Kind::Refresh:
 					log(STICE_LOG_LEVEL_ERROR, "TURN refresh timeout after %d retransmits", TurnMaxRtxCount);
-					state_ = AllocState::Failed;
-					if (sink_.onFailed) sink_.onFailed(0, "refresh timeout");
+					refreshTidFresh_ = false;
+					failAllocation(0, "refresh timeout");
 					return {};
 				case PendingTx::Kind::CreatePermission:
 					log(STICE_LOG_LEVEL_WARN, "TURN CreatePermission timeout (retransmits exhausted)");
-					for (auto &b : bindings_)
-						if (addrEqualNoPort(b.peer, peer)) { b.permissionTidFresh = false; break; }
+					for (auto &b : bindings_) {
+						if (b.peer == peer) {
+							b.permissionTidFresh = false;
+							// Terminal failure: stale buffered data must not be
+							// flushed by a later (retried) successful permission.
+							if (!b.pendingData.empty()) {
+								log(STICE_LOG_LEVEL_DEBUG,
+									"TURN CreatePermission timeout: dropping %zu stale buffered packets",
+									b.pendingData.size());
+								b.pendingData.clear();
+							}
+							break;
+						}
+					}
 					break;
-				case PendingTx::Kind::ChannelBind:
-				log(STICE_LOG_LEVEL_WARN, "TURN ChannelBind timeout (retransmits exhausted)");
-				for (auto &b : bindings_)
-					if (addrEqualNoPort(b.peer, peer)) { b.channelTidFresh = false; break; }
-				break;
+				case PendingTx::Kind::ChannelBind: {
+					log(STICE_LOG_LEVEL_WARN, "TURN ChannelBind timeout (retransmits exhausted)");
+					for (auto &b : bindings_) {
+						if (b.peer == peer) {
+							b.channelTidFresh = false;
+							if (!hasPermission(b.peer) && !b.pendingData.empty()) {
+								log(STICE_LOG_LEVEL_WARN,
+									"TURN ChannelBind timeout + no permission: dropping %zu buffered packets",
+									b.pendingData.size());
+								b.pendingData.clear();
+							}
+							break;
+						}
+					}
+					break;
+				}
 			case PendingTx::Kind::Connect:
 				log(STICE_LOG_LEVEL_WARN, "TURN CONNECT timeout (retransmits exhausted) peer=%s",
 				    peer.toString().c_str());
@@ -661,8 +843,13 @@ std::chrono::steady_clock::time_point Client::tick() {
 			}
 			continue;
 		}
-		// Retransmit with the same TID (RFC 5389 §7.2.1).
-		if (!tx.rawBytes.empty() && sink_.sendRaw)
+		// Retransmit with the same TID (RFC 5389 §7.2.1). On reliable transports
+		// (TCP/TLS, RFC 8656 §7) we MUST NOT retransmit the application-layer
+		// transaction — the transport already guarantees delivery, and a duplicate
+		// Allocate/CreatePermission/ChannelBind with the same TID confuses servers
+		// like coturn (400/401 protocol error). Only UDP retransmits; TCP/TLS keeps
+		// only the timeout-to-failure clock (B1).
+		if (!reliable && !tx.rawBytes.empty() && sink_.sendRaw)
 			sink_.sendRaw(tx.rawBytes.data(), tx.rawBytes.size());
 		++tx.retries;
 		int interval = std::min(TurnRtoMs << tx.retries, TurnMaxRtxIntervalMs);

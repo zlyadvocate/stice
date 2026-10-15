@@ -215,7 +215,12 @@ bool Message::isMessage(const unsigned char *data, std::size_t size) {
 	if (cookie != MagicCookie) return false;
 	std::uint16_t length = readU16Be(data + 2);
 	if ((length & 0x03) != 0) return false; // multiple of 4
-	if (size != MessageHeaderSize + length) return false;
+	// The message is delimited by its own length field (RFC 5389 §6), so trailing
+	// bytes after the declared message are not an error - padding, or a
+	// coalesced/prepended payload on a datagram, is legal. Requiring an exact
+	// size made those packets look like application data. A message that is
+	// SHORTER than its declared length is still rejected.
+	if (size < MessageHeaderSize + length) return false;
 	return true;
 }
 

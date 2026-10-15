@@ -16,6 +16,9 @@ namespace stice::turn {
 std::size_t wrapChannelData(std::uint16_t channel, const unsigned char *data,
                             std::size_t size, bytes &out) {
 	if (!channelValid(channel)) return 0;
+	// F1: the 16-bit length field cannot express payloads > 65535; reject
+	// rather than silently truncate (callers must fragment large payloads).
+	if (size > 0xFFFF) return 0;
 	std::size_t padded = paddedSize(size);
 	out.resize(ChannelDataHeaderSize + padded);
 	out[0] = static_cast<unsigned char>(channel >> 8);

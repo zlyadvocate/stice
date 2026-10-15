@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // Author: zlyadvocate
-// Version: 0.11.0
+// Version: 0.12.4
 // stserver entry point: load stserver.conf, configure logging, run the TURN
 // server event loop until interrupted.
 
@@ -73,8 +73,47 @@ static void logHandler(stice_log_level_t level, const char *message) {
 	std::fprintf(stderr, "[stserver/%s] %s\n", tag, message ? message : "");
 }
 
-int main(int argc, char **argv) {
+
 #ifdef _WIN32
+static LONG WINAPI crashFilter(struct _EXCEPTION_POINTERS *ep) {
+	FILE *f = nullptr;
+	fopen_s(&f, "E:/stice/stice/stserver_crash.txt", "a");
+	if (f) {
+		const char *name = "?";
+		switch (ep->ExceptionRecord->ExceptionCode) {
+		case 0xC0000005: name = "ACCESS_VIOLATION"; break;
+		case 0xC00000FD: name = "STACK_OVERFLOW"; break;
+		case 0xC0000094: name = "INT_DIVIDE_BY_ZERO"; break;
+		case 0xC0000096: name = "PRIV_INSTRUCTION"; break;
+		case 0xC000001D: name = "ILLEGAL_INSTRUCTION"; break;
+		case 0xC0000008: name = "INVALID_HANDLE"; break;
+		default: break;
+		}
+		std::fprintf(f, "CRASH code=0x%08X(%s) addr=%p at %s\n",
+			(unsigned)ep->ExceptionRecord->ExceptionCode, name,
+			ep->ExceptionRecord->ExceptionAddress, __DATE__);
+#ifdef _MSC_VER
+		// Best-effort stack backtrace into the same file.
+		CONTEXT *ctx = ep->ContextRecord;
+		std::fprintf(f, "  RIP=%p RSP=%p RBP=%p\n", (void*)ctx->Rip,
+			(void*)ctx->Rsp, (void*)ctx->Rbp);
+#endif
+		std::fflush(f);
+		fclose(f);
+	}
+	fflush(stderr);
+	return EXCEPTION_EXECUTE_HANDLER;
+}
+#endif
+
+int main(int argc, char **argv) {
+	// Unbuffered stdout: the server's stdout is usually redirected to a file by a
+	// supervisor/test harness, and block buffering made the periodic RELAY-STAT
+	// lines (and everything else) appear minutes late or not at all, which made a
+	// stalled run look like a server that had received nothing.
+	std::setvbuf(stdout, nullptr, _IONBF, 0);
+#ifdef _WIN32
+	SetUnhandledExceptionFilter(&crashFilter);
 	WSADATA wsa;
 	if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
 		std::fprintf(stderr, "stserver: WSAStartup failed\n");

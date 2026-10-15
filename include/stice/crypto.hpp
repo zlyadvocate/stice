@@ -5,6 +5,16 @@
 // transaction IDs, ufrag/pwd). Implementations are self-contained so the
 // core ICE/STUN/TURN path has no hard OpenSSL dependency; OpenSSL is only
 // used optionally for TURN over TLS.
+//
+// SCOPE / NOT A GENERAL-PURPOSE CRYPTO LIBRARY. These primitives exist to
+// implement the STUN/TURN wire requirements above and nothing else. They are
+// hand-written (not a vetted crypto module), so they MUST NOT be used for data
+// confidentiality, general-purpose digests, long-term secret storage, or any
+// new protocol: the security they provide is bounded by what RFC 5389/8656
+// demand (message-integrity and fingerprint checks on already-transported
+// packets, plus credential key derivation). Add new uses only with an
+// independent review; prefer a vetted library (OpenSSL/BoringSSL/libsodium) if
+// you need general cryptography.
 
 #ifndef STICE_CRYPTO_HPP
 #define STICE_CRYPTO_HPP

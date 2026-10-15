@@ -113,4 +113,13 @@ std::size_t StunConn::readFrame(const unsigned char *&out) {
 	return frameSize;
 }
 
+bytes StunConn::takeBuffered() {
+	bytes out;
+	if (consumed_ < buf_.size())
+		out.assign(buf_.begin() + consumed_, buf_.end());
+	buf_.clear();
+	consumed_ = 0;
+	return out;
+}
+
 } // namespace stice::turn

@@ -30,6 +30,31 @@ using namespace stice;
 using namespace stice::ice;
 using namespace stice::stun;
 
+TEST_CASE("LifetimeGuard::shutdown is bounded when a scope is never released", "[agent][lifetime]") {
+	// Regression for the teardown hang: shutdown() waited on `inFlight == 0` with
+	// NO timeout, so a single orphaned LifetimeScope - e.g. held by the gather
+	// worker if it got wedged behind Agent::mutex_ - hung stice_destroy forever
+	// (observed as "tearing down A" never returning). The wait must now be
+	// bounded so teardown always returns, and it must report the leak.
+	auto guard = std::make_shared<LifetimeGuard>();
+
+	// Simulate an async callback that entered and never left.
+	REQUIRE(guard->acquire());
+	REQUIRE(guard->inFlightCount() == 1);
+
+	const auto t0 = std::chrono::steady_clock::now();
+	const bool drained = guard->shutdown(150); // must give up, not hang
+	const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+	REQUIRE_FALSE(drained);
+	REQUIRE(elapsed < std::chrono::seconds(3)); // bounded, nowhere near "forever"
+	REQUIRE(guard->inFlightCount() == 1);
+
+	// A guard whose scopes did drain reports success.
+	guard->release();
+	REQUIRE(guard->shutdown(1000));
+}
+
 namespace {
 Candidate makeCandidate(CandidateType type, CandidateTransport t, std::uint32_t priority) {
 	Candidate c;

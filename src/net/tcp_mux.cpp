@@ -186,6 +186,16 @@ int TcpMuxConn::send(const char *data, std::size_t size) {
 	return static_cast<int>(size);
 }
 
+int TcpMuxConn::sendControl(const char *data, std::size_t size) {
+	if (!transport_ || transport_->state() != TcpState::Connected) {
+		STICE_LOG_DEBUG("TCPMuxConn::sendControl: not connected (state=%d)",
+		                transport_ ? static_cast<int>(transport_->state()) : -1);
+		return -1;
+	}
+	if (!transport_->sendControl(data, size)) return -1;
+	return static_cast<int>(size);
+}
+
 // ---------------------------------------------------------------------------
 // TCPMux
 // ---------------------------------------------------------------------------
@@ -333,7 +343,8 @@ void TCPMux::removeAgent(const std::string &ufrag) {
 	STICE_LOG_INFO("TCPMux: removed agent ufrag=%s", ufrag.c_str());
 }
 
-int TCPMux::sendto(const char *data, std::size_t size, const AddrRecord &dst) {
+int TCPMux::sendto(const char *data, std::size_t size, const AddrRecord &dst,
+                   bool control) {
 	auto key = addrKey(dst);
 	std::shared_ptr<TcpMuxConn> conn;
 	{
@@ -345,7 +356,7 @@ int TCPMux::sendto(const char *data, std::size_t size, const AddrRecord &dst) {
 		}
 		conn = it->second;
 	}
-	return conn->send(data, size);
+	return control ? conn->sendControl(data, size) : conn->send(data, size);
 }
 
 bool TCPMux::boundAddr(AddrRecord &out) const {
@@ -498,7 +509,19 @@ void TCPMux::onConnEstablished(TcpMuxConn *conn, const std::string &ufrag) {
 
 	if (!agent) {
 		STICE_LOG_WARN("TCPMux: no agent for ufrag=%s, closing connection from %s",
-		               ufrag.c_str(), conn->peerAddr().toString().c_str());
+			ufrag.c_str(), conn->peerAddr().toString().c_str());
+		// Critical (C-1): do NOT drop the last shared_ptr here. The calling stack
+		// (onTcpEvents -> tryReadFirstPacket -> onConnEstablished) still accesses
+		// this after this return, so destroying TcpMuxConn now would be a UAF.
+		// Remove + sync so the poll thread holds no raw pointer, then defer the
+		// destruction through toDestroy_ (freed by the next onBookkeeping pass),
+		// matching cleanupConns() deferred-cleanup semantics.
+		if (pollReg_) {
+			pollReg_->remove(conn);
+			pollReg_->sync();
+		}
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (connShared) toDestroy_.push_back(connShared);
 		return;
 	}
 

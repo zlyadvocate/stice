@@ -50,6 +50,7 @@ enum class AllocState {
 	Idle,
 	Allocating,
 	Allocated,
+	Deallocated, // Refresh(0) sent; no further refresh timers may re-arm
 	Failed,
 };
 
@@ -95,7 +96,10 @@ struct TurnConfig {
 // Callbacks the TURN client uses to talk to the agent's network layer.
 struct TurnSink {
 	// Send a raw STUN message or ChannelData frame to the TURN server.
-	std::function<void(const unsigned char *data, std::size_t size)> sendRaw;
+	// Returns the number of bytes sent, or a negative platform errno
+	// (negated, e.g. -STICE_SENOBUFS) on failure so data-path callers can
+	// propagate backpressure to the application.
+	std::function<int(const unsigned char *data, std::size_t size)> sendRaw;
 	// A relayed candidate is available (after Allocate success).
 	std::function<void(const net::AddrRecord &relayed, std::uint32_t lifetime)> onAllocated;
 	// Allocation failed permanently.
@@ -135,7 +139,21 @@ public:
 	// permission/channel state machine internally: if a channel is bound,
 	// uses ChannelData; otherwise uses a Send indication and kicks off
 	// CreatePermission + ChannelBind in the background.
-	void sendData(const net::AddrRecord &peer, const unsigned char *data, std::size_t size);
+	// Returns a non-negative value on acceptance (bytes buffered pending
+	// permission count as accepted), or a negative platform errno on
+	// transport failure, so callers can surface backpressure (EAGAIN /
+	// ENOBUFS) instead of silently dropping the data.
+	int sendData(const net::AddrRecord &peer, const unsigned char *data, std::size_t size);
+
+	// Fast path for the hot app-data send loop: if a ChannelData channel is
+	// already bound for `peer`, render the payload as a ChannelData frame into
+	// `out` and return 1 so the ICE agent can send the frame OUTSIDE the agent
+	// lock (removing lock contention between the send loop and the poll thread,
+	// which libjuice avoids with its independent send_mutex). Returns 0 when no
+	// usable channel is ready yet (caller must fall back to sendData), or a
+	// negative value on error. Const: only reads binding/channel state.
+	int prepareChannelData(const net::AddrRecord &peer, const unsigned char *data,
+	                       std::size_t size, bytes &out) const;
 
 	// Tear down the allocation. Sends Refresh with LIFETIME=0.
 	void deallocate();
@@ -181,8 +199,26 @@ public:
 private:
 	// Send a STUN request, applying long-term credentials if we have them.
 	void sendRequest(stun::Message &msg);
+	// Apply credentials + encode MESSAGE-INTEGRITY into msg.raw (no send).
+	// Kept separate from the actual send so callers can register the pending
+	// transaction BEFORE the datagram leaves the socket. The TURN response
+	// arrives on the poll thread while the request is sent from the gather
+	// thread; if the response beats the pending_ registration it is dropped as
+	// "no pending TID match" and the relay candidate never becomes ready.
+	void prepareRequest(stun::Message &msg);
+	// Send an already-encoded, already-registered request.
+	void sendPrepared(const stun::Message &msg);
 	// Handle a STUN response (success or error).
 	void handleStunResponse(const stun::Message &msg);
+	// Centralized 401/438 handling shared by all request types. Captures
+	// realm/nonce (401) or refreshes the nonce (438), bounded by
+	// MaxNonceRetries. `retryAuthed` is false for Allocate (a 401 after we
+	// already sent credentials means wrong password -> fatal) and true for
+	// post-allocation requests (401 there is usually a rotated nonce).
+	// Returns true when the request should be re-sent with refreshed creds.
+	bool handleAuthError(const stun::Message &msg, int code, bool retryAuthed);
+	// Transition to Failed and emit onFailed AT MOST ONCE per allocation.
+	void failAllocation(int errorCode, const std::string &reason);
 	// Handle an Allocate response (success: store relayed addr + lifetime,
 	// start refresh timers; error 401: capture realm/nonce and retry;
 	// error 438: refresh nonce and retry).
@@ -226,9 +262,23 @@ private:
 	AllocState state_ = AllocState::Idle;
 	std::optional<stun::Credentials> creds_;
 	int nonceRetries_ = 0; // 438 StaleNonce retry counter (reset on successful auth)
+	// onFailed is a terminal event for this allocation: the ICE agent decrements
+	// its pending-relay counter in the callback, so it must fire AT MOST ONCE.
+	// Set once we emit onFailed (auth failure, timeout, transport loss, refresh
+	// failure). Prevents the "allocated then transport-lost" double-decrement
+	// (which underflows the counter in multi-server scenarios).
+	bool failedEmitted_ = false;
 	net::AddrRecord relayedAddr_;
 	std::uint32_t lifetime_ = 0;
 	std::chrono::steady_clock::time_point refreshAt_{};
+	// In-flight guard for Refresh, mirroring PeerBinding::permissionTidFresh /
+	// channelTidFresh. Without it, any Refresh that did not get a successful
+	// response was re-issued on EVERY tick: sendRefresh() never moved refreshAt_,
+	// so tick() kept returning a past-due nextTick_ and the poll loop spun,
+	// emitting one Refresh per iteration. That flooded the server (observed as a
+	// continuous "REFRESH(method=4) -> ERROR(cls=2)" stream during teardown),
+	// grew pending_ without bound, and pinned the poll thread.
+	bool refreshTidFresh_ = false;
 	std::chrono::steady_clock::time_point nextTick_{};
 	// Allocate transaction ID (for tracking the in-flight allocate).
 	std::array<unsigned char, 12> allocateTid_{};

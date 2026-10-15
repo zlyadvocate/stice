@@ -91,6 +91,15 @@ public:
 	// length prefix. In Raw mode, writes the data as-is. Returns false on
 	// hard failure.
 	bool send(const char *data, std::size_t size);
+	// Enqueue a CONTROL frame (STUN connectivity check / TURN Refresh,
+	// CreatePermission, ChannelBind, CONNECTION-BIND). Control frames are
+	// flushed ahead of the bulk application queue, so a saturated data
+	// stream can never starve keepalives: head-of-line blocking of Refresh
+	// or ConnectionBind makes the server drop the allocation/connection
+	// (observed as 9s+ Binding RTT and "connection lost state=4" under
+	// 100 MiB/round floods). Control frames also bypass the send-queue
+	// high watermark — they are small and protocol-critical.
+	bool sendControl(const char *data, std::size_t size);
 	// Pull one complete framed message out of the read buffer (RFC4571 mode),
 	// or raw bytes from the buffer (Raw mode). Returns the number of bytes
 	// written to `out` (0 if no data yet), or -1 on failure.
@@ -102,8 +111,26 @@ public:
 	// the poll thread) and drained by the poll thread's flushSends.
 	bool wantsWrite() const {
 		std::lock_guard<std::mutex> lk(sendMtx_);
-		return !sendQueue_.empty() || state_ == TcpState::Connecting;
+		// E1: while TLS handshaking, arm POLLOUT when the handshake needs to
+		// write (SSL_ERROR_WANT_WRITE) even if the send queue is empty,
+		// otherwise the handshake stalls until connect timeout.
+		return ctrlOff_ < ctrlQueue_.size() || sendOff_ < sendQueue_.size() ||
+		       state_ == TcpState::Connecting ||
+		       (state_ == TcpState::TlsHandshaking && tlsWantWrite_);
 	}
+
+	// D2: true when the pending-send backlog exceeds the high-water mark.
+	// A stalled peer (TCP flow control) otherwise grows sendQueue_ without
+	// bound; data-path callers poll this and surface EWOULDBLOCK backpressure
+	// to the application instead of buffering forever.
+	bool sendQueueFull() const {
+		std::lock_guard<std::mutex> lk(sendMtx_);
+		return (sendQueue_.size() - sendOff_) >= kSendQueueHighWater;
+	}
+
+	// High-water mark for the send backlog (8 MiB). Beyond this, senders get
+	// backpressure; below it, bursts of up to 8 MiB are absorbed losslessly.
+	static constexpr std::size_t kSendQueueHighWater = 8u * 1024 * 1024;
 
 private:
 	short flushSends();
@@ -132,13 +159,26 @@ private:
 	// insert/erase on this vector caused heap corruption (0xC0000374 /
 	// 0xC0000005) when app data was sent from the user thread while the
 	// poll thread flushed a pending queue.
+	// sendOff_ tracks the consumed prefix: draining sends from
+	// data()+sendOff_ instead of erase()-ing the front, so a large
+	// backlog (bulk send while the peer stalls) doesn't memmove the whole
+	// queue on every 64 KiB chunk. The prefix is compacted only when it
+	// exceeds kTcpBufCompactThreshold bytes.
 	std::vector<unsigned char> sendQueue_;
+	std::size_t sendOff_ = 0;
+	// Control-frame queue (sendControl): flushed before sendQueue_ so bulk
+	// application data can never delay STUN/TURN signalling. Same locking
+	// discipline as sendQueue_ (sendMtx_ guards both queues).
+	std::vector<unsigned char> ctrlQueue_;
+	std::size_t ctrlOff_ = 0;
 	mutable std::mutex sendMtx_;
 
 	// Read buffer accumulation for framing. Guarded by recvMtx_
 	// (onReadable appends on the poll thread; recv drains on the caller's
-	// thread).
+	// thread). recvOff_ is the consumed prefix — same amortized-consumption
+	// scheme as sendQueue_ (no per-frame front erase).
 	std::vector<unsigned char> recvBuf_;
+	std::size_t recvOff_ = 0;
 	mutable std::mutex recvMtx_;
 
 	// Application-layer connect deadline (absolute steady-clock ms, -1 =

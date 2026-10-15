@@ -24,8 +24,10 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <mutex>
 #include <new>
 #include <thread>
+#include <unordered_set>
 
 // ---------------------------------------------------------------------------
 // stice_agent_t: the opaque handle. Defined here (not in a header) so the
@@ -37,16 +39,27 @@
 // thread-safe. The owner thread is recorded at creation and checked (debug
 // builds log a warning on violation).
 //
-// Destroy idempotency (P0-6): `destroyed` is set atomically by stice_destroy;
-// a second stice_destroy call on the same handle is a no-op (the handle is
-// responsible for never passing a freed pointer, but the atomic guards
-// against double-destroy of a still-valid handle).
+// Destroy idempotency / lifetime (P0-6): stice_destroy removes the handle from
+// the process-wide live-handle registry (below) under a mutex and only the
+// thread that successfully removed it proceeds to delete. Deciding this from an
+// in-object flag alone was a use-after-free: testing `a->destroyed` requires
+// dereferencing `a`, which another thread may already have deleted.
+// `destroyed` is still set (before the delete) so a late API call on a live
+// handle is rejected by agent_check.
 // ---------------------------------------------------------------------------
 struct stice_agent {
 	stice::ice::Agent agent;
 	std::atomic<bool> destroyed{false};
 	std::thread::id ownerThread;
 };
+
+// Process-wide registry of live handles. Guarded by its own mutex; only
+// stice_create (insert) and stice_destroy (erase) touch it, so it costs nothing
+// on the per-call API path.
+namespace {
+std::mutex g_handleMutex;
+std::unordered_set<stice_agent_t *> g_liveHandles;
+}
 
 // Helper: validate the agent handle and enforce the single-thread constraint.
 // Returns nullptr (and logs in debug) if the handle is invalid, already
@@ -82,6 +95,10 @@ STICE_EXPORT stice_agent_t *stice_create(const stice_config_t *config) {
 		delete a;
 		return nullptr;
 	}
+	{
+		std::lock_guard<std::mutex> lk(g_handleMutex);
+		g_liveHandles.insert(reinterpret_cast<stice_agent_t *>(a));
+	}
 	return reinterpret_cast<stice_agent_t *>(a);
 }
 
@@ -89,11 +106,17 @@ STICE_EXPORT void stice_destroy(stice_agent_t *agent) {
 	if (!agent)
 		return;
 	auto *a = reinterpret_cast<stice_agent *>(agent);
-	// Idempotent destroy (P0-6): if already destroyed, do nothing. The
-	// exchange ensures exactly one caller proceeds to delete.
-	bool expected = false;
-	if (!a->destroyed.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
-		return;
+	// Idempotent destroy (P0-6) decided by the REGISTRY, not by the object: the
+	// handle is removed first, so a concurrent (or repeated) destroy finds
+	// nothing to remove and returns without ever dereferencing the pointer.
+	// Only the winner marks the flag and frees.
+	{
+		std::lock_guard<std::mutex> lk(g_handleMutex);
+		if (g_liveHandles.find(agent) == g_liveHandles.end())
+			return; // unknown handle, or already destroyed
+		a->destroyed.store(true, std::memory_order_release);
+		g_liveHandles.erase(agent);
+	}
 	delete a;
 }
 
@@ -152,7 +175,12 @@ STICE_EXPORT int stice_set_remote_gathering_done(stice_agent_t *agent) {
 }
 
 STICE_EXPORT int stice_send(stice_agent_t *agent, const char *data, size_t size) {
-	return stice_send_diffserv(agent, data, size, 0);
+	// Pass -1 ("do not touch TOS") rather than 0. ds >= 0 selects the diffserv
+	// branch everywhere downstream, and Agent::send gates its fast path on
+	// `ds < 0`; passing 0 therefore sent every default-API packet down the slow
+	// path (main lock + sendMutex_) and did a setsockopt per packet for no
+	// reason.
+	return stice_send_diffserv(agent, data, size, -1);
 }
 
 STICE_EXPORT int stice_send_diffserv(stice_agent_t *agent, const char *data, size_t size, int ds) {
@@ -164,6 +192,11 @@ STICE_EXPORT int stice_send_diffserv(stice_agent_t *agent, const char *data, siz
 		return STICE_ERR_SUCCESS;
 	// ret is the negative of a platform errno (STICE_SE*).
 	if (ret == -STICE_SEAGAIN || ret == -STICE_SEWOULDBLOCK)
+		return STICE_ERR_AGAIN;
+	// ENOBUFS (send buffer full) is transient for UDP relay/datagram
+	// sockets: treat it as EAGAIN so the application retries instead of
+	// failing the send (RFC: datagram ENOBUFS loses nothing unrecoverable).
+	if (ret == -STICE_SENOBUFS)
 		return STICE_ERR_AGAIN;
 	if (ret == -STICE_SEMSGSIZE)
 		return STICE_ERR_TOO_LARGE;
