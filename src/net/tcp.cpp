@@ -9,6 +9,7 @@
 #include "stice/net/tcp.hpp"
 
 #include "stice/log.hpp"
+#include "stice/net/tls.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -25,17 +26,9 @@
 #include <unistd.h>
 #endif
 
-#ifdef STICE_HAVE_OPENSSL
-#include <openssl/err.h>
-#include <openssl/ssl.h>
-#endif
-
 namespace stice::net {
 
 namespace {
-#ifdef STICE_HAVE_OPENSSL
-void clearSslError() { ERR_clear_error(); }
-#endif
 
 // Socket options shared by every TCP transport: outgoing connects
 // (beginConnect) and accepted sockets (attach). Kept in one place so the two
@@ -77,20 +70,17 @@ void applyTcpSocketOptions(socket_t s) {
 }
 } // namespace
 
+TcpTransport::TcpTransport() = default;
+
 TcpTransport::~TcpTransport() { close(); }
 
 void TcpTransport::close() {
-#ifdef STICE_HAVE_OPENSSL
-	if (ssl_) {
-		SSL_shutdown(static_cast<SSL *>(ssl_));
-		SSL_free(static_cast<SSL *>(ssl_));
-		ssl_ = nullptr;
+	if (tls_) {
+		tls_->shutdown();
+		tls_->close();
+		tls_.reset();
 	}
-	if (sslCtx_) {
-		SSL_CTX_free(static_cast<SSL_CTX *>(sslCtx_));
-		sslCtx_ = nullptr;
-	}
-#endif
+	tlsWantRead_ = tlsWantWrite_ = false;
 	if (sock_ != STICE_INVALID_SOCKET) {
 		sticeClosesocket(sock_);
 		sock_ = STICE_INVALID_SOCKET;
@@ -134,11 +124,12 @@ void TcpTransport::setConnectTimeoutMs(int timeoutMs) {
 }
 
 bool TcpTransport::beginConnect(const AddrRecord &dst, const std::string &sni, bool useTls,
-                                bool skipVerify) {
+                                bool skipVerify, const std::string &caFile) {
 	close();
 	useTls_ = useTls;
 	skipVerify_ = skipVerify;
 	sni_ = sni;
+	caFile_ = caFile;
 	peerAddr_ = dst;
 	sock_ = ::socket(dst.addr.ss_family, SOCK_STREAM, IPPROTO_TCP);
 	if (sock_ == STICE_INVALID_SOCKET) {
@@ -148,6 +139,7 @@ bool TcpTransport::beginConnect(const AddrRecord &dst, const std::string &sni, b
 	}
 	setNonBlocking(sock_);
 	applyTcpSocketOptions(sock_);
+	disableSigPipe(sock_); // macOS/BSD: no per-send MSG_NOSIGNAL there
 
 	int r = ::connect(sock_, reinterpret_cast<const struct sockaddr *>(&dst.addr), dst.len);
 	if (r == 0) {
@@ -181,6 +173,7 @@ bool TcpTransport::attach(socket_t fd, const AddrRecord &peerAddr) {
 	// Accepted sockets inherit the listener's options on some platforms, so
 	// apply the full set here too (beginConnect does the same for outbound).
 	applyTcpSocketOptions(sock_);
+	disableSigPipe(sock_);
 	state_ = TcpState::Connected;
 	useTls_ = false;
 	STICE_LOG_DEBUG("TCP transport attached to accepted fd (peer=%s)",
@@ -203,32 +196,30 @@ short TcpTransport::onWritable() {
 		}
 		// Connected.
 		if (useTls_) {
-#ifdef STICE_HAVE_OPENSSL
-			sslCtx_ = SSL_CTX_new(TLS_client_method());
-			if (!sslCtx_) { state_ = TcpState::Failed; return 0; }
-			SSL_CTX_set_default_verify_paths(static_cast<SSL_CTX *>(sslCtx_));
-			if (!skipVerify_) {
-				// Verify the server certificate against the system trust
-				// store (pion's default behavior). skipVerify_ is set only
-				// for testing with self-signed certificates.
-				SSL_CTX_set_verify(static_cast<SSL_CTX *>(sslCtx_),
-				                   SSL_VERIFY_PEER, nullptr);
+			if (!TlsSession::available()) {
+				// Built without a TLS backend: degrade to plain TCP, exactly as
+				// before TLS support existed, but say so.
+				STICE_LOG_WARN("TLS requested but stice was built without a TLS backend; "
+				               "using plain TCP");
+				state_ = TcpState::Connected;
+			} else {
+				tls_.reset(new TlsSession());
+				TlsParams params;
+				params.sni = sni_;
+				params.skipVerify = skipVerify_;
+				// Per-server trust anchor; when empty the backend falls back to
+				// STICE_TLS_CA_FILE and then to the platform store.
+				params.caFile = caFile_;
+				if (!tls_->initClient(sock_, params)) {
+					STICE_LOG_WARN("TLS client setup failed (%s): %s",
+					               TlsSession::backendName(), tls_->errorString().c_str());
+					tls_.reset();
+					state_ = TcpState::Failed;
+					return 0;
+				}
+				state_ = TcpState::TlsHandshaking;
+				return driveTlsHandshake();
 			}
-			ssl_ = SSL_new(static_cast<SSL_CTX *>(sslCtx_));
-			if (!ssl_) { state_ = TcpState::Failed; return 0; }
-			SSL_set_tlsext_host_name(static_cast<SSL *>(ssl_), sni_.c_str());
-			// Enable hostname verification (RFC 6125) unless skipped.
-			if (!skipVerify_ && !sni_.empty()) {
-				X509_VERIFY_PARAM *param = SSL_get0_param(static_cast<SSL *>(ssl_));
-				X509_VERIFY_PARAM_set1_host(param, sni_.c_str(), sni_.size());
-			}
-			SSL_set_fd(static_cast<SSL *>(ssl_), static_cast<int>(sock_));
-			state_ = TcpState::TlsHandshaking;
-			return driveTlsHandshake();
-#else
-			STICE_LOG_WARN("TLS requested but stice built without OpenSSL; using plain TCP");
-			state_ = TcpState::Connected;
-#endif
 		}
 		state_ = TcpState::Connected;
 	}
@@ -248,26 +239,35 @@ short TcpTransport::onReadable() {
 		// than the old 4 KiB buffer, and each extra poll-loop iteration
 		// costs a full bookkeeping pass over all participants.
 		unsigned char tmp[65536];
-		int n;
-		if (ssl_) {
-#ifdef STICE_HAVE_OPENSSL
-			clearSslError();
-			n = SSL_read(static_cast<SSL *>(ssl_), tmp, sizeof(tmp));
-			if (n <= 0) {
-				int e = SSL_get_error(static_cast<SSL *>(ssl_), n);
-				if (e == SSL_ERROR_WANT_READ) { tlsWantRead_ = true; return POLLIN; }
-				if (e == SSL_ERROR_WANT_WRITE) { tlsWantWrite_ = true; return POLLIN | POLLOUT; }
+		std::size_t n = 0;
+		const bool tlsActive = tls_ && tls_->active();
+		if (tlsActive) {
+			TlsStatus st = tls_->read(tmp, sizeof(tmp), n);
+			if (st == TlsStatus::WantRead) {
+				tlsWantRead_ = true;
+				return POLLIN;
+			}
+			if (st == TlsStatus::WantWrite) {
+				tlsWantWrite_ = true;
+				return POLLIN | POLLOUT;
+			}
+			if (st == TlsStatus::Closed) {
+				state_ = TcpState::Disconnected;
+				return 0;
+			}
+			if (st == TlsStatus::Failed) {
+				STICE_LOG_WARN("TLS read failed (%s): %s", TlsSession::backendName(),
+				               tls_->errorString().c_str());
 				state_ = TcpState::Failed;
 				return 0;
 			}
-#else
-			n = 0;
-#endif
+			if (n == 0) return POLLIN; // nothing transferred yet
+			clearTlsWantHints();      // progress: stale hints would spin the poll loop
 		} else {
-			n = static_cast<int>(::recv(sock_, reinterpret_cast<char *>(tmp), sizeof(tmp), 0));
-			if (n > 0) {
-				// ok
-			} else if (n == 0) {
+			int r = static_cast<int>(::recv(sock_, reinterpret_cast<char *>(tmp), sizeof(tmp), 0));
+			if (r > 0) {
+				n = static_cast<std::size_t>(r);
+			} else if (r == 0) {
 				state_ = TcpState::Disconnected;
 				return 0;
 			} else if (wouldBlock()) {
@@ -290,41 +290,36 @@ short TcpTransport::onReadable() {
 		// Plain TCP: keep draining until EWOULDBLOCK. Returning early on a
 		// short read used to leave data in the kernel buffer, forcing one
 		// poll iteration (with full bookkeeping) per ~4 KiB. TLS keeps the
-		// short-read exit (SSL_read returning less than requested may
-		// still have buffered records pending).
-		if (ssl_ && n < static_cast<int>(sizeof(tmp))) return POLLIN;
+		// short-read exit (a TLS record read may return less than requested
+		// while further records are already buffered).
+		if (tlsActive && n < sizeof(tmp)) return POLLIN;
 	}
 }
 
 short TcpTransport::driveTlsHandshake() {
-#ifdef STICE_HAVE_OPENSSL
-	clearSslError();
-	int r = SSL_connect(static_cast<SSL *>(ssl_));
-	if (r == 1) {
-		// Handshake complete. Verify the peer certificate unless we were
-		// explicitly told to skip verification.
-		if (!skipVerify_) {
-			long verifyResult = SSL_get_verify_result(static_cast<SSL *>(ssl_));
-			if (verifyResult != X509_V_OK) {
-				STICE_LOG_WARN("TLS certificate verification failed: %s",
-				               X509_verify_cert_error_string(verifyResult));
-				state_ = TcpState::Failed;
-				return 0;
-			}
-		}
+	if (!tls_ || !tls_->active()) {
+		state_ = TcpState::Failed;
+		return 0;
+	}
+	switch (tls_->handshake()) {
+	case TlsStatus::Ok:
 		state_ = TcpState::Connected;
 		tlsWantRead_ = tlsWantWrite_ = false;
 		return flushSends();
+	case TlsStatus::WantRead:
+		tlsWantRead_ = true;
+		tlsWantWrite_ = false;
+		return POLLIN;
+	case TlsStatus::WantWrite:
+		tlsWantWrite_ = true;
+		tlsWantRead_ = false;
+		return POLLIN | POLLOUT;
+	default:
+		STICE_LOG_WARN("TLS handshake failed (%s): %s", TlsSession::backendName(),
+		               tls_->errorString().c_str());
+		state_ = TcpState::Failed;
+		return 0;
 	}
-	int e = SSL_get_error(static_cast<SSL *>(ssl_), r);
-	if (e == SSL_ERROR_WANT_READ) { tlsWantRead_ = true; tlsWantWrite_ = false; return POLLIN; }
-	if (e == SSL_ERROR_WANT_WRITE) { tlsWantWrite_ = true; tlsWantRead_ = false; return POLLIN | POLLOUT; }
-	state_ = TcpState::Failed;
-	return 0;
-#else
-	state_ = TcpState::Failed;
-	return 0;
-#endif
 }
 
 short TcpTransport::flushSends() {
@@ -344,29 +339,40 @@ short TcpTransport::flushSends() {
 		while (off < q.size()) {
 			const unsigned char *p = q.data() + off;
 			std::size_t avail = q.size() - off;
-			int n;
-			if (ssl_) {
-#ifdef STICE_HAVE_OPENSSL
-				clearSslError();
-				n = SSL_write(static_cast<SSL *>(ssl_), p,
-				              static_cast<int>(std::min<std::size_t>(avail, 16384)));
-				if (n <= 0) {
-					int e = SSL_get_error(static_cast<SSL *>(ssl_), n);
-					if (e == SSL_ERROR_WANT_READ) { tlsWantRead_ = true; return POLLIN; }
-					if (e == SSL_ERROR_WANT_WRITE) { tlsWantWrite_ = true; return POLLIN | POLLOUT; }
+			std::size_t n = 0;
+			if (tls_ && tls_->active()) {
+				TlsStatus st = tls_->write(p, std::min<std::size_t>(avail, 16384), n);
+				if (st == TlsStatus::WantRead) {
+					tlsWantRead_ = true;
+					return POLLIN;
+				}
+				if (st == TlsStatus::WantWrite) {
+					tlsWantWrite_ = true;
+					return POLLIN | POLLOUT;
+				}
+				// Contract (tls.hpp): "Ok with n == 0 is a legal result meaning
+				// 'nothing transferred, try again'". Only a non-Ok status is a
+				// failure — treating Ok+n==0 as fatal would tear down a healthy
+				// connection if a backend (or a future library version, e.g. a
+				// TLS 1.3 post-handshake situation) legitimately makes no
+				// progress in one call. Mirrors the read path.
+				if (st != TlsStatus::Ok) {
+					STICE_LOG_WARN("TLS write failed (%s): %s", TlsSession::backendName(),
+					               tls_->errorString().c_str());
 					state_ = TcpState::Failed;
 					return 0;
 				}
-#else
-				n = 0;
-#endif
+				if (n == 0) break;        // nothing transferred; keep the rest queued
+				clearTlsWantHints();      // progress: drop the stale hints
 			} else {
 				// 64 KiB chunks (fewer syscalls for bulk backlogs; RFC 4571
 				// frames are reassembled by the receiver anyway).
-				n = static_cast<int>(::send(sock_, reinterpret_cast<const char *>(p),
-				                            static_cast<socklen_t>(std::min<std::size_t>(avail, 65536)), 0));
-				if (n > 0) {
-					// ok
+				int r = static_cast<int>(::send(sock_, reinterpret_cast<const char *>(p),
+				                                static_cast<socklen_t>(
+				                                    std::min<std::size_t>(avail, 65536)),
+				                                STICE_MSG_NOSIGNAL));
+				if (r > 0) {
+					n = static_cast<std::size_t>(r);
 				} else if (wouldBlock()) {
 					break;
 				} else {
@@ -374,7 +380,7 @@ short TcpTransport::flushSends() {
 					return 0;
 				}
 			}
-			off += static_cast<std::size_t>(n);
+			off += n;
 		}
 		if (off >= q.size()) {
 			q.clear();

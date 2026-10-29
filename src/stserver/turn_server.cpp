@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // Author: zlyadvocate
-// Version: 0.12.3
+// Version: 0.13.0
 // stserver TURN/STUN server implementation.
 //
 // Implements STUN Binding (RFC 5389), TURN Allocate/Refresh/CreatePermission/

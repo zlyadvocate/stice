@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 // stice TCP transport for ICE-TCP (RFC 6544) and TURN over TCP/TLS (RFC 8656 §4).
-// Implements RFC 4571 2-byte length framing and optional TLS via OpenSSL.
+// Implements RFC 4571 2-byte length framing and optional TLS through the
+// pluggable backend in stice/net/tls.hpp (OpenSSL, GnuTLS or Mbed TLS,
+// selected at configure time with libdatachannel's USE_GNUTLS/USE_MBEDTLS).
 // Ported from libjuice's tcp.c / tls.c.
 
 #ifndef STICE_NET_TCP_HPP
@@ -12,10 +14,13 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <vector>
 
 namespace stice::net {
+
+class TlsSession;
 
 enum class TcpState {
 	Disconnected,
@@ -36,7 +41,10 @@ enum class FramingMode {
 
 class TcpTransport {
 public:
-	TcpTransport() = default;
+	// Out of line (tcp.cpp): the TLS session member is only fwd-declared here,
+	// so an inline default constructor would instantiate unique_ptr's deleter
+	// with an incomplete type in every consumer TU.
+	TcpTransport();
 	~TcpTransport();
 	TcpTransport(const TcpTransport &) = delete;
 	TcpTransport &operator=(const TcpTransport &) = delete;
@@ -44,9 +52,13 @@ public:
 	// Begin a non-blocking connect to `dst`. useTls=true enables TLS after
 	// connect. When useTls is true, skipVerify controls whether the server
 	// certificate is validated against the system trust store (false = verify,
-	// matching pion's default; true = skip, for testing only).
+	// matching pion's default; true = skip, for testing only). caFile is the
+	// per-connection trust bundle: non-empty pins this connection to that PEM
+	// bundle, empty falls back to STICE_TLS_CA_FILE and then to the platform
+	// store — so one agent can talk to several TURN servers with different
+	// private CAs.
 	bool beginConnect(const AddrRecord &dst, const std::string &sni, bool useTls,
-	                  bool skipVerify = false);
+	                  bool skipVerify = false, const std::string &caFile = std::string());
 	// Wrap an already-accepted socket fd (passive side of ICE-TCP). The fd
 	// must already be non-blocking and connected. Sets state=Connected and
 	// records peerAddr for routing. Used by TCPMux when accepting inbound
@@ -135,6 +147,13 @@ public:
 private:
 	short flushSends();
 	short driveTlsHandshake();
+	// Drop the stale "TLS wants read/write" hints after a call made progress.
+	// Leaving a WantWrite hint armed keeps POLLOUT requested forever and spins
+	// the poll loop, so both the read and the write path must clear it.
+	void clearTlsWantHints() {
+		tlsWantRead_ = false;
+		tlsWantWrite_ = false;
+	}
 
 	socket_t sock_ = STICE_INVALID_SOCKET;
 	// State is read by sender threads and written by the poll thread
@@ -143,12 +162,12 @@ private:
 	bool useTls_ = false;
 	bool skipVerify_ = false;
 	std::string sni_;
+	std::string caFile_; // per-connection trust bundle (empty -> env / platform)
 	FramingMode framing_ = FramingMode::RFC4571;
 	AddrRecord peerAddr_{};  // remote peer address (set by beginConnect/attach)
 
-	// OpenSSL session (opaque to the header).
-	void *ssl_ = nullptr;        // SSL*
-	void *sslCtx_ = nullptr;     // SSL_CTX* (owned briefly)
+	// TLS session (opaque; backend selected at configure time).
+	std::unique_ptr<TlsSession> tls_;
 	bool tlsWantRead_ = false;
 	bool tlsWantWrite_ = false;
 

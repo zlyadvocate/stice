@@ -70,6 +70,31 @@ int sticePoll(struct pollfd *fds, nfds_t nfds, int timeout);
 #define STICE_SEACCES EACCES
 #endif
 
+// SIGPIPE: writing to a socket whose peer has gone away raises SIGPIPE on
+// POSIX, and the default action kills the whole process — a peer that resets a
+// TURN/TLS control connection must not be able to take the host down. Linux and
+// the BSDs have MSG_NOSIGNAL per send(); macOS/older BSDs instead need
+// SO_NOSIGPIPE on the socket (set below), and Windows has no SIGPIPE at all.
+// Same approach as libjuice (tcp.c) and libdatachannel (tcptransport.cpp).
+#ifdef MSG_NOSIGNAL
+#define STICE_MSG_NOSIGNAL MSG_NOSIGNAL
+#else
+#define STICE_MSG_NOSIGNAL 0
+#endif
+
+namespace stice::net {
+// macOS/BSD: must be applied to the socket itself (no per-send flag there).
+inline void disableSigPipe(socket_t s) {
+#ifdef SO_NOSIGPIPE
+	int on = 1;
+	::setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+#else
+	(void)s;
+#endif
+}
+} // namespace stice::net
+
+
 namespace stice::net {
 inline bool wouldBlock() {
 	return sticeSockerrno == STICE_SEWOULDBLOCK || sticeSockerrno == STICE_SEAGAIN;

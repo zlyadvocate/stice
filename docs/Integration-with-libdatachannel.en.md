@@ -21,6 +21,7 @@ stice is a C++17 ICE + TURN client library ported from pion/webrtc (Go), designe
 |---------|----------|-------|
 | ICE-TCP (RFC 6544) | Active only | active / passive / simultaneous-open |
 | TURN over TCP (RFC 8656) | ✅ | ✅ |
+| TURN over TLS backend | OpenSSL only | ✅ OpenSSL / GnuTLS / Mbed TLS |
 | TURN TCP Allocation (RFC 6062) | ❌ | ✅ Mode-A + Mode-B |
 | mDNS candidates | ❌ | ✅ query-only / query-and-gather |
 | NAT 1:1 address rewrite | ❌ | ✅ replace / append |
@@ -77,13 +78,61 @@ target_link_libraries(datachannel-static PRIVATE LibJuice::LibJuiceStatic)
 **Step 3: Build**
 
 ```bash
-cmake -B build -S . -DUSE_GNUTLS=OFF -DUSE_MBEDTLS=OFF
+# Default: OpenSSL
+cmake -B build -S .
+
+# Match the crypto backend libdatachannel itself was configured with
+cmake -B build -S . -DUSE_GNUTLS=ON      # or -DUSE_MBEDTLS=ON
 cmake --build build --config Release
 ```
 
-> **Note**: stice uses OpenSSL for cryptography and TURN/TLS. If libdatachannel originally uses GnuTLS or MbedTLS, ensure OpenSSL is available, or set `STICE_USE_OPENSSL=OFF` in stice (which will disable TURN/TLS and some crypto features).
+> **Note**: stice selects its TLS backend with the **same CMake cache variables** libdatachannel uses (`USE_GNUTLS` / `USE_MBEDTLS`). Whatever the parent project picks, stice follows with no extra flags — see 2.4.
 
-### 2.2 Method 2: find_package (After Installation)
+### 2.4 TLS backend parity (OpenSSL / GnuTLS / Mbed TLS)
+
+TURN over TLS (RFC 8656 §4) goes through a pluggable TLS layer (`src/net/tls_*.cpp`).
+Exactly one backend is compiled in, selected exactly the way libdatachannel does it:
+
+| CMake variable | Library | Dependency lookup | Compile definition |
+|----------------|---------|-------------------|--------------------|
+| `USE_GNUTLS=ON` | GnuTLS | `find_package(GnuTLS)` → `GnuTLS::GnuTLS` | `USE_GNUTLS=1` |
+| `USE_MBEDTLS=ON` | Mbed TLS (2.x / 3.x) | `find_package(MbedTLS)` → `MbedTLS::MbedTLS` | `USE_MBEDTLS=1` |
+| neither (default) | OpenSSL | `find_package(OpenSSL)` | `USE_GNUTLS=0` |
+
+Key points:
+
+- Enabling both `USE_GNUTLS` and `USE_MBEDTLS` is a configure-time error, as in libdatachannel.
+- With `add_subdirectory(deps/stice)` **no extra flags are needed**: stice reads the parent's cache variables directly.
+- Standalone builds may use the `STICE_USE_GNUTLS` / `STICE_USE_MBEDTLS` aliases. With `STICE_USE_OPENSSL=OFF` and neither of them, stice builds without TLS (TURN over TLS then degrades to plain TCP with a warning).
+- `stice_get_tls_backend()` returns `"openssl"`, `"gnutls"`, `"mbedtls"` or `"none"` for runtime self-checks.
+- On Windows GnuTLS has no MSVC build (same situation as libdatachannel): use a MinGW-w64 toolchain (MSYS2's `mingw-w64-x86_64-gnutls`; verified to build and pass the full regression), or pick OpenSSL / Mbed TLS on Windows.
+- The ICE/STUN/TURN crypto primitives (MD5/SHA-1/SHA-256/HMAC/CRC32/CSPRNG) are always stice's own implementation and never depended on a TLS library; swapping backends only affects the TLS record layer.
+
+**Certificate verification policy (identical across backends)**
+
+| Situation | Behavior |
+|-----------|----------|
+| Default (`skip_tls_verify = 0`) | Verify the server certificate against the platform trust store, plus SNI/hostname verification |
+| That TURN server sets `ca_file` (non-empty) | Verify **only** that server against that PEM bundle (highest priority) |
+| `STICE_TLS_CA_FILE` set | Use that PEM bundle instead of the platform trust store (pins a private CA) |
+| `skip_tls_verify = 1` (e.g. libjuice's `JUICE_TURN_TLS_NO_VERIFY`) | Verification off, test rigs only |
+| Mbed TLS, no `STICE_TLS_CA_FILE` | Mbed TLS has no platform trust store: falls back to `VERIFY_NONE` and logs a warning |
+| **Windows + OpenSSL, no `STICE_TLS_CA_FILE`** | OpenSSL does not read the Windows certificate store and `SSL_CTX_set_default_verify_paths()` is usually empty there, so **handshakes against a private CA / self-signed certificate fail verification**; set `STICE_TLS_CA_FILE` (or use `skip_tls_verify = 1` in tests only) |
+| **Mbed TLS 2.x + a TURN server addressed by IP** | Supported: 2.x does not parse `iPAddress` SANs, so stice reads the peer certificate's subjectAltName extension itself and compares the address (3.x does it inside the library). A mismatch fails the handshake instead of quietly passing |
+
+> Rule of thumb: only OpenSSL on Linux/macOS and GnuTLS pick up the platform trust store automatically. **OpenSSL on Windows, and Mbed TLS on every platform, need an explicit `STICE_TLS_CA_FILE` or a per-server `ca_file` to verify.**
+>
+> Trust anchor precedence: **per-server `ca_file` (non-empty) > `STICE_TLS_CA_FILE` > platform store**. The environment variable is only consulted when `ca_file` is `NULL`/empty, so one agent can talk to several TURN servers that each use a different private CA — write that server's bundle into `stice_turn_server_t.ca_file` (the string is deep-copied when the server is added, so the caller may free it). The field was appended in 0.13.0: zero-initialised structs keep the old behaviour, but binaries must be recompiled.
+
+**Cipher suites (identical across backends, RFC 8656 §4)**
+
+stice configures an explicit "forward-secret key exchange + AEAD only" profile instead of trusting each library's defaults: TLS 1.2 floor, no static RSA key exchange, no CBC, no SHA-1 MACs. The backends use `SSL_CTX_set_cipher_list` / `SSL_CTX_set_ciphersuites` (OpenSSL), `gnutls_priority_set_direct` (GnuTLS, `NORMAL:-RSA:-VERS-TLS-ALL:+VERS-TLS1.3:+VERS-TLS1.2`) and `mbedtls_ssl_conf_ciphersuites` plus ephemeral-only TLS 1.3 key exchange (Mbed TLS). A peer that only offers legacy suites (CBC-SHA1 only, or pure RSA key exchange) will fail the handshake — that is deliberate; for such devices use a non-TLS TURN port (3478) or an operator-side proxy.
+
+**Failure behavior: strict, no automatic downgrade**
+
+When the handshake fails, that tls-turn candidate simply fails and ICE moves on to the other candidates per RFC 8445; stice never silently downgrades the connection to plaintext TCP. A TURN endpoint that only offers the removed legacy suites is therefore unreachable for stice, and the call may fail — that is the RFC 8445 (candidate failure) / RFC 8656 (use the endpoint as configured) branch, not a silent fallback. For diagnosis, the WARN log line (`TLS handshake failed` / `certificate verification failed`) points at the actual cause: cipher suite, trust anchor, or timeout.
+
+### 2.5 Method 2: find_package (After Installation)
 
 Build and install stice first, then find it via `find_package`.
 
@@ -126,7 +175,7 @@ cmake -B build -S . -DCMAKE_PREFIX_PATH=/usr/local
 cmake --build build --config Release
 ```
 
-### 2.3 Method 3: FetchContent
+### 2.6 Method 3: FetchContent
 
 Use FetchContent in libdatachannel's CMakeLists.txt to automatically download stice:
 
@@ -144,13 +193,18 @@ FetchContent_MakeAvailable(stice)
 # LibJuice::LibJuice target is automatically available
 ```
 
+> `USE_GNUTLS` / `USE_MBEDTLS` are cache variables too, so the FetchContent subproject inherits the parent's choice automatically.
+
 ## 3. CMake Configuration Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `STICE_BUILD_TESTS` | `ON` | Build unit tests. Recommended `OFF` when integrating into libdatachannel |
 | `STICE_BUILD_STSERVER` | `ON` | Build built-in TURN server stserver. Recommended `OFF` when integrating |
-| `STICE_USE_OPENSSL` | `ON` | Use OpenSSL for cryptography and TURN/TLS. `OFF` disables TLS |
+| `STICE_USE_OPENSSL` | `ON` | Use OpenSSL as the TLS backend (default). With `OFF` and no GnuTLS/Mbed TLS, no TLS is compiled |
+| `STICE_USE_GNUTLS` | `OFF` | Use GnuTLS as the TLS backend; same as libdatachannel's `USE_GNUTLS` |
+| `STICE_USE_MBEDTLS` | `OFF` | Use Mbed TLS as the TLS backend; same as libdatachannel's `USE_MBEDTLS` |
+| `USE_GNUTLS` / `USE_MBEDTLS` | `OFF` | libdatachannel's own cache variables; stice follows them when set by the parent |
 | `BUILD_SHARED_LIBS` | `OFF` | Build shared library. Default is static library |
 
 Recommended configuration for libdatachannel integration:
@@ -158,7 +212,7 @@ Recommended configuration for libdatachannel integration:
 ```cmake
 set(STICE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(STICE_BUILD_STSERVER OFF CACHE BOOL "" FORCE)
-set(STICE_USE_OPENSSL ON CACHE BOOL "" FORCE)
+# No TLS backend to set: it follows libdatachannel's USE_GNUTLS / USE_MBEDTLS
 ```
 
 ## 4. Feature Differences and Caveats
@@ -185,9 +239,20 @@ The compatibility layer's `juice_set_ice_tcp_mode()` directly forwards the value
 
 ### 4.4 skip_tls_verify in TURN Server Config
 
-libjuice's `juice_turn_server_t` does not have a `skip_tls_verify` field. stice's `stice_turn_server_t` has this field. The compatibility layer defaults to `skip_tls_verify = 0` (certificate verification, secure default) during conversion.
+libjuice's `juice_turn_server_t` does not have a `skip_tls_verify` field. stice's `stice_turn_server_t` has this field.
 
-If you need to skip TLS certificate verification (for testing self-signed certificates), use stice's native API `stice_add_turn_server()` and set `skip_tls_verify = 1`.
+The compatibility layer resolves it identically on both entry points (`juice_create()` and `juice_add_turn_server()`):
+
+| Situation | Result |
+|-----------|--------|
+| `JUICE_TURN_TLS_NO_VERIFY` unset (default) | `skip_tls_verify = 0`, certificates are verified |
+| `JUICE_TURN_TLS_NO_VERIFY` is `1` / `t` / `T` | `skip_tls_verify = 1`, verification **off**, plus a WARN |
+
+This is a process-wide, all-or-nothing switch: while the variable is present, every TURN/TLS connection created through the compatibility layer stops verifying certificates. It is provided by stice — `JUICE_TURN_TLS_NO_VERIFY` is not an upstream libjuice feature (the libjuice snapshot vendored in this repo has neither `src/tls.c` nor any `getenv()` call) — so that example programs built around a self-signed test server keep working unchanged. Do not set it in production; use `STICE_TLS_CA_FILE` to pin a private CA instead.
+
+To skip verification for one TURN server only, use stice's native API `stice_add_turn_server()` and set `skip_tls_verify = 1`.
+
+The same entry point carries a per-server trust bundle: when `stice_turn_server_t.ca_file` is non-empty, that server is verified **only** against that PEM (it wins over `STICE_TLS_CA_FILE`). The compatibility layer leaves the field `NULL` (there is no corresponding `juice_turn_server_t` field), so connections created through `juice_*` use the process-wide variable / platform store.
 
 ### 4.5 Concurrency Mode
 
@@ -197,7 +262,25 @@ libjuice's `juice_concurrency_mode_t` defines `POLL=0`, `MUX=1`, `THREAD=2`. sti
 
 `juice_set_log_level()` and `juice_set_log_handler()` fully forward to stice's corresponding functions. Log level enum values are binary-compatible. libdatachannel's logging configuration requires no modification.
 
-## 5. Verifying Integration
+### 4.7 stserver and the TLS backends
+
+`stserver` (the built-in TURN/STUN server) only listens on **UDP/TCP** and does not
+terminate TLS: its control plane (STUN Binding, TURN Allocate/Refresh/
+CreatePermission/ChannelBind, RFC 6062 CONNECT) is plaintext, matching coturn's
+3478 port. Consequently:
+
+- `stserver` builds against any of the three TLS backends (it links the stice
+  static library compiled with that backend) and behaves identically in all
+  three builds — the backend choice only affects TURN over TLS on the stice
+  client side.
+- For end-to-end TURN/TLS (RFC 8656 §4) verification, use a TLS-capable TURN
+  server (e.g. coturn's `tls-listening-port`); the stice client side already
+  supports OpenSSL, GnuTLS and Mbed TLS.
+- Pairing `stserver` with a stice client on the same host (or same platform) for
+  a long-running soak is backend-independent and is exactly how "any TLS
+  backend builds and works end to end" is verified here.
+
+## 5. Verifying the Integration
 
 ### 5.1 Compilation Verification
 
@@ -259,12 +342,12 @@ target_include_directories(datachannel PRIVATE deps/stice/include)
 
 ### Q3: TURN/TLS connection failure
 
-**Cause**: stice's TURN/TLS depends on OpenSSL; OpenSSL may not be found or certificate verification fails.
+**Cause**: the selected TLS backend was not found, certificate verification failed, or no backend was compiled in.
 
 **Solution**:
-1. Confirm OpenSSL development package is installed (`libssl-dev` / `openssl-devel`).
-2. Check CMake configure output for `OpenSSL found`.
-3. When testing self-signed certificates, use stice's native API to set `skip_tls_verify = 1`.
+1. Install the matching development package: `libssl-dev` for OpenSSL, `libgnutls28-dev` for GnuTLS, `libmbedtls-dev` for Mbed TLS.
+2. Check the `stice: TLS backend = ...` line in the CMake configure output, or call `stice_get_tls_backend()` at runtime. `none` means no backend was compiled and TURN/TLS falls back to plain TCP.
+3. For self-signed certificates either set `skip_tls_verify = 1` through stice's native API, or point `STICE_TLS_CA_FILE` at that certificate to keep verification on. Mbed TLS does not read the platform trust store, so `STICE_TLS_CA_FILE` is required for a verifying handshake there.
 
 ### Q4: Windows link error LNK2019
 

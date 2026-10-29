@@ -444,4 +444,14 @@ STICE_EXPORT void stice_set_log_handler(stice_log_cb_t cb) {
 	stice::Logger::instance().setHandler(cb);
 }
 
+// --- Build information -----------------------------------------------------
+
+STICE_EXPORT const char *stice_get_tls_backend(void) {
+#ifdef STICE_TLS_BACKEND_NAME
+	return STICE_TLS_BACKEND_NAME;
+#else
+	return "none";
+#endif
+}
+
 } // extern "C"

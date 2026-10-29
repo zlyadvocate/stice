@@ -1,3 +1,260 @@
+## [0.13.0] - 2026-10-28
+
+Pluggable TLS backend: TURN over TLS no longer requires OpenSSL. stice now
+builds against OpenSSL, GnuTLS or Mbed TLS, selected with **the same CMake
+variables libdatachannel uses**, so an existing libdatachannel integration keeps
+its crypto backend without extra configuration.
+
+### Added
+
+- **TLS record-layer abstraction** (`include/stice/net/tls.hpp`,
+  `src/net/tls_{openssl,gnutls,mbedtls,none}.cpp`). `TcpTransport` no longer
+  talks to OpenSSL directly; it drives a `TlsSession` with one non-blocking
+  contract (Ok / WantRead / WantWrite / Closed / Failed) implemented by each
+  backend. Client and server modes are both supported (server mode backs the
+  in-process TLS echo server used by the new tests).
+- **libdatachannel-compatible backend selection**: `USE_GNUTLS=ON` →
+  `find_package(GnuTLS)` + `GnuTLS::GnuTLS` + `USE_GNUTLS=1`; `USE_MBEDTLS=ON`
+  → `find_package(MbedTLS)` + `MbedTLS::MbedTLS` + `USE_MBEDTLS=1`; otherwise
+  OpenSSL + `USE_GNUTLS=0`. Enabling both is a configure-time error, exactly as
+  in libdatachannel. Standalone builds may use `STICE_USE_GNUTLS` /
+  `STICE_USE_MBEDTLS`; `STICE_USE_OPENSSL=OFF` with neither builds without TLS
+  (TURN/TLS then degrades to plain TCP with a warning, as before).
+- **`stice_get_tls_backend()`** (C API) returns `"openssl"`, `"gnutls"`,
+  `"mbedtls"` or `"none"` for the compiled-in backend.
+- **`STICE_TLS_CA_FILE`** environment variable: pin an explicit PEM trust bundle
+  instead of the platform trust store, for deployments (and tests) with a
+  private CA. Honored by all three backends.
+- **`stice_turn_server_t::ca_file`** — per-server trust anchor. Non-empty means
+  that TURN server's TLS control connection (and the RFC 6062 data connection
+  that inherits its TLS parameters) is verified **only** against that PEM
+  bundle; `NULL`/empty falls back to `STICE_TLS_CA_FILE` and then to the
+  platform store. Precedence is therefore per-server field > process-wide
+  variable > platform store, which is what lets one agent hold allocations on
+  several TURN servers with different private CAs (up to 8 servers). The string
+  is deep-copied when the server is added, like host/username/password. It was
+  appended as a trailing struct field, so zero-initialised configs keep the old
+  behaviour but binaries must be recompiled. The juice compatibility layer
+  leaves it `NULL` (no counterpart upstream); use `stice_add_turn_server()` for
+  per-server anchors. `test_longrun_4mode` gained `--turn-ca-file` to exercise
+  the path end to end.
+- **`tests/test_tls_transport.cpp`** + `tests/data/` (two-level test PKI): an
+  in-process TLS echo server exercises handshake, byte-exact echo, rejection of
+  an untrusted peer, and pinned-CA acceptance, for whichever backend the build
+  selected.
+- **`turns` mode** in `tests/test_longrun_4mode.cpp` (TURN control connection
+  over TLS, UDP-relayed media) and per-mode TLS endpoint overrides in the soak
+  drivers (`-TlsTurnHost` / `-TlsTurnPort` / `-TurnSkipVerify`, plus
+  `TLS_TURN_HOST` / `TLS_TURN_PORT` / `TURN_SKIP_VERIFY`).
+
+### Changed
+
+- Certificate verification semantics are identical across backends: verify
+  against the platform store by default, honor `skip_tls_verify`, and use
+  `STICE_TLS_CA_FILE` when set. Mbed TLS has no platform trust store, so without
+  a bundle it falls back to `VERIFY_NONE` and logs a warning rather than
+  pretending to verify.
+- TLS 1.2 is the floor on every backend.
+
+### Fixed
+
+- OpenSSL backend checked `SSL_get_verify_result()` even with
+  `skip_tls_verify`, rejecting every self-signed peer regardless of the flag.
+- GnuTLS verification now runs explicitly after the handshake
+  (`gnutls_certificate_verify_peers3`) because the session-level hook
+  (`gnutls_session_set_verify_cert`) rejected chains that the same API accepts
+  on the mingw-w64 build.
+- **TURN over TLS could never connect when the TCP connect was asynchronous**:
+  `Agent::onTurnTcpEventsSock` only ran the "transport reached Connected" step
+  from the POLLOUT branch. A TLS handshake finishes on a READABLE event, so the
+  transport stayed in `TlsHandshaking`, the ALLOCATE was never sent, and
+  gathering eventually reported `connect timeout`. The transition is now
+  detected after either drive (plain TCP and TLS both covered).
+- Stale TLS `WANT_READ`/`WANT_WRITE` hints are cleared as soon as a read or
+  write makes progress; previously one transient `WANT_WRITE` kept POLLOUT
+  armed for the rest of the connection (poll-loop spin).
+- MinGW-w64 portability (needed for GnuTLS-on-Windows, which has no MSVC build):
+  `ssize_t` is no longer redeclared when the toolchain provides it, `bcrypt` is
+  linked explicitly for `BCryptGenRandom`, and `wepoll_poll.cpp` includes
+  `<cstdint>`.
+- **SIGPIPE could kill the host process** when a TURN/TCP/TLS peer went away
+  mid-write (POSIX default action; found by the new ca_file test). Every send
+  path now passes `MSG_NOSIGNAL` (`STICE_MSG_NOSIGNAL`: plain TCP,
+  `TcpTransport`; GnuTLS `tlsPush`; Mbed TLS `tlsSend`) and macOS/BSD also get
+  `SO_NOSIGPIPE` on the socket — the same treatment libjuice (`tcp.c`) and
+  libdatachannel (`tcptransport.cpp`) give their sockets. The OpenSSL backend
+  stopped using `SSL_set_fd()` altogether in favour of a small socket BIO whose
+  writes carry `MSG_NOSIGNAL`; that also removes the `int` truncation of a
+  64-bit Windows `SOCKET` (the earlier range check is gone because the handle
+  now travels in a pointer-sized slot, guarded by the `socketToUserPtr`
+  `static_assert`).
+- **TURN servers addressed by IP failed verification.** OpenSSL checked the
+  literal with `X509_VERIFY_PARAM_set1_host()`, i.e. as a *DNS name*, so even a
+  certificate carrying `IP:192.0.2.1` was rejected. It now uses
+  `set1_ip_asc()` for IPv4/IPv6 literals and omits SNI for them (RFC 6066 §3
+  forbids IP literals in SNI); a shared `isIpLiteral()` in `tls.hpp` makes the
+  distinction for every backend. GnuTLS the same way: no SNI for a literal, the
+  chain is verified without a hostname and the address is matched with
+  `gnutls_x509_crt_check_ip()`. Mbed TLS 3.x handles IP SANs natively. Mbed TLS
+  2.x does not keep `iPAddress` entries in `mbedtls_x509_crt::subject_alt_names`
+  (only `dNSName`/`otherName`), so stice parses the subjectAltName extension out
+  of the peer certificate's DER itself and compares the 4/16-byte address — an
+  IP-addressed TURN server now verifies on 2.28 as well, and a mismatch fails
+  closed.
+
+### Security hardening (post-review)
+
+- **Contract violation in `TcpTransport::flushSends`** (TLS branch): a
+  `TlsStatus::Ok` result with `n == 0` — which `tls.hpp` documents as
+  "nothing transferred, try again" — was classified as Failed and tore the
+  connection down, while the read path handled the same case correctly. No
+  current backend returns `Ok`+`n == 0` on write, so this was latent, but any
+  future backend or library version permitted to do so (for example a TLS 1.3
+  post-handshake record) would have had its connection closed under it. The
+  write path now fails only on `st != Ok` and treats `n == 0` as "keep the rest
+  queued", mirroring `onReadable`.
+- **Explicit modern-only cipher suites** on all three backends (RFC 8656 §4
+  recommends configuring this rather than relying on defaults):
+  - OpenSSL: `SSL_CTX_set_cipher_list("ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:"
+    "!aNULL:!eNULL:!MD5:!RC4:!3DES:!DES:!EXPORT:!PSK:!SRP:!DSS:!kRSA")` plus
+    `SSL_CTX_set_ciphersuites` for TLS 1.3. Note `!kRSA` (key exchange), not
+    `!RSA`, which is shorthand for `kRSA|aRSA` and would also drop every
+    ECDHE-RSA suite.
+  - GnuTLS: `NORMAL:-RSA:-VERS-TLS-ALL:+VERS-TLS1.3:+VERS-TLS1.2`, with
+    `NORMAL:-RSA` and then `NORMAL` as fallbacks if the installed priority
+    string rejects the version tokens.
+  - Mbed TLS: numeric IANA suite list (TLS 1.3 AEAD suites + ECDHE-AEAD for TLS
+    1.2, no static RSA, no CBC, no SHA-1 MACs) and
+    `mbedtls_ssl_conf_tls13_key_exchange_modes(..., EPHEMERAL)` so TLS 1.3 uses
+    pure-ephemeral key exchange only. One list has to cover both versions here
+    because Mbed TLS 3.x has no per-version setter — handing it 1.2-only IDs
+    makes every handshake fail with "handshake negotiation failed".
+- **`SSL_set_fd` range check**: `windows SOCKET` is a 64-bit `UINT_PTR` and the
+  OpenSSL API takes an `int`, so `attach()` now rejects handles above
+  `INT_MAX` instead of silently truncating them.
+- **Windows + OpenSSL trust store documented**: OpenSSL does not read the
+  Windows certificate store and `SSL_CTX_set_default_verify_paths()` is usually
+  empty there, so a verifying handshake against a private/self-signed CA fails
+  unless `STICE_TLS_CA_FILE` is set. Both integration guides now say so
+  explicitly; previously only the Mbed TLS limitation was called out.
+
+### Review round 2 (compatibility layer, diagnostics, hygiene)
+
+- **`JUICE_TURN_TLS_NO_VERIFY` is now honest about itself.** The compatibility
+  layer honours the variable (as before) but logs a one-time WARN when it
+  engages, because it is a process-wide switch that disables certificate
+  verification for every connection: "certificate verification is DISABLED …
+  test rigs only". The code comment no longer claims libjuice's `src/tls.c`
+  implements it — the vendored libjuice snapshot has neither that file nor a
+  single `getenv()` call, so it is documented as a stice extension added for
+  self-signed test rigs. Integration guides §4.4 now describe the real
+  behaviour (both entry points, table of conditions) instead of claiming a
+  hard-coded `skip_tls_verify = 0`.
+- **"No trust store" is now a WARN, not a DEBUG line.** This is the most common
+  cause of a failed TURN/TLS handshake, and the user used to see only
+  "certificate verify failed". OpenSSL now inspects the store after
+  `SSL_CTX_set_default_verify_paths()` (success does not imply any anchor was
+  loaded; on Windows the default path is empty) and GnuTLS warns when
+  `gnutls_certificate_set_x509_system_trust()` returns 0 anchors. Both point at
+  `STICE_TLS_CA_FILE`, matching what the Mbed TLS backend already did.
+- **GnuTLS priority fallbacks keep the TLS 1.2 floor** and are no longer silent:
+  `NORMAL:-RSA:-VERS-TLS-ALL:+VERS-TLS1.2`, then
+  `NORMAL:-VERS-TLS-ALL:+VERS-TLS1.2`, each with a WARN; the bare `NORMAL`
+  escape hatch is gone, so a rejected priority string can no longer re-admit TLS
+  1.0/1.1 behind the documentation's back.
+- **GnuTLS peer-initiated renegotiation is refused** (`GNUTLS_E_REHANDSHAKE` →
+  Failed + `errorString`). Mapping it to WantRead made `TcpTransport` re-arm
+  POLLIN forever without resuming the handshake; `tls.hpp` now also states that
+  WantRead never asks the caller to re-drive `handshake()`.
+- **Socket-handle width is asserted in one place**: `socketToUserPtr()` /
+  `userPtrToSocket()` in `tls.hpp` carry a `static_assert` that the handle fits
+  in a pointer, used by the GnuTLS and Mbed TLS backends (OpenSSL keeps its
+  runtime `int` range check). Previously both cast blindly.
+- **Soak drivers refuse to run `turns` without a TLS endpoint**: the Linux and
+  Windows long-test scripts now exit with an explanation instead of pointing the
+  TLS mode at stserver's plaintext port (stserver terminates no TLS, docs §4.7).
+  The Linux driver also builds its optional args as an array instead of relying
+  on unquoted word splitting.
+- **Closing a session no longer reallocates**: `TlsSession::close()` frees the
+  backend state in place (each `Impl` grew a `reset()`), so shutdown does not
+  allocate a throw-away `Impl` per connection and `errorString()` stays valid.
+- **Hygiene**: the duplicated "clear the TLS want-hints on progress" logic in
+  `TcpTransport` is one private helper (`clearTlsWantHints()`); duplicated
+  OpenSSL error text is separated from the backend's own message with `": "`;
+  `tests/data/README.md` states that the test PKI is test-only and must not be
+  reused; `regress/bump_version_comments.py` replaces the one-off version-bump
+  script (`--check` for CI), and the five `src/stserver` files still reading
+  `// Version: 0.12.3` are stamped 0.13.0; the outer workspace README/CHANGELOG
+  now state which of the two changelogs owns which history.
+- **Documented trade-off (strict compliance)**: the modern-only cipher profile
+  is not weakened by a fallback switch — when the handshake fails, that
+  tls-turn candidate fails, ICE moves on per RFC 8445, and stice never silently
+  downgrades to plaintext TCP. A legacy-only TURN endpoint is therefore
+  unreachable, which the integration guides now spell out.
+
+### Verified (all three backends, both platforms)
+
+- TLS transport suite (`test_tls_transport`: handshake, byte-exact echo,
+  untrusted peer rejected, pinned CA accepted) passes on OpenSSL 3.6 (vcpkg,
+  MSVC x64), Mbed TLS 3.6 (vcpkg, MSVC x64) and GnuTLS 3.8 (MSYS2 mingw-w64) on
+  Windows, and on OpenSSL 3.0.2, GnuTLS 3.7.3 and Mbed TLS 2.28 on Ubuntu 22.04.
+- Full ctest regression per backend (25 tests each): Linux OpenSSL / GnuTLS /
+  Mbed TLS and Windows OpenSSL / Mbed TLS / GnuTLS. Pass counts: 17/25 on Linux
+  (all three), 17/25 (OpenSSL), 20/25 (Mbed TLS) and 19/25 (GnuTLS) on Windows.
+  Every failure belongs to the same set of tests that need an externally
+  started TURN server (`test_integration`, `test_libjuice_bench`,
+  `test_stserver_*`), and a worktree of the pre-change commit fails that same
+  set for the same reasons — the TLS work introduces no regression.
+- 3 h soak, 5 transports (udp-ice, udpturn, tcpturn, tcp-ice and `turns`),
+  4 clients x 512 KiB/s, zero-loss policy:
+  - Linux / GnuTLS 3.7.3: 10,544 s, every mode 4/4 pass, `rx == sent`
+    byte-for-byte, loss 0, including TURN over TLS.
+  - Windows / OpenSSL 3.6 (MSVC): 10,606 s, udp-ice/udpturn/tcpturn/tcp-ice
+    4/4 pass with loss 0; `turns` 3/4 pass. The one failure lost 81,600 bytes of
+    4.40 GB (0.002 %) on a single client across the wireless link to the TLS
+    TURN server — UDP loss on the WiFi hop, not a TLS error (the same mode is
+    byte-exact on the loopback leg above).
+- Sustained TURN-over-TLS runs (10 min, 4 clients, zero-loss policy) for the
+  backends that did not drive the full 3 h TLS leg: Windows Mbed TLS, Windows
+  GnuTLS and Linux Mbed TLS all reported `rx == sent`, loss 0.
+- `stserver` build matrix: the server builds and serves with every backend on
+  both platforms — Windows OpenSSL (MSVC) / Mbed TLS (MSVC) / GnuTLS
+  (mingw-w64) and Linux OpenSSL / GnuTLS / Mbed TLS. Each combination was run
+  through all four local transports (udp-ice, udpturn, tcpturn, tcp-ice) with
+  `rx == sent`, loss 0. `stserver` itself terminates no TLS (its control plane is
+  plaintext UDP/TCP like coturn's 3478), so the backend selection shows up only
+  in what it links.
+- 2 h local soak on both platforms (stice client + `stserver` on the same host,
+  no cross-platform traffic), 8 clients x 512 KiB/s, 4 transports, 1740 s each:
+  Windows/OpenSSL 7,054 s and Linux/GnuTLS 6,991 s, all modes 8/8 pass with
+  `rx == sent` byte-for-byte, loss 0, and `stserver` reporting `drop=0`
+  (7.30 GB per mode, ~29.2 GB per platform).
+- 1 h local soak on both platforms, Mbed TLS only, 8 clients x 512 KiB/s,
+  4 transports: Windows/Mbed TLS 3.6 (MSVC) 3,456 s and Linux/Mbed TLS 2.28
+  3,393 s, all four modes 8/8 pass with `rx == sent`, loss 0.
+- Re-validated after the post-review hardening above: `test_tls_transport`
+  passes on all three backends on both platforms (19 assertions on
+  OpenSSL/GnuTLS, 15 on Mbed TLS — the untrusted-peer case is skipped there for
+  lack of a trust store), and a `turns` interop run against the local coturn
+  (clients 2 x 256 KiB/s, 20 s) reports `rx == sent`, loss 0 on every backend.
+- Full local ctest after the hardening: 17/17 on all six builds (Windows
+  OpenSSL / Mbed TLS / GnuTLS and Linux OpenSSL / GnuTLS / Mbed TLS), excluding
+  only the tests that need an externally started TURN server
+  (`test_integration`, `test_libjuice_bench`, `test_stserver_*`) and the long
+  soak. The OpenSSL cipher list was additionally checked against coturn with
+  `openssl s_client`, which negotiated `ECDHE-RSA-AES256-GCM-SHA384` over TLS
+  1.2 — i.e. `!kRSA` removed static RSA key exchange without touching the
+  ECDHE-RSA suites.
+- Re-run after review round 2: the same 17/17 on all six builds, plus a short
+  4-mode soak (8 clients x 512 KiB/s, 40 s per mode) that exercises the changed
+  close/hint paths — Windows/OpenSSL and Linux/GnuTLS both 4/4 with
+  `rx == sent`, loss 0, and `stserver ... drop=0`. The new diagnostic was
+  checked live: Windows + OpenSSL without `STICE_TLS_CA_FILE` now prints
+  "no CA bundle loaded … set STICE_TLS_CA_FILE" *before* the generic
+  "certificate verify failed" when connecting to coturn. The soak driver's new
+  guard was exercised on Linux (`mode=turns` with no TLS endpoint exits 2 with
+  an explanation).
+
 ## [0.12.4] - 2026-10-15
 
 Negative packet loss elimination and backend hardening: the 4-mode soak

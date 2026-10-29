@@ -32,12 +32,13 @@
 // stops the run) and the offending pair is named with a diagnosis string.
 //
 // Usage:
-//   test_longrun_4mode --mode <udp-ice|udpturn|tcpturn|tcp-ice>
+//   test_longrun_4mode --mode <udp-ice|udpturn|tcpturn|tcp-ice|turns>
 //                      [--clients N=100] [--rate-bps B=10485760]
 //                      [--duration-sec S=10800] [--block K=1200]
 //                      [--connect-timeout-ms ms=60000] [--stall-sec S=30]
 //                      [--inflight B=8388608] [--report-every S=30]
 //                      [--turn-host H=127.0.0.1] [--turn-port P=3478]
+//                      [--turn-skip-verify 0|1] [--turn-ca-file <pem>]
 //                      [--tcp-port P=44444] [--bidir]
 //                      [--start-at <epoch_ms>] [--log <level>] [--label S]
 #include "stice/stice.h"
@@ -64,11 +65,17 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-enum class Mode { UdpIce, UdpTurn, TcpTurn, TcpIce };
+enum class Mode { UdpIce, UdpTurn, TcpTurn, TcpIce, Turns };
 const char* modeName(Mode m) {
     switch (m) { case Mode::UdpIce: return "udp-ice"; case Mode::UdpTurn: return "udpturn";
-                 case Mode::TcpTurn: return "tcpturn"; case Mode::TcpIce: return "tcp-ice"; }
+                 case Mode::TcpTurn: return "tcpturn"; case Mode::TcpIce: return "tcp-ice";
+                 case Mode::Turns: return "turns"; }
     return "?";
+}
+
+// True for the modes that drive a TURN server (UDP, TCP or TLS control).
+bool isTurnMode(Mode m) {
+    return m == Mode::UdpTurn || m == Mode::TcpTurn || m == Mode::Turns;
 }
 
 // Gather wait must exceed stice's internal soft-gathering fallback (15 s).
@@ -77,7 +84,7 @@ static constexpr int kGatherWaitMs = 20000;
 static constexpr int kDrainMs = 20000;
 
 // static storage for TURN server entries (must outlive config use)
-static stice_turn_server_t g_turnUdp, g_turnTcp;
+static stice_turn_server_t g_turnUdp, g_turnTcp, g_turnTls;
 
 struct Options {
     Mode mode = Mode::UdpIce;
@@ -90,6 +97,12 @@ struct Options {
     size_t inflightCap = 8ull * 1024 * 1024;
     std::string turnHost = "127.0.0.1";
     uint16_t turnPort = 3478;
+    // TURN/TLS peers in a soak are usually self-signed (coturn/ICE test rigs),
+    // so the driver can opt out of certificate verification explicitly.
+    bool turnSkipVerify = false;
+    // Per-server trust bundle for the TURN/TLS control connection; empty falls
+    // back to STICE_TLS_CA_FILE and then the platform store.
+    std::string turnCaFile;
     int tcpPort = 44444;
     int reportEverySec = 30;
     int staggerMs = 0;
@@ -170,14 +183,20 @@ stice_config_t makeCfg(PairState& s, bool isA, const Options& o) {
     cfg.local_port_range_begin = 10000;
     cfg.local_port_range_end = 49000;
 
-    if (o.mode == Mode::UdpTurn || o.mode == Mode::TcpTurn) {
-        auto* ts = (o.mode == Mode::UdpTurn) ? &g_turnUdp : &g_turnTcp;
+    if (isTurnMode(o.mode)) {
+        auto* ts = (o.mode == Mode::UdpTurn) ? &g_turnUdp
+                 : (o.mode == Mode::TcpTurn) ? &g_turnTcp : &g_turnTls;
         ts->host = o.turnHost.c_str();
         ts->port = o.turnPort;
         ts->username = "testuser";
         ts->password = "123456";
-        ts->transport = (o.mode == Mode::TcpTurn) ? STICE_TURN_TRANSPORT_TCP : STICE_TURN_TRANSPORT_UDP;
-        ts->skip_tls_verify = 0;
+        ts->transport = (o.mode == Mode::UdpTurn) ? STICE_TURN_TRANSPORT_UDP
+                      : (o.mode == Mode::TcpTurn) ? STICE_TURN_TRANSPORT_TCP
+                                                  : STICE_TURN_TRANSPORT_TLS;
+        ts->skip_tls_verify = o.turnSkipVerify ? 1 : 0;
+        // Per-server CA: proves the field is honoured end to end when the soak
+        // drives a TLS TURN server with a private/self-signed certificate.
+        ts->ca_file = o.turnCaFile.empty() ? nullptr : o.turnCaFile.c_str();
         cfg.turn_servers = ts;
         cfg.turn_servers_count = 1;
         cfg.relay_only_local = 1;
@@ -293,7 +312,7 @@ void runOnePair(int idx, const Options& o, Control& ctl,
         return;
     }
     mark("local-description-read");
-    if (o.mode == Mode::UdpTurn || o.mode == Mode::TcpTurn) {
+    if (isTurnMode(o.mode)) {
         filterNonRelayCandidates(bufA);
         filterNonRelayCandidates(bufB);
     }
@@ -326,7 +345,7 @@ void runOnePair(int idx, const Options& o, Control& ctl,
             bool remoteRelay = std::strstr(selRemote, "typ relay") != nullptr;
             if (idx == 0)
                 printf("  selected pair: local=[%s] remote=[%s]\n", selLocal, selRemote);
-            if ((o.mode == Mode::UdpTurn || o.mode == Mode::TcpTurn) && !remoteRelay) {
+            if (isTurnMode(o.mode) && !remoteRelay) {
                 bail("TURN mode selected a non-relay remote pair");
                 return;
             }
@@ -507,6 +526,7 @@ int main(int argc, char** argv) {
             if (m == "udpturn") o.mode = Mode::UdpTurn;
             else if (m == "tcpturn") o.mode = Mode::TcpTurn;
             else if (m == "tcp-ice") o.mode = Mode::TcpIce;
+            else if (m == "turns") o.mode = Mode::Turns;
             else o.mode = Mode::UdpIce;
         }
         else if (a == "--clients" && i + 1 < argc) o.clients = atoi(argv[++i]);
@@ -521,6 +541,8 @@ int main(int argc, char** argv) {
         else if (a == "--stagger-ms" && i + 1 < argc) o.staggerMs = atoi(argv[++i]);
         else if (a == "--turn-host" && i + 1 < argc) o.turnHost = argv[++i];
         else if (a == "--turn-port" && i + 1 < argc) o.turnPort = (uint16_t)atoi(argv[++i]);
+        else if (a == "--turn-skip-verify" && i + 1 < argc) o.turnSkipVerify = atoi(argv[++i]) != 0;
+        else if (a == "--turn-ca-file" && i + 1 < argc) o.turnCaFile = argv[++i];
         else if (a == "--tcp-port" && i + 1 < argc) o.tcpPort = atoi(argv[++i]);
         else if (a == "--bidir") o.bidir = true;
         else if (a == "--start-at" && i + 1 < argc) o.startAtMs = atoll(argv[++i]);

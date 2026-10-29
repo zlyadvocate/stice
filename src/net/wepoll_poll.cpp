@@ -20,6 +20,7 @@
 #include <winsock2.h>
 
 #include "wepoll/wepoll.h"
+#include <cstdint>
 #include <vector>
 
 namespace stice::net {

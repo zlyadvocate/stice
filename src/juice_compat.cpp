@@ -8,18 +8,36 @@
 #include <juice/juice.h>   // the compatibility header we just created
 #include <stice/stice.h>   // the real stice API
 
+#include "stice/log.hpp"
+
 #include <cstdlib>
 #include <vector>
 
-// libjuice's src/tls.c honors JUICE_TURN_TLS_NO_VERIFY (accepting '1'/'t'/'T')
-// to disable TURN/TLS certificate verification. stice models the same knob as
-// the skip_tls_verify field on stice_turn_server_t, so map the env var through
-// here to keep this drop-in replacement faithful — the examples that test
-// against self-signed certs (turnstreamer, turn-tcp-suite, stun-turn-modes)
-// rely on it. Unset or any other value keeps the secure default 0.
-static int turnTlsSkipVerify() {
+// JUICE_TURN_TLS_NO_VERIFY is a *stice extension* of the juice compatibility
+// layer, not an upstream libjuice knob: the libjuice snapshot vendored under
+// libjuice-ref/ has no src/tls.c and no getenv() call anywhere, so there is no
+// upstream implementation to mirror. It exists so example programs that point
+// at a self-signed TURN-over-TLS endpoint (turnstreamer, turn-tcp-suite,
+// stun-turn-modes) work unchanged: stice models the same intent as the
+// skip_tls_verify field on stice_turn_server_t, and this maps the env var onto
+// it. Accepts '1'/'t'/'T'; unset or any other value keeps the secure default 0.
+//
+// This is a process-wide, all-or-nothing switch, so it warns once when it
+// engages: silently turning certificate verification off is exactly the kind
+// of "secure default gone quiet" that is hard to notice in production.
+static bool turnTlsSkipVerify() {
 	const char *v = std::getenv("JUICE_TURN_TLS_NO_VERIFY");
-	return (v && (v[0] == '1' || v[0] == 't' || v[0] == 'T')) ? 1 : 0;
+	if (!v || !(v[0] == '1' || v[0] == 't' || v[0] == 'T'))
+		return false;
+	static const bool warned = [] {
+		STICE_LOG_WARN("JUICE_TURN_TLS_NO_VERIFY is set: TURN/TLS certificate verification is "
+		               "DISABLED for every connection created through the juice compatibility "
+		               "layer (process-wide). Test rigs only — unset it for production, or pin "
+		               "the CA with STICE_TLS_CA_FILE to keep verification on.");
+		return true;
+	}();
+	(void)warned;
+	return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -42,8 +60,8 @@ juice_agent_t *juice_create(const juice_config_t *config) {
 	sc.local_port_range_end = config->local_port_range_end;
 
 	// Convert the turn server array. juice_turn_server_t and
-	// stice_turn_server_t have the same leading fields but stice has an
-	// extra trailing field (skip_tls_verify), so we must copy element by
+	// stice_turn_server_t have the same leading fields but stice has extra
+	// trailing ones (skip_tls_verify, ca_file), so we must copy element by
 	// element into a temporary array.
 	std::vector<stice_turn_server_t> sturn;
 	if (config->turn_servers && config->turn_servers_count > 0) {
@@ -56,6 +74,11 @@ juice_agent_t *juice_create(const juice_config_t *config) {
 			sturn[i].transport =
 			    static_cast<stice_turn_transport_t>(config->turn_servers[i].transport);
 			sturn[i].skip_tls_verify = turnTlsSkipVerify();
+			// juice_turn_server_t has no CA field: leave NULL so the backend
+			// falls back to the process-wide STICE_TLS_CA_FILE (and then the
+			// platform store). Applications that need a per-server anchor must
+			// use the native stice_add_turn_server() API.
+			sturn[i].ca_file = nullptr;
 		}
 		sc.turn_servers = sturn.data();
 	}
@@ -109,6 +132,7 @@ int juice_add_turn_server(juice_agent_t *agent, const juice_turn_server_t *turn_
 	st.port = turn_server->port;
 	st.transport = static_cast<stice_turn_transport_t>(turn_server->transport);
 	st.skip_tls_verify = turnTlsSkipVerify();
+	st.ca_file = nullptr; // no CA field in juice_turn_server_t: use the env default
 	return stice_add_turn_server((stice_agent_t *)agent, &st);
 }
 

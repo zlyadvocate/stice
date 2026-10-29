@@ -1,7 +1,7 @@
 # stice
 
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
-[![Version](https://img.shields.io/badge/version-0.11.0-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-0.13.0-blue.svg)]()
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)]()
 
 **C++17 ICE + TURN client library, ported from [pion/webrtc](https://github.com/pion/webrtc) (Go), designed as a drop-in replacement for [libjuice](https://github.com/paullouisageneau/libjuice).**
@@ -32,7 +32,7 @@ stice implements the ICE (Interactive Connectivity Establishment, RFC 8445) agen
 - **NAT 1:1 Address Rewrite** — replace or append external IP mappings for host/srflx/relay candidates
 - **UDP / TCP Multiplexing** — share a single socket across multiple agents (UDPMux / TCPMux)
 - **Configurable Pairing Strategy** — RFC 8445 strict, serial, limited-concurrent, phased-UDP-first scheduling; aggressive / regular / stable nomination; RFC 6062 TCP-relay fallback policies; lazy Mode-B pre-allocation
-- **Built-in TURN Server (`stserver`)** — UDP + TCP listeners, STUN binding, TURN UDP relay, TURN TCP relay (RFC 6062 Mode-B data piping), ICE-TCP passive candidate support; epoll / IOCP / select backends
+- **Built-in TURN Server (`stserver`)** — UDP + TCP listeners, STUN binding, TURN UDP relay, TURN TCP relay (RFC 6062 Mode-B data piping), ICE-TCP passive candidate support; epoll / IOCP / select backends; multi-threaded UDP-listener reader pool and a **local-relay (hairpin) shortcut** for co-located peers
 - **libjuice Compatibility** — `juice_*` C API drop-in replacement via `juice_compat.cpp`
 - **Cross-platform** — Windows (MSVC/MinGW), Linux, macOS
 
@@ -171,6 +171,11 @@ The built-in TURN/STUN server (`stserver`) provides a full relay implementation:
 - **ICE-TCP passive** — accepts incoming TCP connections for RFC 6544 passive candidates (when clients use TCPMux)
 - **Long-term credential authentication** — user/password database via config
 - **IO backends** — IOCP (Windows), epoll (Linux), select (cross-platform fallback)
+- **UDP-listener reader pool** — the shared listener is drained by several reader threads, so the client→peer data plane scales past one core (essential for 100+ concurrent clients)
+- **Local-relay (hairpin) shortcut** — when a client's peer address is one of this server's own relayed addresses, the datagram is delivered directly to the destination allocation instead of looping out and back through the kernel, removing two of the four syscalls per relayed frame and roughly halving relay CPU for co-located peers. Set `STICE_TURN_NO_LOCAL_SHORTCUT=1` to disable and always take the full two-hop path.
+- **Tuning knobs** — `STSERVER_UDP_READERS` overrides the listener reader-thread count; the UDP listener and relay sockets use 64 MiB buffers to absorb bursts.
+
+> **Performance note (100/200 concurrent clients, `udpturn`, 10 MiB each, Windows + select backend).** End-to-end loss is zero. Because the datagram is 1200 B, the relay is dominated by per-datagram socket syscalls and loopback delivery cost, not by the forwarding logic itself; the achieved aggregate is bounded by that, not by stice flow control. With the local-relay shortcut enabled the server relay used ~68 s of CPU to move 2.1 GiB at 200 clients (vs ~169 s with it disabled).
 
 ```bash
 # Build the server (enabled by STICE_BUILD_STSERVER=ON, default ON)
@@ -291,6 +296,7 @@ These tests launch pairs of stice agents and drive them through a local `stserve
 | `test_stserver_tcp_diag` | TCP relay diagnostics with verbose client logging — captures TURN-over-TCP state transitions for debugging. | `127.0.0.1 3478` |
 | `test_stserver_stress_tcp` | High-concurrency TCP stress: N agent pairs all using TURN over TCP (RFC 6062 Mode-B) through stserver. Reports success rate and per-pair timing. | `[host] [port] [pairs] [timeout_ms]` → `127.0.0.1 13478 20 20000` |
 | `test_stserver_stress_mixed` | Mixed workload stress: N ICE-UDP pairs + M1 TURN-UDP + M2 TURN-TCP background sessions simultaneously. Validates stserver D-plan (IOCP/epoll) under mixed load. | `[host] [port] [icePairs] [turnUdpBg] [turnTcpBg] [timeoutMs]` → `127.0.0.1 3478 1000 20 20 30000` |
+| `test_agent_4mode_bigdata` | In-process A→B big-data transfer across the 4 modes (`udp-ice`/`udpturn`/`tcpturn`/`tcp-ice`); reports send/receive byte counts, peak rate and receive window so a stall is diagnosable. With `--spawn N` it forks N aligned clients and reports pass/fail per client — used for the 100/200-client zero-loss concurrency runs. | `--mode udpturn --bytes N [--block K] [--rate MiB/s] [--inflight B] [--spawn N --spawn-out DIR]` |
 
 ##### Running stserver Integration Tests
 
@@ -333,6 +339,12 @@ cp stserver.test.conf build/Release/stserver.conf
 
 # Mixed stress: 100 ICE-UDP + 10 TURN-UDP + 10 TURN-TCP
 ./build/Release/test_stserver_stress_mixed.exe 127.0.0.1 3478 100 10 10 30000
+
+# 200 concurrent TURN-over-UDP clients, 10 MiB each, aligned start (zero-loss check).
+# --spawn forks the clients via CreateProcess and aligns them to one start
+# barrier; each child writes its report to <DIR>\c<i>.log.
+./build/Release/test_agent_4mode_bigdata.exe --mode udpturn --bytes 10485760 \
+  --timeout 60000 --spawn 200 --spawn-out ./out/run200
 ```
 
 Each test prints `=== PASS: ... ===` on success and `=== FAIL: ... ===` with a diagnostic on failure.

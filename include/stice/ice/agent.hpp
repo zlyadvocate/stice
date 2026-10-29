@@ -242,6 +242,10 @@ struct StunEntry {
 	bool turnTcpUseTls = false;
 	std::string turnTcpSni;
 	bool turnTcpSkipVerify = false;
+	// Per-server CA bundle (empty -> process-wide STICE_TLS_CA_FILE). Copied
+	// from stice_turn_server_t::ca_file so several TURN servers in one agent
+	// can each pin a different private CA.
+	std::string turnTcpCaFile;
 	// Terminal-event guard: pendingRelayAllocations_ is decremented exactly
 	// once per relay entry, by the first of onAllocated/onFailed that fires.
 	std::shared_ptr<std::atomic<bool>> relayCounted;
@@ -487,7 +491,8 @@ private:
 	// stored in the entry (per-server), so multiple TCP/TLS TURN servers
 	// connect concurrently. Returns false on immediate failure.
 	bool beginTurnTcpConnect(StunEntry &entry, const net::AddrRecord &turnServer,
-	                         bool useTls, const std::string &sni, bool skipVerify);
+	                         bool useTls, const std::string &sni, bool skipVerify,
+	                         const std::string &caFile);
 	// Called when a relay entry's TCP transport becomes connected: sends the
 	// buffered Allocate request now that the control connection is ready.
 	void onTurnTcpConnected(StunEntry &entry);
@@ -537,6 +542,9 @@ private:
 	std::deque<std::string> turnServerHostStorage_;
 	std::deque<std::string> turnServerUserStorage_;
 	std::deque<std::string> turnServerPassStorage_;
+	// Backing storage for stice_turn_server_t::ca_file (same deque rationale:
+	// the pointer stays valid while more servers are registered).
+	std::deque<std::string> turnServerCaStorage_;
 	// Internal storage for STUN servers added via add_stun_server or
 	// config_.stun_servers. Each entry is a host:port pair. All are
 	// queried concurrently during gatherServerReflexive.

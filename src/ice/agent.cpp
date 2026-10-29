@@ -200,6 +200,10 @@ namespace stice::ice {
 					turnServerPassStorage_.emplace_back(srv.password);
 					ts.password = turnServerPassStorage_.back().c_str();
 				}
+				if (srv.ca_file) {
+					turnServerCaStorage_.emplace_back(srv.ca_file);
+					ts.ca_file = turnServerCaStorage_.back().c_str();
+				}
 				turnServersInternal_.push_back(ts);
 			}
 			config_.turn_servers = turnServersInternal_.data();
@@ -975,6 +979,10 @@ namespace stice::ice {
 			e.turnTcpUseTls = (srv.transport == STICE_TURN_TRANSPORT_TLS);
 			e.turnTcpSni = e.turnTcpUseTls ? std::string(srv.host) : std::string();
 			e.turnTcpSkipVerify = (srv.skip_tls_verify != 0);
+			// Per-server CA bundle (empty -> STICE_TLS_CA_FILE, then platform
+			// store). Each relay entry keeps its own copy, so one agent can hold
+			// allocations on several TURN servers with different private CAs.
+			e.turnTcpCaFile = (e.turnTcpUseTls && srv.ca_file) ? std::string(srv.ca_file) : std::string();
 		}
 		++pendingRelayAllocations_;
 		entries_.push_back(std::move(e));
@@ -992,11 +1000,12 @@ namespace stice::ice {
 			bool useTls = entry.turnTcpUseTls;
 			std::string sni = entry.turnTcpSni;
 			bool skipVerify = entry.turnTcpSkipVerify;
+			std::string caFile = entry.turnTcpCaFile;
 			// Seed the entry's nextTransmission so an Idle relay entry never
 			// reads as time-point-zero (which would poison nextTimestampMs).
 			entry.nextTransmission = std::chrono::steady_clock::now() +
 				std::chrono::milliseconds(TcpConnectTimeoutMs / 2);
-			if (!beginTurnTcpConnect(entry, resolved, useTls, sni, skipVerify)) {
+			if (!beginTurnTcpConnect(entry, resolved, useTls, sni, skipVerify, caFile)) {
 				STICE_LOG_WARN("Agent: TURN TCP connect failed immediately for %s", srv.host);
 			}
 		}
@@ -1415,6 +1424,12 @@ namespace stice::ice {
 		if (srv->password) {
 			turnServerPassStorage_.emplace_back(srv->password);
 			ts.password = turnServerPassStorage_.back().c_str();
+		}
+		if (srv->ca_file) {
+			// Per-server trust bundle: copied like the other strings so the
+			// caller may free its own copy immediately.
+			turnServerCaStorage_.emplace_back(srv->ca_file);
+			ts.ca_file = turnServerCaStorage_.back().c_str();
 		}
 		turnServersInternal_.push_back(ts);
 		config_.turn_servers = turnServersInternal_.data();
@@ -3101,17 +3116,22 @@ namespace stice::ice {
 			STICE_LOG_DEBUG("TURN TCP: events=0x%x state=%d",
 				static_cast<unsigned>(events),
 				static_cast<int>(tt->state()));
-			if (events & POLLOUT) {
-				tt->onWritable();
-				// Check if the connection just completed.
-				if (tt->state() == net::TcpState::Connected) {
-					STICE_LOG_INFO("TURN TCP: POLLOUT -> Connected transition");
-					onTurnTcpConnected(e);
-				}
-			}
+			// Detect "reached Connected" across BOTH drives. With plain TCP the
+			// connect completes on the writable event, but with TLS the handshake
+			// finishes on a READABLE event (server Finished/handshake flight), so
+			// a Connected check on the POLLOUT branch alone left TLS relays stuck
+			// in TlsHandshaking: the ALLOCATE was never sent and gathering timed
+			// out.
+			const net::TcpState before = tt->state();
+			if (events & POLLOUT) tt->onWritable();
 			if (events & POLLIN) {
 				tt->onReadable();
 				handleInboundTurnTcp(e);
+			}
+			if (before != net::TcpState::Connected && tt->state() == net::TcpState::Connected) {
+				STICE_LOG_INFO("TURN TCP: transport reached Connected (events=0x%x)",
+					static_cast<unsigned>(events));
+				onTurnTcpConnected(e);
 			}
 			if (tt && (tt->state() == net::TcpState::Failed ||
 				tt->state() == net::TcpState::Disconnected)) {
@@ -3168,14 +3188,15 @@ namespace stice::ice {
 		}
 	}
 	bool Agent::beginTurnTcpConnect(StunEntry& entry, const net::AddrRecord& turnServer,
-		bool useTls, const std::string& sni, bool skipVerify) {
-		STICE_LOG_INFO("TURN TCP: beginning %s connect to %s (sni=%s skipVerify=%d)",
+		bool useTls, const std::string& sni, bool skipVerify, const std::string& caFile) {
+		STICE_LOG_INFO("TURN TCP: beginning %s connect to %s (sni=%s skipVerify=%d caFile=%s)",
 			useTls ? "TLS" : "TCP", turnServer.toString().c_str(),
-			sni.c_str(), static_cast<int>(skipVerify));
+			sni.c_str(), static_cast<int>(skipVerify),
+			caFile.empty() ? "<env/platform>" : caFile.c_str());
 		if (!entry.turnTcp) entry.turnTcp = std::make_shared<net::TcpTransport>();
 		auto& tt = entry.turnTcp;
 		tt->setFramingMode(net::FramingMode::Raw);
-		if (!tt->beginConnect(turnServer, sni, useTls, skipVerify)) {
+		if (!tt->beginConnect(turnServer, sni, useTls, skipVerify, caFile)) {
 			STICE_LOG_WARN("TURN TCP: failed to begin connect to %s (errno=%d)",
 				turnServer.toString().c_str(), sticeSockerrno);
 			// Signal the failure to the TURN Client so it transitions to Failed,
@@ -3328,10 +3349,12 @@ namespace stice::ice {
 		// We stored the server address in the StunEntry's record field.
 		net::AddrRecord turnServer = ctrl->record;
 		// B2: the RFC 6062 data connection inherits the control connection's TLS
-		// parameters so a turns: relay does not silently downgrade to plain TCP.
+		// parameters (including its per-server CA bundle) so a turns: relay does
+		// not silently downgrade to plain TCP or to a different trust anchor.
 		if (!turnDataConn_->transport->beginConnect(
 			turnServer, ctrl->turnTcpUseTls ? ctrl->turnTcpSni : std::string(),
-			ctrl->turnTcpUseTls, ctrl->turnTcpSkipVerify)) {
+			ctrl->turnTcpUseTls, ctrl->turnTcpSkipVerify,
+			ctrl->turnTcpUseTls ? ctrl->turnTcpCaFile : std::string())) {
 			STICE_LOG_WARN("TURN data: failed to begin connect (errno=%d)", sticeSockerrno);
 			turnDataConn_.reset();
 			return;

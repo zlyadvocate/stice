@@ -16,7 +16,11 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
+#if defined(_MSC_VER)
+// MSVC's CRT has no ssize_t; MinGW-w64 (used for the GnuTLS-on-Windows build)
+// does declare it, and redeclaring it there is an error.
 using ssize_t = int;
+#endif
 #else
 #include <arpa/inet.h>
 #include <netdb.h>

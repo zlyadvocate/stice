@@ -84,6 +84,18 @@ typedef struct stice_turn_server {
 	// 0 = verify (default, secure), 1 = skip verification (insecure, use
 	// only for testing with self-signed certificates).
 	int skip_tls_verify;
+	// Per-server trust bundle for TURN over TLS (PEM), one CA per server:
+	//   non-empty -> verify this server against exactly this bundle
+	//   NULL/empty -> fall back to the process-wide STICE_TLS_CA_FILE, then
+	//                 to the platform trust store
+	// This is what lets one agent talk to several TURN servers that each use a
+	// different private CA. Like host/username/password the string is copied
+	// when the server is added, so the caller may free it afterwards.
+	//
+	// Added in 0.13.0 as a trailing field: binaries built against an older
+	// header must recompile (sizeof grew), but source compatibility is kept
+	// because the field defaults to NULL for zero-initialised structs.
+	const char *ca_file;
 } stice_turn_server_t;
 
 typedef enum stice_concurrency_mode {
@@ -376,6 +388,12 @@ typedef void (*stice_log_cb_t)(stice_log_level_t level, const char *message);
 
 STICE_EXPORT void stice_set_log_level(stice_log_level_t level);
 STICE_EXPORT void stice_set_log_handler(stice_log_cb_t cb);
+
+// Name of the TLS backend this build was compiled with: "openssl", "gnutls",
+// "mbedtls" or "none" (no TLS backend, TURN over TLS degrades to plain TCP).
+// The backend is chosen at configure time and mirrors libdatachannel's
+// USE_GNUTLS / USE_MBEDTLS options. The returned string is static.
+STICE_EXPORT const char *stice_get_tls_backend(void);
 
 #ifdef __cplusplus
 }
