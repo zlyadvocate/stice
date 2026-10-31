@@ -376,7 +376,6 @@ void runOnePair(int idx, const Options& o, Control& ctl,
         size_t sent = 0;
         auto lastAdv = Clock::now();
         size_t lastRx = rxRef.load();
-        long againStreak = 0;
         while (true) {
             double el = std::chrono::duration<double>(Clock::now() - tStreamStart).count();
             if (el >= (double)o.durationSec) { if (elOut) *elOut = el; return 0; }
@@ -403,8 +402,17 @@ void runOnePair(int idx, const Options& o, Control& ctl,
                     setFail(m);
                     return 2;
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                continue;
+                // In-flight depth alone must not throttle the sender. While the
+                // receiver is still advancing, lag >= cap is just pipeline
+                // buffering; gating on it ratchets the flow down to whatever
+                // rate it happened to have when the window first filled (128
+                // MiB/s at 1200-byte blocks froze at ~2 MiB/s while the same
+                // byte rate at 4096-byte blocks held 4 MiB/s). Only back off
+                // once delivery has actually paused.
+                if (idle >= 0.05) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    continue;
+                }
             }
 
             if (st.sa.load() == STICE_STATE_FAILED) {
@@ -418,7 +426,6 @@ void runOnePair(int idx, const Options& o, Control& ctl,
             if (rc == STICE_ERR_SUCCESS) {
                 sent += o.block;
                 sentOut.store(sent);
-                againStreak = 0;
             } else if (rc == STICE_ERR_AGAIN) {
                 // Transport send queue full: retry IMMEDIATELY (yield) instead
                 // of sleeping a whole timer tick. A 1 ms sleep per AGAIN caps

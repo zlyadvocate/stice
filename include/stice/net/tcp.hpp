@@ -140,6 +140,12 @@ public:
 		return (sendQueue_.size() - sendOff_) >= kSendQueueHighWater;
 	}
 
+	// Plaintext bytes actually moved through the record layer, for loss triage:
+	// comparing the two ends of a TURN-over-TLS pair tells a send-side drop
+	// (tx short) from a transport-side drop (tx complete, peer rx short).
+	std::uint64_t txPlainBytes() const { return txBytes_.load(std::memory_order_relaxed); }
+	std::uint64_t rxPlainBytes() const { return rxBytes_.load(std::memory_order_relaxed); }
+
 	// High-water mark for the send backlog (8 MiB). Beyond this, senders get
 	// backpressure; below it, bursts of up to 8 MiB are absorbed losslessly.
 	static constexpr std::size_t kSendQueueHighWater = 8u * 1024 * 1024;
@@ -185,11 +191,18 @@ private:
 	// exceeds kTcpBufCompactThreshold bytes.
 	std::vector<unsigned char> sendQueue_;
 	std::size_t sendOff_ = 0;
+	// Length of the SSL_write call that returned WantRead/WantWrite, per queue.
+	// The record layer requires the interrupted call to be resumed with the same
+	// length; the queue can grow in between, so it cannot be recomputed.
+	std::size_t sendTlsPendingLen_ = 0;
 	// Control-frame queue (sendControl): flushed before sendQueue_ so bulk
 	// application data can never delay STUN/TURN signalling. Same locking
 	// discipline as sendQueue_ (sendMtx_ guards both queues).
 	std::vector<unsigned char> ctrlQueue_;
 	std::size_t ctrlOff_ = 0;
+	std::size_t ctrlTlsPendingLen_ = 0; // see sendTlsPendingLen_
+	std::atomic<std::uint64_t> txBytes_{0}; // plaintext bytes written (see txPlainBytes)
+	std::atomic<std::uint64_t> rxBytes_{0}; // plaintext bytes read
 	mutable std::mutex sendMtx_;
 
 	// Read buffer accumulation for framing. Guarded by recvMtx_

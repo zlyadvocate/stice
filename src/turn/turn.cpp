@@ -558,6 +558,38 @@ void Client::handleRefreshResponse(const stun::Message &msg, bool isError) {
 	             std::chrono::seconds(baseSecs + jitterSecs);
 }
 
+std::size_t Client::flushPendingData(PeerBinding &b) {
+	if (b.pendingData.empty()) return 0;
+	if (!sink_.sendRaw) return b.pendingData.size();
+	// In-place, order-preserving drain: stop at the first packet the transport
+	// refuses so the caller's stream stays contiguous, and keep it queued.
+	// Dropping on backpressure here silently lost data the application had
+	// already been told was sent (stice_send returned success).
+	std::size_t sent = 0;
+	for (; sent < b.pendingData.size(); ++sent) {
+		const auto &pkt = b.pendingData[sent];
+		int r = -1;
+		if (b.channelReady) {
+			bytes frame;
+			if (wrapChannelData(b.channel, pkt.data(), pkt.size(), frame))
+				r = sink_.sendRaw(frame.data(), frame.size());
+		} else {
+			stun::Message sm;
+			sm.method = stun::Method::Send;
+			sm.cls = stun::Class::Indication;
+			sm.newTransactionID();
+			stun::writeXorAddress(sm, stun::AttrType::XorPeerAddress, b.peer, sm.transactionID);
+			stun::addData(sm, pkt.data(), pkt.size());
+			sm.encode(nullptr, nullptr, "stice");
+			r = sink_.sendRaw(sm.raw.data(), sm.raw.size());
+		}
+		if (r < 0) break; // transport backpressure: keep this packet and the rest
+	}
+	if (sent > 0)
+		b.pendingData.erase(b.pendingData.begin(), b.pendingData.begin() + static_cast<long>(sent));
+	return b.pendingData.size();
+}
+
 void Client::handleCreatePermissionResponse(const stun::Message &msg, bool isError,
                                             const net::AddrRecord &peer) {
 	auto &b = getBinding(peer);
@@ -572,23 +604,11 @@ void Client::handleCreatePermissionResponse(const stun::Message &msg, bool isErr
 		if (!b.pendingData.empty()) {
 			log(STICE_LOG_LEVEL_DEBUG, "TURN CreatePermission ok: flushing %zu pending packets",
 			    b.pendingData.size());
-			for (auto &pkt : b.pendingData) {
-				if (b.channelReady) {
-					bytes frame;
-					wrapChannelData(b.channel, pkt.data(), pkt.size(), frame);
-					if (sink_.sendRaw) sink_.sendRaw(frame.data(), frame.size());
-				} else {
-					stun::Message sm;
-					sm.method = stun::Method::Send;
-					sm.cls = stun::Class::Indication;
-					sm.newTransactionID();
-					stun::writeXorAddress(sm, stun::AttrType::XorPeerAddress, peer, sm.transactionID);
-					stun::addData(sm, pkt.data(), pkt.size());
-					sm.encode(nullptr, nullptr, "stice");
-					if (sink_.sendRaw) sink_.sendRaw(sm.raw.data(), sm.raw.size());
-				}
-			}
-			b.pendingData.clear();
+			std::size_t left = flushPendingData(b);
+			if (left > 0)
+				log(STICE_LOG_LEVEL_DEBUG,
+				    "TURN CreatePermission ok: %zu packets still buffered (transport backpressure)",
+				    left);
 			if (b.channel == 0) sendChannelBind(peer);
 		}
 		return;
@@ -854,7 +874,9 @@ std::chrono::steady_clock::time_point Client::tick() {
 		++tx.retries;
 		int interval = std::min(TurnRtoMs << tx.retries, TurnMaxRtxIntervalMs);
 		tx.nextRetransmitAt = now + std::chrono::milliseconds(interval);
-		log(STICE_LOG_LEVEL_DEBUG, "TURN retransmit kind=%d retry=%d next=%dms",
+		// TEMP-DIAG: elevated from DEBUG so a 128 MiB/s repro shows the retransmit
+		// cadence at the default WARN log level.
+		log(STICE_LOG_LEVEL_WARN, "DIAG: TURN retransmit kind=%d retry=%d next=%dms",
 		    static_cast<int>(tx.kind), tx.retries, interval);
 	}
 		if (tx.nextRetransmitAt < nextTick_)
@@ -873,6 +895,13 @@ std::chrono::steady_clock::time_point Client::tick() {
 			sendCreatePermission(b.peer);
 		if (b.channelReady && now >= b.channelRefreshAt)
 			sendChannelBind(b.peer);
+	}
+
+	// Retry application data that is still buffered because the transport was
+	// under backpressure when the permission completed. stice_send already
+	// reported those bytes as accepted, so they must not be dropped.
+	for (auto &b : bindings_) {
+		if (!b.pendingData.empty() && b.permissionPermitted) flushPendingData(b);
 	}
 
 	// Garbage-collect stale bindings: if a peer's permission refresh has been

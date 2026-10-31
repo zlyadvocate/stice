@@ -1,3 +1,98 @@
+## [0.13.1] - 2026-10-30
+
+TCP relay media is sharded across dedicated data threads on the server, and a
+round of transport/relay fixes lands on top. No API or ABI change.
+
+### Fixed
+
+- **TURN over TLS lost the tail of a data stream.**
+  `TcpTransport::onReadable()` returned as soon as one TLS record had been read:
+  the "short read" exit compared against the 64 KiB buffer while the record
+  layer caps a read at 16 KiB, so it fired on *every* event. The UDP path has
+  always drained its socket completely on each readable event — that is what the
+  wepoll/epoll rework made reliable — but the TLS path handed the rest back to
+  the event loop, which cannot re-notify for records the record layer has
+  already pulled out of the kernel socket buffer. Once the sender went silent
+  nothing ever woke the loop again, so the last 1-13 ChannelData frames were
+  stranded and reported as loss. Reproduced deterministically: one readable
+  event moved 16,384 of 28,896 bytes. The read pump now drains until the backend
+  reports would-block, matching the UDP path, and the new test
+  `TLS: a burst followed by silence is drained by one readable event` fails on
+  the old behaviour and passes on the new one (all three backends).
+- **Buffered TURN data was discarded on transport backpressure.** When a
+  CreatePermission completed, the flush ignored `sendRaw`'s return value and
+  cleared the buffer unconditionally, so a refused write (EWOULDBLOCK/ENOBUFS)
+  silently dropped data `stice_send` had already reported as accepted. Unsent
+  packets now stay queued in order and are retried from the client tick.
+- **An interrupted `SSL_write` could be resumed with a different length.** The
+  length was recomputed from the queue on each retry, and the queue can grow
+  while the write is pending (OpenSSL then fails with "bad write retry"). The
+  length of the interrupted call is now remembered per queue and reused.
+- **The UDP listener was capped at one in-flight receive per socket.** A single
+  `WSARecvFrom` per socket limits drain to one completion-and-repost round trip
+  per datagram: measured ~53k pps on the listener, i.e. ~63 MiB/s at 1200-byte
+  blocks, and every client's media arrives on that ONE socket. Past that point
+  the kernel queue overflowed while `RELAY-STAT` still reported `drop=0`. A
+  pool of receives is now armed per socket (32 on the listener, 8 on relay
+  sockets) so several workers drain the same socket concurrently; each
+  completion owns its own buffer, so pending ops never alias.
+- **stserver counted refused relay sends as successes.** `logSendToFailure()`
+  logged EWOULDBLOCK/ENOBUFS at DEBUG and the caller still counted the frame as
+  forwarded, so a full send buffer was invisible in `RELAY-STAT`. The helper
+  now returns whether the send actually succeeded and refused sends are counted
+  as `sendFail`, which is what made the listener ceiling above measurable.
+
+### Changed
+
+- **TCP media no longer funnels through the single business thread.** TURN-over-
+  TCP control-connection frames and both RFC 6062 data pipes used to be
+  serialized in `businessThread_` under `stateMutex_`, which capped TCP relay
+  throughput at one core and let bulk data starve control transactions
+  (CreatePermission timed out once the in-flight window filled). Sockets are
+  now hashed to N data shards (`shardIndexFor`), each shard owning its own FIFO
+  queue and thread, so a connection is always handled by the same thread and
+  per-connection byte order is preserved without cross-thread parse buffers.
+  Media frames take a fast path that holds only `connMapMutex_` (shared) plus a
+  `TcpConn::ioUsers` reference instead of `stateMutex_`; only STUN control
+  frames still take the global lock. Teardown never waits for in-flight IO:
+  `closeTcpConn()` moves the object to `pendingFreeConns_` and the business
+  thread reaps it once the reference count drains. Lock order is unchanged
+  (`stateMutex_ -> connMapMutex_ -> Allocation::mtx -> TcpConn::writeMtx`).
+  `RELAY-STAT` gained a `pipe` field for RFC 6062 data-pipe bytes.
+- **`test_longrun_4mode` no longer ratchets the flow down.** In-flight depth
+  alone no longer throttles the sender while the receiver is still advancing;
+  the old gate froze 128 MiB/s at 1200-byte blocks down to ~2 MiB/s as soon as
+  the window first filled.
+
+### Verified
+
+- `test_tls_transport` 7/7 on OpenSSL, GnuTLS and Mbed TLS (2.28 + 3.x), Windows
+  and Linux.
+- `turns` soak, 8 clients x 300 s at 512 KiB/s against coturn over TLS:
+  **47 client-runs, 0 bytes lost** (24 at INFO level, 23 at WARN level), against
+  roughly one losing client per 5-minute round before the fix. The new
+  per-connection counters (`TcpTransport: closed tls=1 tx=... rx=...`, INFO) show
+  the sender's `tx` and the peer's `rx` agreeing to within control-frame traffic,
+  so the record layer is no longer stranding anything on either end.
+- One client in one round lost its *connection* instead (`SSL_read failed` ->
+  `TURN TCP: connection lost` -> `stice_send rc=-2`). That is an explicit
+  transport failure, not silent loss, and is tracked separately from this fix.
+- `tcpturn` 128 MiB/s, Windows, 32 clients x 4 MiB/s x 900 s (1200-byte blocks):
+  **120.79 GB relayed, 0 bytes lost**, `drop=0 sendFail=0`, `qS` in single
+  digits. This is the load that failed on control-plane starvation before the
+  sharding rework.
+- `tcpturn` 128 MiB/s, Linux, 16 clients x 8 MiB/s x 900 s (8 KiB blocks):
+  **120.79 GB relayed, 0 bytes lost**, server RSS 10.6 MB -> 9.8 MB, client RSS
+  flat at 7 MB.
+- Linux `udpturn` 100 MiB/s (10 x 10 MiB/s) and 32 concurrent TCP connections at
+  32 MiB/s: 0 bytes lost, confirming the UDP path and the 32-connection shard
+  distribution are unaffected.
+- 32 concurrent TCP clients on a 4-core VM at 128 MiB/s aggregate fails inside
+  the *client* (32 driver processes starve, `stice_send rc=-2` at the window
+  edge, mid-run `lag=0`) while the server still reports `drop=0 sendFail=0`; the
+  same aggregate passes with 16 clients, so this is test-host CPU density, not a
+  relay defect.
+
 ## [0.13.0] - 2026-10-28
 
 Pluggable TLS backend: TURN over TLS no longer requires OpenSSL. stice now

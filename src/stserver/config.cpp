@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // Author: zlyadvocate
-// Version: 0.13.0
+// Version: 0.13.1
 #include "stice/stserver/config.hpp"
 
 #include "stice/log.hpp"

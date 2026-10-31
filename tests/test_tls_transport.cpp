@@ -261,6 +261,122 @@ private:
 	std::thread thread_;
 };
 
+// Server that writes one large burst and then goes silent (connection stays
+// open). Proves the client moves everything the record layer holds, rather than
+// only the first record, on a single readable event.
+class BurstServer {
+public:
+	~BurstServer() { stop(); }
+
+	bool start(std::size_t totalBytes) {
+		total_ = totalBytes;
+#ifdef _WIN32
+		WSADATA wsa{};
+		WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+		listenFd_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+		if (listenFd_ == STICE_INVALID_SOCKET) return false;
+		int on = 1;
+		setsockopt(listenFd_, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&on), sizeof(on));
+		sockaddr_in sin{};
+		sin.sin_family = AF_INET;
+		sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		sin.sin_port = 0;
+		if (::bind(listenFd_, reinterpret_cast<sockaddr *>(&sin), sizeof(sin)) != 0) return false;
+		if (::listen(listenFd_, 4) != 0) return false;
+		sockaddr_in bound{};
+		socklen_t blen = sizeof(bound);
+		if (::getsockname(listenFd_, reinterpret_cast<sockaddr *>(&bound), &blen) != 0) return false;
+		port_ = ntohs(bound.sin_port);
+		setNonBlocking(listenFd_);
+		thread_ = std::thread([this] { run(); });
+		return true;
+	}
+
+	void stop() {
+		stop_.store(true);
+		if (listenFd_ != STICE_INVALID_SOCKET) {
+			sticeClosesocket(listenFd_);
+			listenFd_ = STICE_INVALID_SOCKET;
+		}
+		if (thread_.joinable()) thread_.join();
+	}
+
+	uint16_t port() const { return port_; }
+	bool sent() const { return sent_.load(); }
+	std::string lastError() const { return err_; }
+
+private:
+	void run() {
+		while (!stop_.load()) {
+			sockaddr_storage ss{};
+			socklen_t sl = sizeof(ss);
+			socket_t c = ::accept(listenFd_, reinterpret_cast<sockaddr *>(&ss), &sl);
+			if (c == STICE_INVALID_SOCKET) {
+				if (stop_.load()) return;
+				std::this_thread::sleep_for(std::chrono::milliseconds(5));
+				continue;
+			}
+			serve(c);
+			sticeClosesocket(c);
+			return; // single shot
+		}
+	}
+
+	void serve(socket_t c) {
+		setBlocking(c);
+		TlsSession tls;
+		TlsParams p;
+		p.certFile = certPath();
+		p.keyFile = keyPath();
+		if (!tls.initServer(c, p)) {
+			err_ = "initServer: " + tls.errorString();
+			return;
+		}
+		bool established = false;
+		for (int i = 0; i < 100000 && !established; ++i) {
+			TlsStatus st = tls.handshake();
+			if (st == TlsStatus::Ok) established = true;
+			else if (st != TlsStatus::WantRead && st != TlsStatus::WantWrite) {
+				err_ = "handshake: " + tls.errorString();
+				tls.close();
+				return;
+			}
+		}
+		if (!established) {
+			err_ = "handshake did not converge";
+			tls.close();
+			return;
+		}
+		std::vector<unsigned char> buf(total_, static_cast<unsigned char>('b'));
+		std::size_t off = 0;
+		while (off < buf.size()) {
+			std::size_t w = 0;
+			TlsStatus st = tls.write(buf.data() + off, buf.size() - off, w);
+			if (st == TlsStatus::Ok) off += w;
+			else if (st != TlsStatus::WantRead && st != TlsStatus::WantWrite) {
+				err_ = "write: " + tls.errorString();
+				tls.close();
+				return;
+			}
+		}
+		sent_.store(true);
+		// Go silent but keep the connection open: no further bytes and no EOF,
+		// so a client that stranded records in the TLS layer can never recover.
+		while (!stop_.load()) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		tls.shutdown();
+		tls.close();
+	}
+
+	socket_t listenFd_ = STICE_INVALID_SOCKET;
+	uint16_t port_ = 0;
+	std::size_t total_ = 0;
+	std::atomic<bool> stop_{false};
+	std::atomic<bool> sent_{false};
+	std::string err_;
+	std::thread thread_;
+};
+
 // Pump the TcpTransport until it reaches a terminal/desired state.
 bool driveTo(TcpTransport &t, TcpState want, int timeoutMs) {
 	auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
@@ -343,6 +459,55 @@ TEST_CASE("TLS: handshake + byte-exact echo over TcpTransport", "[tls][transport
 	REQUIRE(echoed.size() == payload.size());
 	REQUIRE(echoed == payload);
 	REQUIRE(server.handshakes() == 1);
+	client.close();
+	server.stop();
+}
+
+TEST_CASE("TLS: a burst followed by silence is drained by one readable event", "[tls][transport]") {
+	REQUIRE(backendName() != "none");
+
+	// ~29 KiB: more than one TLS record, so a read path that stops after the
+	// first record leaves the remainder behind.
+	const std::size_t kMsg = 1204;
+	const std::size_t kMsgs = 24;
+	const std::size_t kTotal = kMsg * kMsgs;
+
+	BurstServer server;
+	REQUIRE(server.start(kTotal));
+
+	TcpTransport client;
+	client.setFramingMode(FramingMode::Raw);
+	REQUIRE(client.beginConnect(loopback(server.port()), "localhost", true, true));
+	REQUIRE(driveTo(client, TcpState::Connected, 8000));
+
+	// Wait for the whole burst to be written and to land in the client's socket
+	// buffer, without pumping any read event (that is what the poll loop would
+	// do for a real socket).
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+	while (!server.sent() && std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	}
+	REQUIRE(server.sent());
+	std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+	// Exactly one readable event. With the sender now silent, anything the TLS
+	// layer keeps buffered can never be recovered by a later event.
+	client.onReadable();
+
+	std::vector<char> got(kTotal);
+	std::size_t total = 0;
+	AddrRecord peer;
+	while (total < got.size()) {
+		int n = client.recv(got.data() + total, got.size() - total, peer);
+		if (n <= 0) break;
+		total += static_cast<std::size_t>(n);
+	}
+	INFO("backend=" << backendName() << " server_err='" << server.lastError()
+	                << "' drained=" << total << "/" << kTotal
+	                << " state=" << static_cast<int>(client.state()));
+	REQUIRE(total == kTotal);
+	for (std::size_t i = 0; i < total; ++i) REQUIRE(got[i] == 'b');
+
 	client.close();
 	server.stop();
 }

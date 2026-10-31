@@ -228,6 +228,10 @@ private:
 	// Handle CreatePermission response.
 	void handleCreatePermissionResponse(const stun::Message &msg, bool isError,
 	                                    const net::AddrRecord &peer);
+	// Flush data buffered for `b` while its permission was pending (or while the
+	// transport was under backpressure). Packets the transport refuses
+	// (sendRaw < 0) stay queued in order; returns the number still buffered.
+	std::size_t flushPendingData(PeerBinding &b);
 	// Handle ChannelBind response.
 	void handleChannelBindResponse(const stun::Message &msg, bool isError,
 	                               const net::AddrRecord &peer);

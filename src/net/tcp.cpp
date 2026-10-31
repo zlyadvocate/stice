@@ -75,6 +75,12 @@ TcpTransport::TcpTransport() = default;
 TcpTransport::~TcpTransport() { close(); }
 
 void TcpTransport::close() {
+	if (txBytes_.load(std::memory_order_relaxed) || rxBytes_.load(std::memory_order_relaxed)) {
+		STICE_LOG_INFO("TcpTransport: closed tls=%d tx=%llu rx=%llu",
+		               useTls_ ? 1 : 0,
+		               static_cast<unsigned long long>(txBytes_.load(std::memory_order_relaxed)),
+		               static_cast<unsigned long long>(rxBytes_.load(std::memory_order_relaxed)));
+	}
 	if (tls_) {
 		tls_->shutdown();
 		tls_->close();
@@ -92,6 +98,8 @@ void TcpTransport::close() {
 		sendOff_ = 0;
 		ctrlQueue_.clear();
 		ctrlOff_ = 0;
+		sendTlsPendingLen_ = 0;
+		ctrlTlsPendingLen_ = 0;
 	}
 	{
 		std::lock_guard<std::mutex> lk(recvMtx_);
@@ -287,12 +295,25 @@ short TcpTransport::onReadable() {
 			}
 			recvBuf_.insert(recvBuf_.end(), tmp, tmp + n);
 		}
-		// Plain TCP: keep draining until EWOULDBLOCK. Returning early on a
-		// short read used to leave data in the kernel buffer, forcing one
-		// poll iteration (with full bookkeeping) per ~4 KiB. TLS keeps the
-		// short-read exit (a TLS record read may return less than requested
-		// while further records are already buffered).
-		if (tlsActive && n < sizeof(tmp)) return POLLIN;
+		rxBytes_.fetch_add(n, std::memory_order_relaxed);
+		// Keep draining until the transport reports would-block — for TLS as
+		// well as for plain TCP.
+		//
+		// The TLS branch used to return here as soon as one record came back
+		// (a record read always returns less than the 64 KiB buffer, so the
+		// "short read" exit fired on *every* event). That capped the receive
+		// path at one record (~16 KiB) per poll iteration, which kept the TCP
+		// receive window small and left records queued in the kernel socket
+		// buffer. Under a sustained 512 KiB/s ChannelData stream this made the
+		// TURN server's per-connection send buffer back up, and coturn then
+		// dropped relayed frames silently (measured: isolated 1-13 message tail
+		// loss in TURN-over-TLS soaks that never occurred in the plaintext TCP
+		// mode sharing the same relay hop and the same code path). Draining
+		// fully per readable event keeps the window open.
+		//
+		// Termination: the loop exits when read() reports WantRead/WantWrite
+		// (nothing left in the record layer or the socket), Closed/Failed, or
+		// Ok with n == 0.
 	}
 }
 
@@ -335,19 +356,30 @@ short TcpTransport::flushSends() {
 	//   -1          queue fully drained — caller may proceed to the next one
 	//   POLLIN|...  blocked with backlog left / TLS wants an event
 	//   0           transport failed (state_ = Failed)
-	auto drain = [this](std::vector<unsigned char> &q, std::size_t &off) -> short {
+	auto drain = [this](std::vector<unsigned char> &q, std::size_t &off,
+	                    std::size_t &tlsPendingLen) -> short {
 		while (off < q.size()) {
 			const unsigned char *p = q.data() + off;
 			std::size_t avail = q.size() - off;
 			std::size_t n = 0;
 			if (tls_ && tls_->active()) {
-				TlsStatus st = tls_->write(p, std::min<std::size_t>(avail, 16384), n);
+				// A WantWrite/WantRead from SSL_write means the record layer has
+				// already taken (part of) this buffer and MUST be resumed with the
+				// same pointer AND the same length, otherwise OpenSSL reports
+				// "bad write retry" and the connection dies. `avail` can grow in
+				// between because senders keep appending to the queue, so the
+				// length of the interrupted call is remembered per queue.
+				std::size_t len = std::min<std::size_t>(avail, 16384);
+				if (tlsPendingLen != 0) len = std::min(tlsPendingLen, avail);
+				TlsStatus st = tls_->write(p, len, n);
 				if (st == TlsStatus::WantRead) {
 					tlsWantRead_ = true;
+					tlsPendingLen = len;
 					return POLLIN;
 				}
 				if (st == TlsStatus::WantWrite) {
 					tlsWantWrite_ = true;
+					tlsPendingLen = len;
 					return POLLIN | POLLOUT;
 				}
 				// Contract (tls.hpp): "Ok with n == 0 is a legal result meaning
@@ -381,10 +413,13 @@ short TcpTransport::flushSends() {
 				}
 			}
 			off += n;
+			tlsPendingLen = 0; // progress: any interrupted write completed
+			txBytes_.fetch_add(n, std::memory_order_relaxed);
 		}
 		if (off >= q.size()) {
 			q.clear();
 			off = 0;
+			tlsPendingLen = 0;
 			return -1; // fully drained
 		}
 		// Amortized consumption: only compact the consumed prefix when it is
@@ -398,10 +433,10 @@ short TcpTransport::flushSends() {
 		}
 		return POLLIN | POLLOUT; // blocked with backlog: keep POLLOUT armed
 	};
-	short r = drain(ctrlQueue_, ctrlOff_);
+	short r = drain(ctrlQueue_, ctrlOff_, ctrlTlsPendingLen_);
 	if (r >= 0)
 		return r; // ctrl blocked/failed — do not touch data queue yet
-	r = drain(sendQueue_, sendOff_);
+	r = drain(sendQueue_, sendOff_, sendTlsPendingLen_);
 	if (r >= 0)
 		return r; // data blocked (POLLOUT stays armed) or transport failed
 	return POLLIN; // both queues drained

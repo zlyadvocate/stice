@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // Author: zlyadvocate
-// Version: 0.13.0
+// Version: 0.13.1
 // IocpBackend: D plan implementation — Windows IOCP (Input/Output Completion
 // Port) based async IO with a dynamic worker thread pool.
 //
@@ -8,7 +8,9 @@
 //   - Single IOCP handle, all sockets associated with it.
 //   - N worker threads call GetQueuedCompletionStatus() in a loop.
 //   - UDP listener and relay sockets use WSARecvFrom (overlapped) to get
-//     both data and source address in one operation.
+//     both data and source address in one operation, with a pool of receives
+//     armed per socket so several workers drain one socket concurrently
+//     (a single in-flight op caps a socket at ~53k pps).
 //   - TCP listener uses AcceptEx for overlapped accept.
 //   - TCP connections use WSARecv (overlapped) for data.
 //   - Sends use non-blocking send() with writeBuf; a periodic retry
@@ -63,6 +65,17 @@ constexpr int WriteRetryIntervalMs = 50;  // Pending write flush interval
 #define STSERVER_IO_BUFFER_SIZE 65536
 #endif
 constexpr int BufferSize = STSERVER_IO_BUFFER_SIZE;
+
+// Number of WSARecvFrom operations kept armed per UDP socket. A single
+// in-flight receive caps one socket at roughly one "completion -> re-post"
+// round trip per datagram: measured ~53k pps on the listening socket, i.e.
+// ~63 MiB/s at 1200-byte blocks. Every client's media arrives on that ONE
+// listening socket, so at 128 MiB/s roughly half the datagrams overflowed the
+// kernel queue and were dropped while RELAY-STAT still showed drop=0. Keeping
+// a pool armed lets several workers drain the same socket concurrently.
+// Each context owns its own buffer, so concurrent ops never share storage.
+constexpr int UdpListenerRecvDepth = 32;
+constexpr int UdpRelayRecvDepth = 8;
 
 // Operation type identifiers for OVERLAPPED contexts.
 enum class OpType : int {
@@ -168,9 +181,13 @@ public:
 		running_ = true;
 		int n = std::max(1, workerCount_);
 
-		// Post initial overlapped WSARecvFrom on UDP listener.
+		// Post initial overlapped WSARecvFrom on UDP listener. The full pool
+		// must be armed up front: re-posting one receive per completion only
+		// sustains a single in-flight op and re-creates the drain-rate ceiling.
 		if (udpListener_ != INVALID_SOCKET) {
-			postRecvFrom(udpListener_);
+			for (int i = 0; i < UdpListenerRecvDepth; ++i) {
+				postRecvFrom(udpListener_, UdpListenerRecvDepth);
+			}
 		}
 		// Post initial AcceptEx.
 		if (tcpListener_ != INVALID_SOCKET) {
@@ -222,7 +239,9 @@ public:
 			std::lock_guard<std::mutex> lk(relayMutex_);
 			relaySockets_.insert(s);
 		}
-		postRecvFrom(s);
+		for (int i = 0; i < UdpRelayRecvDepth; ++i) {
+			postRecvFrom(s, UdpRelayRecvDepth);
+		}
 	}
 
 	void removeRelaySocket(socket_t s) override {
@@ -296,7 +315,10 @@ private:
 	// call, because the completion can fire (on another worker thread) before
 	// WSARecvFrom returns. If the context isn't in the map yet, the completion
 	// handler's linear search fails and the socket stops receiving.
-	void postRecvFrom(socket_t s) {
+	// Up to `maxInFlight` receives may be pending per socket; the cap is a
+	// memory bound, not a correctness requirement (each context has its own
+	// buffer, so pending ops never alias).
+	void postRecvFrom(socket_t s, int maxInFlight) {
 		auto ctx = std::make_unique<OverlappedCtx>();
 		std::memset(&ctx->ol, 0, sizeof(OVERLAPPED));
 		ctx->type = OpType::RecvFrom;
@@ -308,16 +330,9 @@ private:
 
 		auto *raw = ctx.get();
 		{
-			// At most ONE in-flight WSARecvFrom per socket, enforced atomically
-			// with the insert. Overwriting an existing ctx would free it while
-			// its overlapped op is still pending: the allocator hands the same
-			// block to the new ctx, both ops then share one buffer, and two
-			// completions deliver the same datagram bytes (also losing the
-			// earlier one). Observed as "negative loss" (rx > sent) under
-			// teardown churn.
 			std::lock_guard<std::mutex> lk(ctxMutex_);
-			if (ctxs_.count(s) > 0) return;
-			ctxs_[s] = std::move(ctx);
+			if (ctxs_.count(s) >= static_cast<std::size_t>(maxInFlight)) return;
+			ctxs_.emplace(s, std::move(ctx));
 		}
 
 		DWORD flags = 0;
@@ -352,7 +367,9 @@ private:
 			if (!transient || attempt >= 8) {
 				STICE_LOG_ERROR("stserver: WSARecvFrom failed on sock %llu: %d", static_cast<unsigned long long>(s), err);
 				std::lock_guard<std::mutex> lk(ctxMutex_);
-				ctxs_.erase(s);
+				for (auto it = ctxs_.begin(); it != ctxs_.end(); ++it) {
+					if (it->second.get() == raw) { ctxs_.erase(it); break; }
+				}
 				return;
 			}
 			// Consume the queued ICMP-derived error and retry.
@@ -373,11 +390,13 @@ private:
 
 		auto *raw = ctx.get();
 		{
-			// Same single-in-flight invariant as postRecvFrom: never overwrite
-			// a ctx whose op is still pending (shared-buffer double delivery).
+			// TCP keeps exactly one receive armed: a byte stream is already
+			// serialized by the connection, and concurrent WSARecv ops would
+			// reorder data. Never overwrite a pending ctx (shared-buffer
+			// double delivery).
 			std::lock_guard<std::mutex> lk(ctxMutex_);
 			if (ctxs_.count(s) > 0) return;
-			ctxs_[s] = std::move(ctx);
+			ctxs_.emplace(s, std::move(ctx));
 		}
 
 		DWORD flags = 0;
@@ -410,7 +429,7 @@ private:
 		auto *raw = ctx.get();
 		{
 			std::lock_guard<std::mutex> lk(ctxMutex_);
-			ctxs_[key] = std::move(ctx);
+			ctxs_.emplace(key, std::move(ctx));
 		}
 
 		DWORD bytesRecv = 0;
@@ -478,11 +497,9 @@ private:
 				// (measured: after one client teardown the server stopped
 				// responding to any Allocate).
 				// Identity guard: re-post ONLY when this completion belongs
-				// to the socket's CURRENT ctx. A stale ctx (aborted op whose
+				// to a context we still own. A stale ctx (aborted op whose
 				// handle was already recycled by a new relay socket) must
-				// never trigger a re-post — that created a second in-flight
-				// recv sharing the new ctx's buffer, and the two completions
-				// then delivered the same datagram twice (negative loss).
+				// never trigger a re-post on the recycled handle.
 				bool wasCurrent = false;
 				{
 					std::lock_guard<std::mutex> lk(ctxMutex_);
@@ -494,13 +511,17 @@ private:
 						}
 					}
 				}
-				if (running_ && wasCurrent) {
+				// Cancelled ops (CancelIoEx from removeRelaySocket /
+				// removeTcpConn) are teardown noise: never re-arm them, or
+				// the pool silently regrows on a socket that is going away.
+				bool aborted = (err == WSA_OPERATION_ABORTED);
+				if (running_ && wasCurrent && !aborted) {
 					if (s == udpListener_) {
-						postRecvFrom(s);
+						postRecvFrom(s, UdpListenerRecvDepth);
 					} else {
 						// Relay socket: only re-post if still registered.
 						std::lock_guard<std::mutex> lk(relayMutex_);
-						if (relaySockets_.count(s) > 0) postRecvFrom(s);
+						if (relaySockets_.count(s) > 0) postRecvFrom(s, UdpRelayRecvDepth);
 					}
 				}
 			}
@@ -620,7 +641,7 @@ private:
 		// of scope). postRecvFrom creates a fresh context for the next recv.
 		ctxOwner.reset();
 		if (shouldRepost && (isListener || stillRelay)) {
-			postRecvFrom(sock);
+			postRecvFrom(sock, isListener ? UdpListenerRecvDepth : UdpRelayRecvDepth);
 		}
 	}
 
@@ -698,8 +719,10 @@ private:
 	std::thread writeThread_;
 
 	// Overlapped contexts: key = socket (for recv) or synthetic key (for accept).
+	// multimap because a UDP socket keeps a pool of receives armed; duplicate
+	// keys are distinct contexts with distinct buffers.
 	std::mutex ctxMutex_;
-	std::map<socket_t, std::unique_ptr<OverlappedCtx>> ctxs_;
+	std::multimap<socket_t, std::unique_ptr<OverlappedCtx>> ctxs_;
 	std::atomic<int> acceptCounter_{0};
 
 	// Relay socket tracking (to distinguish relay vs TCP conn on completion).

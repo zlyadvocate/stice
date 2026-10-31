@@ -1,7 +1,7 @@
 # stice
 
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
-[![Version](https://img.shields.io/badge/version-0.13.0-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-0.13.1-blue.svg)]()
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)]()
 
 **C++17 ICE + TURN client library, ported from [pion/webrtc](https://github.com/pion/webrtc) (Go), designed as a drop-in replacement for [libjuice](https://github.com/paullouisageneau/libjuice).**

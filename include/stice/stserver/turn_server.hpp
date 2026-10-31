@@ -28,8 +28,8 @@
 #include <map>
 #include <memory>
 #include <unordered_map>
-#include <unordered_set>
 #include <mutex>
+#include <shared_mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -128,9 +128,16 @@ struct TcpConn {
 	// ... before this ConnectionBind request was received" (Section 5.4), and
 	// Section 5.2/5.3 say the server MUST buffer data received before the bind.
 	// A local-policy cap applies (Section 7): exceeding it closes the
-	// connection rather than growing without bound. Only the business thread
-	// touches this buffer.
+	// connection rather than growing without bound.
+	//
+	// Appended by the shard that owns this connection, flushed by the business
+	// thread when the pair is published. Both sides hold prePairMtx and re-check
+	// the pairing state inside it: if the flush wins, the shard forwards instead
+	// of buffering; if the append wins, the flush sends the buffered prefix. That
+	// closes the window where a chunk appended just after the flush would stay
+	// stuck in the buffer forever.
 	std::vector<unsigned char> prePairBuf;
+	std::mutex prePairMtx;
 	// Serializes the non-blocking write state (writeBuf/writeOff + send() +
 	// write-pending arming). The RFC 6062 data-pipe fast path writes to a peer
 	// connection directly on the IO worker thread, concurrently with the
@@ -240,17 +247,18 @@ private:
 	// ---- STUN/TURN request dispatch ----
 	void handleUdpPacket(const unsigned char *data, std::size_t size,
 	                     const stice::net::AddrRecord &src);
-	void handleTcpFrame(TcpConn &conn, const unsigned char *data, std::size_t size);
+	void handleTcpFrame(TcpConn &conn, socket_t connSock, const unsigned char *data,
+	                    std::size_t size);
 	void dispatchStun(stice::stun::Message &msg, const stice::net::AddrRecord &src,
 	                  TcpConn *tcpConn, Allocation *alloc);
 
-	// ---- Business dispatch (control / data queues) ----
-	// IO callbacks enqueue work items instead of processing inline. A single
-	// business thread drains two FIFO queues: the control queue (STUN/TURN
-	// control: UDP listener data, TCP accepts, control-connection frames,
-	// closes) is drained first — control has priority over data but keeps
-	// its own arrival order — then the data queue (relay forwarding, RFC
-	// 6062 data pipes, write flushes).
+	// ---- Business dispatch (control queue) ----
+	// IO callbacks never process work inline on the hot media path. The single
+	// business thread drains one control FIFO (STUN/TURN control: UDP listener
+	// data, TCP accepts, closes) in arrival order. Bulk TCP media — control
+	// connection ChannelData/STUN frames, RFC 6062 data pipes, relay->client
+	// forwarding for TCP-control allocations and write flushes — is routed to
+	// the data shards instead (see DataShard).
 	struct WorkItem {
 		enum class Kind {
 			UdpData,
@@ -265,6 +273,20 @@ private:
 		stice::net::AddrRecord from;
 		std::vector<unsigned char> data;
 	};
+
+	// A TCP data shard: its own FIFO and thread. Bulk TCP media (control-conn
+	// ChannelData/STUN frames and RFC 6062 data pipes, both directions) is
+	// routed to exactly one shard per socket, so per-connection byte order is
+	// preserved without any cross-thread parse buffer, and media never takes
+	// stateMutex_. Previously all of it funnelled through the single business
+	// thread under stateMutex_, which capped TCP relay throughput at one core
+	// and let a large data batch delay STUN/TURN transactions.
+	struct DataShard {
+		std::deque<WorkItem> queue;
+		std::mutex mtx;
+		std::condition_variable cv;
+		std::thread thread;
+	};
 	// IO fast-path lookups that take a lifetime reference (caller must
 	// allocUnref). Return nullptr if not found or dying.
 	Allocation *findAllocByClientRef(const stice::net::AddrRecord &addr);
@@ -278,24 +300,42 @@ private:
 	void allocUnref(Allocation *a);
 
 	void enqueueControl(WorkItem &&item);
-	void enqueueData(WorkItem &&item);
 	void businessLoop();
 	void processItem(const WorkItem &item);
 	void registerTcpConn(socket_t sock, const stice::net::AddrRecord &peer);
 	void handleTcpConnData(socket_t connSock, const unsigned char *data, std::size_t len);
 	// RFC 6062 §5.2/5.3/5.4: bytes that arrive on a data connection before its
 	// pair is published are buffered (appendPrePair) and forwarded as soon as
-	// the pair exists (flushPrePair). Both run on the business thread only.
-	void appendPrePair(TcpConn &conn, const unsigned char *data, std::size_t len);
+	// the pair exists (flushPrePair). Both hold conn.prePairMtx.
+	void appendPrePair(TcpConn &conn, socket_t connSock, const unsigned char *data,
+	                   std::size_t len);
 	void flushPrePair(TcpConn &conn);
-	// Classify a TCP conn socket by its current isData flag (data pipe vs
-	// control). Takes stateMutex_ briefly; safe because the flag only flips
-	// on the business thread.
-	bool connIsDataSock(socket_t s) const;
+	// ---- TCP data shards ----
+	// Bulk TCP media runs on shard threads instead of the business thread. A
+	// socket always maps to the same shard (shardIndexFor is a pure function of
+	// the handle), so every chunk of a connection is parsed and forwarded in
+	// arrival order by one thread, with no lock on the parse buffer.
+	int shardIndexFor(socket_t s) const;
+	void enqueueToShard(int idx, WorkItem &&item);
+	void shardLoop(int idx);
+	void processShardItem(const WorkItem &item);
+	// Lifetime-taking lookups for the shard threads (caller must release with
+	// connUnref / allocUnref). Guarded by connMapMutex_, never stateMutex_.
+	TcpConn *tcpConnRef(socket_t s);
+	Allocation *findAllocByControlSockRef(socket_t s);
+	// Ask the business thread to tear a connection down. Used by the shards
+	// instead of calling closeTcpConn() directly: the shard may be holding a
+	// lifetime reference to that connection, and closeTcpConn waits for it to
+	// drain.
+	void enqueueCloseConn(socket_t s);
+	// Destroys connections whose ioUsers reached zero. Runs outside stateMutex_
+	// (business thread, after a batch) so a shard blocked on stateMutex_ for a
+	// control frame cannot deadlock against the free.
+	void reapPendingConns();
 	// RFC 6062 data-pipe fast path: resolve the peer connection of a paired data
 	// socket and take a lifetime reference on it (the caller MUST call
 	// connUnref()). Returns nullptr when the socket is not (yet) a paired data
-	// pipe, in which case the caller falls back to the business queue.
+	// pipe, in which case the caller buffers into prePairBuf under prePairMtx.
 	TcpConn *dataPipePeerRef(socket_t connSock);
 	void connUnref(TcpConn *conn);
 
@@ -370,15 +410,19 @@ private:
 
 	// Guards allocByRelaySock_ for the parallel relay data-plane fast path
 	// (relay workers look up the allocation by relay socket concurrently with
-	// the business thread inserting/erasing it).
-	mutable std::mutex relayMapMutex_;
+	// the business thread inserting/erasing it). Shared: lookups run on every
+	// relayed packet from all IO workers, so an exclusive lock here serialized
+	// the whole data plane and capped stserver at roughly 60-80k pps (the 128
+	// MiB/s / 1200-byte case dropped ~50% at the inbound socket once the
+	// workers blocked on this lock).
+	mutable std::shared_mutex relayMapMutex_;
 
 	// Client 5-tuple -> allocation, for the ChannelData fast path. IO workers
 	// read this concurrently with the business thread. Guarded by its OWN mutex
 	// (clientMapMutex_) so the ChannelData lookup never contends with the relay
 	// socket lookup (relayMapMutex_) that relay workers take on every packet.
 	std::unordered_map<stice::net::AddrRecord, Allocation*, AddrHash> allocByClientAddr_;
-	mutable std::mutex clientMapMutex_;
+	mutable std::shared_mutex clientMapMutex_;
 
 	// Allocations: owned by unique_ptr (stable pointers) in a map keyed by
 	// the 5-tuple string. Reverse-lookup maps hold raw pointers.
@@ -407,9 +451,24 @@ private:
 	std::map<socket_t, TcpConn *> dataPipePeer_;
 	mutable std::mutex pipeMapMutex_;
 
-	// Business dispatch queues (see WorkItem). Guarded by queueMutex_.
+	// Guards tcpBySock_ and allocByControlSock_, and gates TcpConn lifetime for
+	// the shard threads. Writers (accept / close / allocate / destroy) run on the
+	// business thread under stateMutex_ and take this uniquely; shard threads take
+	// it shared and bump TcpConn::ioUsers before dereferencing. Lock order is
+	// stateMutex_ -> connMapMutex_ -> Allocation::mtx -> TcpConn::writeMtx; no
+	// shard ever takes stateMutex_ while holding connMapMutex_ or a TcpConn ref.
+	mutable std::shared_mutex connMapMutex_;
+
+	// TCP data shards (see DataShard).
+	std::vector<std::unique_ptr<DataShard>> shards_;
+	int shardCount_ = 4;
+	// Connections unlinked from the maps but still referenced by a shard. Freed
+	// on the business thread once ioUsers drops to zero (see reapPendingConns).
+	std::vector<std::unique_ptr<TcpConn>> pendingFreeConns_;
+
+	// Business dispatch queue (see WorkItem). Guarded by queueMutex_. Only
+	// control-plane work lands here; bulk TCP media runs on the shards.
 	std::deque<WorkItem> controlQueue_;
-	std::deque<WorkItem> dataQueue_;
 	mutable std::mutex queueMutex_;
 	// NOTE: there is intentionally NO send mutex for udpListener_. The control
 	// responses (sendUdp) and the relay data plane (forwardToClient, on several
@@ -429,13 +488,6 @@ private:
 	std::condition_variable ioUsersCv_;
 	std::atomic<int> ioUsersWaiters_{0};
 
-	// TCP connection classification (data pipe vs control), consulted by
-	// ioOnTcpConnData() on the IO threads. Held in its own tiny mutex so the TCP
-	// data path does not contend on the global stateMutex_, which the business
-	// thread holds for the whole duration of each control/data item.
-	mutable std::mutex connClassMutex_;
-	std::unordered_set<socket_t> dataConns_;
-
 	std::atomic<bool> running_{false};
 
 	// DIAG relay accounting: bytes read from relay sockets by IO threads
@@ -445,8 +497,15 @@ private:
 	// hot increments use memory_order_relaxed (they are diagnostics only).
 	alignas(64) std::atomic<std::uint64_t> relayReadBytes_{0};
 	alignas(64) std::atomic<std::uint64_t> forwardBytes_{0};
+	// Bytes relayed through an RFC 6062 data pipe (the raw TCP media path). The
+	// two counters above only see UDP relay sockets, so without this the TCP
+	// data-pipe throughput is invisible in RELAY-STAT.
+	alignas(64) std::atomic<std::uint64_t> pipeBytes_{0};
 	std::atomic<std::uint64_t> forwardOk_{0};
-	std::atomic<std::uint64_t> forwardDrop_{0};
+    std::atomic<std::uint64_t> forwardDrop_{0};
+    // UDP sendto failures (SNDBUF full / transient would-block). Separate from
+    // forwardDrop_ (a policy drop) so kernel-level send starvation is visible.
+    std::atomic<std::uint64_t> sendFail_{0};
 	std::atomic<std::uint64_t> controlBytes_{0}; // DIAG: bytes from client->server (3478, controlLoop)
 	std::atomic<std::uint64_t> ctlHandleNs_{0};   // DIAG: ChannelData handle+sendo cumulative ns
 };
