@@ -125,7 +125,7 @@ TEST_CASE("Pairing profile factory produces expected configs", "[pairing][profil
 		REQUIRE(c.max_concurrent_check == 2);
 		REQUIRE(c.udp_phase_timeout.count() == 3000);
 		REQUIRE(c.tcp_nomination_precheck.count() == 500);
-		REQUIRE(c.keepalive_udp.count() == 10000);
+		REQUIRE(c.keepalive_udp.count() == 5000);
 		REQUIRE(c.keepalive_tcp_relay.count() == 5000);
 		// Speed optimization: tightened RTO/retransmit for faster pair
 		// failure detection; early-phase concurrency boost (3 for first
@@ -245,7 +245,7 @@ TEST_CASE("C API pairing config factory", "[pairing][capi]") {
 		REQUIRE(cfg.reselect_policy == STICE_RESELECT_STICKY_SELECTED);
 		REQUIRE(cfg.udp_phase_timeout_ms == 3000);
 		REQUIRE(cfg.tcp_nomination_precheck_ms == 500);
-		REQUIRE(cfg.keepalive_udp_ms == 10000);
+		REQUIRE(cfg.keepalive_udp_ms == 5000);
 		REQUIRE(cfg.keepalive_tcp_relay_ms == 5000);
 		// Speed optimization fields round-trip through the C ABI.
 		REQUIRE(cfg.enable_trickle == true);

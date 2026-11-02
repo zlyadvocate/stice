@@ -56,9 +56,13 @@ public:
 	// per-connection trust bundle: non-empty pins this connection to that PEM
 	// bundle, empty falls back to STICE_TLS_CA_FILE and then to the platform
 	// store — so one agent can talk to several TURN servers with different
-	// private CAs.
+	// private CAs. bindLocal, when non-null and of the same address family as
+	// `dst`, binds the outgoing socket to that local address (ICE-TCP P1-C6:
+	// the resulting local candidate is a gathered host address instead of an
+	// OS-routing choice).
 	bool beginConnect(const AddrRecord &dst, const std::string &sni, bool useTls,
-	                  bool skipVerify = false, const std::string &caFile = std::string());
+	                  bool skipVerify = false, const std::string &caFile = std::string(),
+	                  const AddrRecord *bindLocal = nullptr);
 	// Wrap an already-accepted socket fd (passive side of ICE-TCP). The fd
 	// must already be non-blocking and connected. Sets state=Connected and
 	// records peerAddr for routing. Used by TCPMux when accepting inbound

@@ -175,7 +175,10 @@ int main(int argc, char **argv) {
 	const char *host = argc > 1 ? argv[1] : "127.0.0.1";
 	uint16_t port = argc > 2 ? static_cast<uint16_t>(std::atoi(argv[2])) : 13478;
 
-	stice_set_log_level(STICE_LOG_LEVEL_ERROR);
+	stice_set_log_level(STICE_LOG_LEVEL_DEBUG);
+	stice_set_log_handler([](stice_log_level_t lvl, const char *msg) {
+		std::fprintf(stderr, "[L%d] %s\n", static_cast<int>(lvl), msg);
+	});
 
 	std::fprintf(stderr, "=== stserver bench: %s:%u ===\n", host, port);
 
@@ -185,6 +188,13 @@ int main(int argc, char **argv) {
 
 	cfgA.stun_server_host = host;
 	cfgA.stun_server_port = port;
+	// Topology contract (matches filterRelayOnly below): A gathers ONLY relayed
+	// candidates. Without this A still gathers host/srflx candidates and pairs
+	// them with B's host candidate internally — the SDP filter hides them from
+	// signaling but not from formPairs — so the selected pair could silently
+	// drift onto an un-signaled direct hairpin path, breaking the relay-only
+	// demux/throughput measurement this bench exists for.
+	cfgA.relay_only_local = 1;
 
 	stice_turn_server_t turn{};
 	turn.host = const_cast<char *>(host);
@@ -231,13 +241,22 @@ int main(int argc, char **argv) {
 	stice_set_remote_gathering_done(a);
 	stice_set_remote_gathering_done(b);
 
-	if (!waitFor([&] {
+	// Judgment: fail fast when either side declares FAILED — waiting out the
+	// full window after a terminal state only slows the loop without new
+	// information. The timeout branch remains for the "still checking" case.
+	bool connected = waitFor([&] {
 		auto as = sa.state.load(), bs = sb.state.load();
 		return (as == STICE_STATE_CONNECTED || as == STICE_STATE_COMPLETED) &&
 		       (bs == STICE_STATE_CONNECTED || bs == STICE_STATE_COMPLETED);
-	}, 15000)) {
-		std::fprintf(stderr, "FAIL: connect timeout (A=%d B=%d)\n",
-		             (int)sa.state.load(), (int)sb.state.load());
+	}, 15000);
+	if (!connected) {
+		auto as = sa.state.load(), bs = sb.state.load();
+		std::fprintf(stderr, "FAIL: %s (A=%d B=%d)\n",
+		             (as == STICE_STATE_FAILED || bs == STICE_STATE_FAILED)
+		                 ? "ICE failed" : "connect timeout",
+		             (int)as, (int)bs);
+		stice_destroy(a);
+		stice_destroy(b);
 		return 1;
 	}
 	std::fprintf(stderr, "CONNECTED (A=relay, B=host)\n");

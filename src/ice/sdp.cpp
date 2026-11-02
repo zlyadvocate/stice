@@ -48,8 +48,10 @@ std::string Description::generateSdp() const {
 	if (finished) {
 		s += "a=end-of-candidates\r\n";
 		s += "a=ice-options:ice2\r\n";
-	} else {
+	} else if (trickleEnabled) {
 		s += "a=ice-options:ice2,trickle\r\n";
+	} else {
+		s += "a=ice-options:ice2\r\n";
 	}
 	return s;
 }

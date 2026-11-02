@@ -66,8 +66,18 @@ public:
 	virtual ~PollParticipant() = default;
 	virtual socket_t udpSocket() const = 0;
 	virtual bool hasTcp() const = 0;
-	virtual socket_t tcpSocket() const = 0;
-	virtual short tcpDesiredEvents() const = 0; // POLLIN / POLLOUT bits
+  virtual socket_t tcpSocket() const = 0;
+  virtual short tcpDesiredEvents() const = 0; // POLLIN / POLLOUT bits
+  // Indexed ICE-TCP slots (RFC 6544 §7.1): one active TCP connection per
+  // candidate pair, so several pairs can be dialed and checked concurrently
+  // instead of sharing a single transport. Enumeration is rebuilt every poll
+  // iteration; dispatch identifies the connection by its socket fd via
+  // onIceTcpEventsSock(), which stays correct even if the connection list is
+  // mutated (insert/erase) during an earlier callback.
+  virtual int iceTcpSlotCount() const { return 0; }
+  virtual socket_t iceTcpSocketAt(int /*i*/) const { return STICE_INVALID_SOCKET; }
+  virtual short iceTcpDesiredEventsAt(int /*i*/) const { return 0; }
+  virtual void onIceTcpEventsSock(socket_t /*sock*/, short /*events*/) {}
 	// Optional second TCP socket (e.g. TURN over TCP, separate from ICE-TCP).
 	// Default: no second TCP socket.
 	virtual bool hasTurnTcp() const { return false; }

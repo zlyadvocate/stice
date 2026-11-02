@@ -29,6 +29,8 @@ const char *errorReason(int code) {
 	case 441: return "Wrong credentials";
 	case 442: return "Unsupported Transport Protocol";
 	case 443: return "Peer Address Family Mismatch";
+	case 446: return "Connection Already Exists";
+	case 447: return "Connection Timeout or Failure";
 	case 486: return "Allocation Quota Reached";
 	case 500: return "Server Error";
 	case 508: return "Insufficient Capacity";
@@ -65,7 +67,8 @@ Attribute *Message::find(AttrType type) {
 	return nullptr;
 }
 
-bool Message::encode(const char *password, const Credentials *creds, const char *software) {
+bool Message::encode(const char *password, const Credentials *creds, const char *software,
+                     bool emitAuthAttributes) {
 	raw.clear();
 	raw.reserve(MessageHeaderSize + attributes.size() * 8);
 
@@ -87,14 +90,21 @@ bool Message::encode(const char *password, const Credentials *creds, const char 
 			raw[offset + 4 + i] = 0;
 	};
 
-	// 1. Optional USERNAME / REALM / NONCE for long-term credentialed requests.
-	//    Per RFC 5389 §15.3, requests MUST carry USERNAME when MESSAGE-INTEGRITY
-	//    is present and the mechanism is long-term.
-	if (creds && password && cls != Class::Indication) {
-		if (!creds->username.empty())
+	// 1. Optional USERNAME / USERHASH / REALM / NONCE for long-term credentialed
+	//    requests. Per RFC 5389 §15.3, requests MUST carry USERNAME when
+	//    MESSAGE-INTEGRITY is present and the mechanism is long-term. RFC 8489
+	//    §14.2 allows USERHASH (SHA-256("username:realm")) in its place.
+	if (creds && password && emitAuthAttributes && cls != Class::Indication) {
+		if (creds->useUserhash && !creds->username.empty() && !creds->realm.empty()) {
+			std::string combined = creds->username + ":" + creds->realm;
+			auto h = crypto::sha256(reinterpret_cast<const unsigned char *>(combined.data()),
+			                        combined.size());
+			appendAttr(AttrType::Userhash, h.data(), h.size());
+		} else if (!creds->username.empty()) {
 			appendAttr(AttrType::Username,
 			           reinterpret_cast<const unsigned char *>(creds->username.data()),
 			           creds->username.size());
+		}
 		if (!creds->realm.empty())
 			appendAttr(AttrType::Realm,
 			           reinterpret_cast<const unsigned char *>(creds->realm.data()),
@@ -120,6 +130,9 @@ bool Message::encode(const char *password, const Credentials *creds, const char 
 	//    Per RFC 5389 §15.4 and pion-stun, the HMAC is computed over the header
 	//    + body (NOT including the MI TLV itself), with the header length field
 	//    patched to include the full MI TLV (header + value = 24 bytes).
+	//    When the negotiated algorithm is SHA-256, MESSAGE-INTEGRITY-SHA256
+	//    (RFC 8489 §14.5) is appended right after MI. Keeping MI as well lets
+	//    peers that only implement RFC 5389 still verify the message.
 	if (password && cls != Class::Indication) {
 		const unsigned char *key = nullptr;
 		std::size_t keyLen = 0;
@@ -145,6 +158,37 @@ bool Message::encode(const char *password, const Credentials *creds, const char 
 		writeU16Be(raw.data() + miTlvOff, static_cast<std::uint16_t>(AttrType::MessageIntegrity));
 		writeU16Be(raw.data() + miTlvOff + 2, HmacSha1Size);
 		std::memcpy(raw.data() + miTlvOff + AttributeHeaderSize, hmac.data(), HmacSha1Size);
+
+		if (creds && creds->algo == IntegrityAlgo::HmacSha256) {
+			const unsigned char *key256 = nullptr;
+			std::size_t key256Len = 0;
+			bytes key256Buf;
+			if (!creds->keySha256.empty()) {
+				key256 = creds->keySha256.data();
+				key256Len = creds->keySha256.size();
+			} else if (!creds->username.empty()) {
+				auto k = crypto::longTermKeySha256(creds->username, creds->realm, password);
+				key256Buf.assign(k.begin(), k.end());
+				key256 = key256Buf.data();
+				key256Len = key256Buf.size();
+			}
+			if (key256 && key256Len) {
+				// RFC 8489 §14.5: the length covers everything up to and including
+				// this TLV, and the HMAC input includes the MESSAGE-INTEGRITY TLV
+				// appended above.
+				std::size_t bodyWithMi = raw.size() - MessageHeaderSize;
+				writeU16Be(raw.data() + 2, static_cast<std::uint16_t>(
+				        bodyWithMi + AttributeHeaderSize + HmacSha256Size));
+				auto hmac256 = crypto::hmacSha256(key256, key256Len, raw.data(), raw.size());
+				std::size_t mi256Off = raw.size();
+				raw.resize(raw.size() + AttributeHeaderSize + HmacSha256Size);
+				writeU16Be(raw.data() + mi256Off,
+				           static_cast<std::uint16_t>(AttrType::MessageIntegritySha256));
+				writeU16Be(raw.data() + mi256Off + 2, HmacSha256Size);
+				std::memcpy(raw.data() + mi256Off + AttributeHeaderSize, hmac256.data(),
+				            HmacSha256Size);
+			}
+		}
 	}
 
 	// 5. FINGERPRINT (always last). Per RFC 5389 §15.5 and pion-stun, the CRC
@@ -174,6 +218,42 @@ bool Message::encode(const char *password, const Credentials *creds, const char 
 	return true;
 }
 
+namespace {
+// Comprehension-required attribute types this implementation actually parses.
+// Anything else below 0x8000 must be reported in a 420 (RFC 8489 §6.3.4).
+bool isKnownComprehensionRequired(std::uint16_t t) {
+	switch (t) {
+	case 0x0001: // MAPPED-ADDRESS
+	case 0x0006: // USERNAME
+	case 0x0008: // MESSAGE-INTEGRITY
+	case 0x0009: // ERROR-CODE
+	case 0x000A: // UNKNOWN-ATTRIBUTES
+	case 0x000C: // CHANNEL-NUMBER
+	case 0x000D: // LIFETIME
+	case 0x0012: // XOR-PEER-ADDRESS
+	case 0x0013: // DATA
+	case 0x0014: // REALM
+	case 0x0015: // NONCE
+	case 0x0016: // XOR-RELAYED-ADDRESS
+	case 0x0017: // REQUESTED-ADDRESS-FAMILY
+	case 0x0018: // EVEN-PORT
+	case 0x0019: // REQUESTED-TRANSPORT
+	case 0x001A: // DONT-FRAGMENT
+	case 0x001C: // MESSAGE-INTEGRITY-SHA256
+	case 0x001D: // PASSWORD-ALGORITHM
+	case 0x001E: // USERHASH
+	case 0x0020: // XOR-MAPPED-ADDRESS
+	case 0x0022: // RESERVATION-TOKEN
+	case 0x0024: // PRIORITY
+	case 0x0025: // USE-CANDIDATE
+	case 0x002A: // CONNECTION-ID
+		return true;
+	default:
+		return false;
+	}
+}
+} // namespace
+
 bool Message::decode(const unsigned char *data, std::size_t size) {
 	if (size < MessageHeaderSize) return false;
 	if (!isMessage(data, size)) return false;
@@ -187,20 +267,36 @@ bool Message::decode(const unsigned char *data, std::size_t size) {
 
 	raw.assign(data, data + size);
 	attributes.clear();
+	unknownComprehensionRequired.clear();
 
 	std::size_t offset = MessageHeaderSize;
 	std::size_t end = MessageHeaderSize + length;
 	if (end > size) return false;
 
+	bool fingerprintSeen = false;
 	while (offset + AttributeHeaderSize <= end) {
-		AttrType at = static_cast<AttrType>(readU16Be(data + offset));
+		std::uint16_t atWire = readU16Be(data + offset);
+		AttrType at = static_cast<AttrType>(atWire);
 		std::uint16_t vlen = readU16Be(data + offset + 2);
+		// RFC 8489 §14.7: FINGERPRINT MUST be the last attribute in the
+		// message. An attribute after it means the CRC no longer covers the
+		// whole message, so the framing is malformed and is rejected outright.
+		if (fingerprintSeen) return false;
 		offset += AttributeHeaderSize;
 		if (offset + vlen > end) return false;
+		if (at == AttrType::Fingerprint) {
+			if (vlen != 4) return false;
+			fingerprintSeen = true;
+		}
 		Attribute a;
 		a.type = at;
 		a.value.assign(data + offset, data + offset + vlen);
 		attributes.push_back(std::move(a));
+		// RFC 8489 §6.3.4: unknown comprehension-required attributes must be
+		// surfaced so the caller can reject the request with 420. Optional
+		// attributes (>= 0x8000) are silently ignored by design.
+		if (atWire < 0x8000 && !isKnownComprehensionRequired(atWire))
+			unknownComprehensionRequired.push_back(atWire);
 		// Skip padding.
 		offset += paddedSize(vlen);
 	}
@@ -240,22 +336,77 @@ std::size_t Message::findIntegrityOffset(std::size_t &attrStart) const {
 	return 0;
 }
 
-bool Message::checkIntegrity(const unsigned char *key, std::size_t keyLen, bool allowMissing) const {
+namespace {
+// Location of the strongest integrity attribute present in `raw`.
+struct IntegrityLoc {
 	std::size_t attrStart = 0;
-	std::size_t valueOff = findIntegrityOffset(attrStart);
-	if (valueOff == 0) return allowMissing;
-	if (valueOff + HmacSha1Size > raw.size()) return false;
+	std::size_t valueOff = 0;
+	std::size_t valueLen = 0;
+	bool sha256 = false;
+};
 
-	// Compute HMAC over header + body before MI (NOT including MI TLV).
-	// Patch length to include full MI TLV (header + value = 24 bytes).
-	std::size_t bodyBeforeMi = attrStart - MessageHeaderSize;
-	bytes copy(raw.begin(), raw.begin() + attrStart); // header + body before MI
+bool locateIntegrity(const bytes &raw, IntegrityLoc &out) {
+	std::size_t offset = MessageHeaderSize;
+	std::uint16_t length = readU16Be(raw.data() + 2);
+	std::size_t end = MessageHeaderSize + length;
+	IntegrityLoc sha1;
+	IntegrityLoc sha256;
+	while (offset + AttributeHeaderSize <= end) {
+		AttrType at = static_cast<AttrType>(readU16Be(raw.data() + offset));
+		std::uint16_t vlen = readU16Be(raw.data() + offset + 2);
+		if (at == AttrType::MessageIntegrity && sha1.attrStart == 0) {
+			sha1.attrStart = offset;
+			sha1.valueOff = offset + AttributeHeaderSize;
+			sha1.valueLen = vlen;
+		} else if (at == AttrType::MessageIntegritySha256 && sha256.attrStart == 0) {
+			sha256.attrStart = offset;
+			sha256.valueOff = offset + AttributeHeaderSize;
+			sha256.valueLen = vlen;
+			sha256.sha256 = true;
+		}
+		offset += AttributeHeaderSize + paddedSize(vlen);
+	}
+	// RFC 8489 §14.5: MESSAGE-INTEGRITY-SHA256 is the stronger check, so prefer
+	// it when a message carries both.
+	if (sha256.attrStart) { out = sha256; return true; }
+	if (sha1.attrStart) { out = sha1; return true; }
+	return false;
+}
+
+bool verifyIntegrityAt(const bytes &raw, const IntegrityLoc &loc,
+                       const unsigned char *key, std::size_t keyLen) {
+	const std::size_t expected = loc.sha256 ? HmacSha256Size : HmacSha1Size;
+	if (!key || keyLen == 0) return false;
+	if (loc.valueLen < expected || loc.valueOff + expected > raw.size()) return false;
+	// Compute the HMAC over header + body before the attribute, with the header
+	// length patched to include the full TLV (header + value).
+	bytes copy(raw.begin(), raw.begin() + loc.attrStart);
+	std::size_t bodyBefore = loc.attrStart - MessageHeaderSize;
 	unsigned char lenBuf[2];
-	writeU16Be(lenBuf, static_cast<std::uint16_t>(bodyBeforeMi + AttributeHeaderSize + HmacSha1Size));
+	writeU16Be(lenBuf, static_cast<std::uint16_t>(bodyBefore + AttributeHeaderSize + expected));
 	std::memcpy(copy.data() + 2, lenBuf, 2);
+	if (loc.sha256) {
+		auto h = crypto::hmacSha256(key, keyLen, copy.data(), copy.size());
+		return std::memcmp(h.data(), raw.data() + loc.valueOff, HmacSha256Size) == 0;
+	}
+	auto h = crypto::hmacSha1(key, keyLen, copy.data(), copy.size());
+	return std::memcmp(h.data(), raw.data() + loc.valueOff, HmacSha1Size) == 0;
+}
+} // namespace
 
-	auto hmac = crypto::hmacSha1(key, keyLen, copy.data(), copy.size());
-	return std::memcmp(hmac.data(), raw.data() + valueOff, HmacSha1Size) == 0;
+bool Message::checkIntegrity(const unsigned char *key, std::size_t keyLen, bool allowMissing) const {
+	IntegrityLoc loc;
+	if (!locateIntegrity(raw, loc)) return allowMissing;
+	return verifyIntegrityAt(raw, loc, key, keyLen);
+}
+
+bool Message::checkIntegrityDual(const unsigned char *sha1Key, std::size_t sha1KeyLen,
+                                 const unsigned char *sha256Key, std::size_t sha256KeyLen,
+                                 bool allowMissing) const {
+	IntegrityLoc loc;
+	if (!locateIntegrity(raw, loc)) return allowMissing;
+	if (loc.sha256) return verifyIntegrityAt(raw, loc, sha256Key, sha256KeyLen);
+	return verifyIntegrityAt(raw, loc, sha1Key, sha1KeyLen);
 }
 
 bool Message::checkFingerprint(bool allowMissing) const {

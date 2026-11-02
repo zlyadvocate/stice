@@ -308,12 +308,12 @@ TEST_CASE("Legal candidate pair: TCP SO-SO", "[candidate][pair]") {
 }
 
 TEST_CASE("CandidatePair priority formula (RFC 8445 §6.1.2.3)", "[candidate][pair]") {
-	// pairPriority = (2^32-1) * MIN(G,D) + 2 * MAX(G,D) + (G > D ? 1 : 0)
-	// Note: uses (2^32-1) instead of 2^32 to avoid uint64 overflow, aligned
-	// with pion-ice candidatepair.go priority().
+	// pairPriority = 2^32 * MIN(G,D) + 2 * MAX(G,D) + (G > D ? 1 : 0)
+	// The RFC coefficient is 2^32 verbatim; inputs are clamped to 2^31-1 so the
+	// product stays inside uint64.
 	std::uint32_t lp = 100u;
 	std::uint32_t rp = 90u;
-	constexpr std::uint64_t k = (1ull << 32) - 1;
+	constexpr std::uint64_t k = 1ull << 32;
 
 	SECTION("controlling local: G=local, D=remote") {
 		// G=100, D=90; min=90, max=100; G>D so +1

@@ -62,6 +62,11 @@ struct Candidate {
 	// Related address (for srflx/relay candidates).
 	bool hasRelated = false;
 	net::AddrRecord related{};
+	// True when this candidate originated as a `.local` mDNS name (either the
+	// unresolved original or the copy the mDNS resolver produced). Used to
+	// enforce draft-ietf-rtcweb-mdns-ice-candidates §3.3.2: a relayed local
+	// candidate MUST NOT be paired with an mDNS remote candidate.
+	bool fromMdns = false;
 
 	// Compute the SDP "a=candidate:" line for this candidate.
 	std::string toSdp() const;

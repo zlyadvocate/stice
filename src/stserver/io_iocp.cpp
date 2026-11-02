@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // Author: zlyadvocate
-// Version: 0.13.1
+// Version: 0.14.1
 // IocpBackend: D plan implementation — Windows IOCP (Input/Output Completion
 // Port) based async IO with a dynamic worker thread pool.
 //

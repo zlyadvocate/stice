@@ -110,7 +110,9 @@ typedef enum stice_ice_tcp_mode {
 	STICE_ICE_TCP_MODE_NONE = 0,
 	STICE_ICE_TCP_MODE_ACTIVE,      // Local active: initiates TCP connections
 	STICE_ICE_TCP_MODE_PASSIVE,     // Local passive: listens for incoming TCP (requires TcpMux)
-	STICE_ICE_TCP_MODE_SO,          // Simultaneous-Open: both directions
+	// experimental: currently behaves like PASSIVE (auto-dial via ufrag
+	// breakout) and emits no `tcptype so` candidates. Kept for API compat.
+	STICE_ICE_TCP_MODE_SO,          // Simultaneous-Open (experimental, see above)
 } stice_ice_tcp_mode_t;
 
 // Multicast DNS mode (aligned with pion-ice MulticastDNSMode).
@@ -244,6 +246,10 @@ STICE_EXPORT stice_agent_t *stice_create(const stice_config_t *config);
 STICE_EXPORT void stice_destroy(stice_agent_t *agent);
 
 STICE_EXPORT int stice_gather_candidates(stice_agent_t *agent);
+// RFC 8445 §9: restart the ICE session. Generates a new ufrag/pwd, discards the
+// current checklist and starts a fresh gathering pass. The application must
+// re-signal the new local description and re-send remote candidates.
+STICE_EXPORT int stice_agent_restart(stice_agent_t *agent);
 STICE_EXPORT int stice_get_local_description(stice_agent_t *agent, char *buffer, size_t size);
 STICE_EXPORT int stice_set_remote_description(stice_agent_t *agent, const char *sdp);
 STICE_EXPORT int stice_add_remote_candidate(stice_agent_t *agent, const char *sdp);

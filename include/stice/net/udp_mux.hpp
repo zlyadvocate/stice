@@ -11,7 +11,15 @@
 //
 // When an agent sends through the mux, the destination address is registered
 // in the address map so that subsequent packets from that address take the
-// fast path (no STUN parsing).
+// fast path (no STUN parsing). The address map only ever holds REMOTE
+// addresses. Loopback packets (an agent sending to the mux's own address,
+// as happens when several agents on the same host share one mux) are
+// attributed to their sender per packet via loopbackPending_: each loopback
+// non-STUN send enqueues (send-time, sender) and the matching recvfrom pairs
+// FIFO, so concurrent senders cannot misattribute each other's in-flight
+// packets. Mixing loopback attribution into the address map (a single "last
+// sender" slot) let a STUN fast-path registration write the DESTINATION agent
+// under the mux's own key and misattribute loopback sends after a restart.
 
 #ifndef STICE_NET_UDP_MUX_HPP
 #define STICE_NET_UDP_MUX_HPP
@@ -21,7 +29,9 @@
 #include "stice/net/poll.hpp"
 #include "stice/net/udp.hpp"
 
+#include <chrono>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -82,8 +92,12 @@ public:
 	int setDiffserv(int ds);
 	// Atomic set -> send -> reset of the DSCP/TOS window on the shared socket.
 	// Serialized on the socket, so concurrent agents cannot interleave their
-	// per-socket TOS state. ds < 0 means "leave TOS alone".
-	int sendtoWithDiffserv(const char *data, std::size_t size, const AddrRecord &dst, int ds);
+	// per-socket TOS state. ds < 0 means "leave TOS alone". ufrag attributes
+	// loopback sends (same discipline as sendto) and registers the remote
+	// destination for fast-path routing; without it, app data sent by muxed
+	// agents would never refresh the loopback sender attribution.
+	int sendtoWithDiffserv(const char *data, std::size_t size, const AddrRecord &dst, int ds,
+	                       const std::string &ufrag);
 
 	// Get the shared socket handle (for logging only).
 	socket_t socketHandle() const { return sock_.valid() ? sock_.handle() : STICE_INVALID_SOCKET; }
@@ -107,6 +121,10 @@ private:
 	// Route a received packet to the correct agent.
 	void routePacket(const char *buf, int len, const AddrRecord &src);
 
+	// True when dst is the mux's own bound address (loopback). Compared by
+	// port only since the mux may bind to 0.0.0.0.
+	bool isLoopbackDst(const AddrRecord &dst) const;
+
 	// Build a canonical key for an address (host:port).
 	static std::string addrKey(const AddrRecord &addr);
 
@@ -116,8 +134,24 @@ private:
 	// ufrag → agent entry.
 	std::unordered_map<std::string, std::shared_ptr<MuxAgentEntry>> agentsByUfrag_;
 
-	// source-address-key → agent entry (fast path).
+	// source-address-key → agent entry (fast path). Remote addresses only.
 	std::unordered_map<std::string, std::shared_ptr<MuxAgentEntry>> agentsByAddr_;
+
+	// Per-packet sender attribution for loopback app data. A global "last
+	// sender" is wrong when two muxed agents send concurrently: the first
+	// sender's packet is still in flight when the second sender overwrites
+	// the attribution, so the first packet gets broadcast as if the second
+	// agent sent it — permanently excluding a sibling from delivery. Instead
+	// every loopback non-STUN send enqueues (send-time, sender) and the
+	// matching recvfrom dequeues the head: a single shared UDP socket
+	// delivers loopback datagrams in send order, so the queue head IS the
+	// in-flight packet's sender. Entries older than the window are dropped
+	// as a safety valve. Entries for removed agents are purged.
+	struct LoopbackSend {
+		std::chrono::steady_clock::time_point sent;
+		std::shared_ptr<MuxAgentEntry> sender;
+	};
+	std::deque<LoopbackSend> loopbackPending_;
 
 	// Per-mux PollRegistry instance (per-agent independent thread model).
 	PollRegistry *pollReg_ = nullptr;

@@ -208,3 +208,135 @@ TEST_CASE("RFC 8863: an all-failed checklist while connecting does not fail imme
 	CHECK(waitFor([&] { return s.state.load() == STICE_STATE_FAILED; }, 60000));
 	stice_destroy(a);
 }
+
+// ---------------------------------------------------------------------------
+// #11: transient check error responses (401/500) get a bounded retry buffer
+// before the pair is failed. A peer that rejects with 401 (wrong key) is
+// answered twice more with fresh transactions; only then does the pair fail.
+// 400 stays terminal (fast-failure product choice for ufrag mismatch).
+// ---------------------------------------------------------------------------
+TEST_CASE("401 error responses are retried twice before the pair fails",
+          "[consent][retry]") {
+	stice_set_log_level(STICE_LOG_LEVEL_DEBUG);
+	{
+		std::lock_guard<std::mutex> lk(g_logMutex);
+		g_logText.clear();
+	}
+	g_capture = true;
+	stice_set_log_handler(captureLog);
+
+	AgentState sa, sb;
+	stice_config_t ca = makeConfig(sa);
+	stice_config_t cb = makeConfig(sb);
+	stice_agent_t *a = stice_create(&ca);
+	stice_agent_t *b = stice_create(&cb);
+	REQUIRE(a != nullptr);
+	REQUIRE(b != nullptr);
+	REQUIRE(stice_gather_candidates(a) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_gather_candidates(b) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] { return sa.gatheringDone.load(); }, 5000));
+	REQUIRE(waitFor([&] { return sb.gatheringDone.load(); }, 5000));
+
+	// Hand A a tampered copy of B's description: same ufrag (so the USERNAME
+	// parses), wrong pwd (so the MESSAGE-INTEGRITY HMAC fails). B answers every
+	// check with 401 per RFC 8489 §9.2.2.
+	char bufA[4096], bufB[4096];
+	REQUIRE(stice_get_local_description(a, bufA, sizeof(bufA)) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_get_local_description(b, bufB, sizeof(bufB)) == STICE_ERR_SUCCESS);
+	std::string sdpB(bufB);
+	auto pwdPos = sdpB.find("a=ice-pwd:");
+	REQUIRE(pwdPos != std::string::npos);
+	sdpB.replace(pwdPos + 10, 1, "9"); // corrupt one key byte, keep the length
+	REQUIRE(stice_set_remote_description(a, sdpB.c_str()) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_remote_description(b, bufA) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_remote_gathering_done(a) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_remote_gathering_done(b) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] { return sa.state.load() == STICE_STATE_CONNECTING; }, 5000));
+
+	// Each 401 consumes one retry slot with a fresh transaction; after the
+	// budget (2) is exhausted the pair fails and the agent reaches FAILED.
+	// All of this is loopback-fast (each retry is one RTT), so a few seconds
+	// is generous.
+	CHECK(waitFor([&] { return sa.state.load() == STICE_STATE_FAILED; }, 10000));
+
+	g_capture = false;
+	stice_set_log_handler(nullptr);
+
+	std::string log;
+	{
+		std::lock_guard<std::mutex> lk(g_logMutex);
+		log = g_logText;
+	}
+	CHECK(log.find("retrying (1/2)") != std::string::npos);
+	CHECK(log.find("retrying (2/2)") != std::string::npos);
+	CHECK(log.find("retrying (3/") == std::string::npos);
+
+	stice_destroy(a);
+	stice_destroy(b);
+}
+
+// ---------------------------------------------------------------------------
+// #10: a live session that loses its peer reports DISCONNECTED first and only
+// reaches the terminal FAILED after a short grace window (pion-aligned
+// lifecycle; the window is also the chance for a TCP redial revival).
+// ---------------------------------------------------------------------------
+TEST_CASE("post-connection loss reports DISCONNECTED before FAILED",
+          "[consent][lifecycle][slow]") {
+	stice_set_log_level(STICE_LOG_LEVEL_ERROR);
+
+	// AgentState plus lifecycle flags for the state callback. `base` is the
+	// first member so exchangeDescriptions() can operate on it directly.
+	struct Tracker {
+		AgentState base;
+		std::atomic<bool> wasConnected{false};
+		std::atomic<bool> sawDisconnected{false};
+	} ta;
+	AgentState sb;
+
+	stice_config_t cfgA{};
+	cfgA.cb_state_changed = [](stice_agent_t *, stice_state_t state, void *user_ptr) {
+		auto *t = static_cast<Tracker *>(user_ptr);
+		t->base.state.store(state);
+		if (state == STICE_STATE_CONNECTED || state == STICE_STATE_COMPLETED)
+			t->wasConnected.store(true);
+		else if (state == STICE_STATE_DISCONNECTED && t->wasConnected.load())
+			t->sawDisconnected.store(true);
+	};
+	cfgA.cb_candidate = [](stice_agent_t *, const char *cand, void *user_ptr) {
+		auto *t = static_cast<Tracker *>(user_ptr);
+		std::lock_guard<std::mutex> lk(t->base.candidatesMutex);
+		t->base.candidates.emplace_back(cand);
+	};
+	cfgA.cb_gathering_done = [](stice_agent_t *, void *user_ptr) {
+		static_cast<Tracker *>(user_ptr)->base.gatheringDone.store(true);
+	};
+	cfgA.cb_recv = [](stice_agent_t *, const char *, size_t, void *) {};
+	cfgA.user_ptr = &ta;
+	cfgA.bind_address = nullptr;
+	cfgA.local_port_range_begin = 0;
+	cfgA.local_port_range_end = 0;
+
+	auto cfgB = makeConfig(sb);
+	stice_agent_t *a = stice_create(&cfgA);
+	stice_agent_t *b = stice_create(&cfgB);
+	REQUIRE(a != nullptr);
+	REQUIRE(b != nullptr);
+	REQUIRE(stice_gather_candidates(a) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_gather_candidates(b) == STICE_ERR_SUCCESS);
+	exchangeDescriptions(a, ta.base, b, sb);
+	REQUIRE(waitFor([&] {
+		auto as = ta.base.state.load();
+		auto bs = sb.state.load();
+		return (as == STICE_STATE_CONNECTED || as == STICE_STATE_COMPLETED) &&
+		       (bs == STICE_STATE_CONNECTED || bs == STICE_STATE_COMPLETED);
+	}, 15000));
+
+	// Kill the peer: A's consent keepalives now go unanswered. Consent expires
+	// at 30 s; the DISCONNECTED report must land before the terminal FAILED.
+	stice_destroy(b);
+
+	CHECK(waitFor([&] { return ta.sawDisconnected.load(); }, 45000));
+	CHECK(waitFor([&] { return ta.base.state.load() == STICE_STATE_FAILED; }, 15000));
+
+	stice_destroy(a);
+}

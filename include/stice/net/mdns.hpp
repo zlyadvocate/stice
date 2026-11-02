@@ -79,6 +79,14 @@ public:
 	// Returns false if the client is not initialized or the mode is Disabled.
 	bool query(const std::string &hostname, MDnsQueryCallback cb);
 
+	// Register an additional (hostname, address) pair to answer queries for.
+	// draft-ietf-rtcweb-mdns-ice-candidates §3.1 requires a DISTINCT hostname
+	// per local address, so an agent gathering several interfaces registers one
+	// record per address instead of advertising a single name for all of them
+	// (which would let a peer correlate them into one device).
+	// Returns false when the client is not in QueryAndGather mode.
+	bool addRecord(const std::string &hostname, const std::string &addr);
+
 	// Check if a hostname is an mDNS name (ends with ".local").
 	static bool isMDnsName(const std::string &hostname);
 
@@ -87,6 +95,10 @@ public:
 
 	MulticastDNSMode mode() const { return mode_; }
 	const std::string &hostname() const { return hostname_; }
+	// True when init() could not bind the standard mDNS port (5353) and silently
+	// dropped to QueryOnly. The agent surfaces this so a degraded resolver is
+	// observable instead of looking like a healthy QueryAndGather session.
+	bool degraded() const { return degraded_; }
 
 	void stop();
 
@@ -117,14 +129,16 @@ private:
 
 	// Encode a DNS query message.
 	std::vector<unsigned char> encodeQuery(const std::string &name, std::uint16_t type) const;
-	// Encode a DNS response message.
+	// Encode a DNS response message. `ttl` 0 is a goodbye (record removed).
 	std::vector<unsigned char> encodeResponse(std::uint16_t id, const std::string &name,
-	                                          std::uint16_t type,
-	                                          const std::string &addr) const;
-	// Parse a DNS message. Returns true on success.
+	                                          std::uint16_t type, const std::string &addr,
+	                                          std::uint32_t ttl) const;
+	// Parse a DNS message. Returns true on success. `authorities` receives the
+	// authority (NSEC) records used to fail a query early on a negative answer.
 	bool parseMessage(const unsigned char *data, std::size_t size, DnsHeader &hdr,
 	                  std::vector<DnsQuestion> &questions,
-	                  std::vector<DnsAnswer> &answers) const;
+	                  std::vector<DnsAnswer> &answers,
+	                  std::vector<DnsAnswer> &authorities) const;
 	// Parse a DNS name at the given offset. Returns the name and the new offset.
 	std::string parseName(const unsigned char *data, std::size_t size, std::size_t &offset) const;
 	// Encode a DNS name (labels).
@@ -135,13 +149,31 @@ private:
 
 	// Send a multicast query for all pending queries.
 	void sendPendingQueries();
+	// Send one A/AAAA response with the cache-flush bit set; `ttl` 0 is a
+	// goodbye. `dst` selects the transport family: the response goes out on the
+	// IPv4 or IPv6 socket matching dst->sa_family. When `multicast` is true the
+	// packet is sent to the mDNS multicast group for that family.
+	void sendRecordResponse(const std::string &name, std::uint16_t type,
+	                        const std::string &addr, std::uint32_t ttl,
+	                        const sockaddr *dst, bool multicast);
+	// Send a TTL-0 goodbye for every registered record so peers drop the name
+	// immediately when this client stops (RFC 6762 §10.1).
+	void sendGoodbyes();
 
 	MulticastDNSMode mode_ = MulticastDNSMode::Disabled;
-	std::string hostname_; // e.g. "uuid.local"
-	std::string hostnameDot_; // "uuid.local." (with trailing dot)
+	bool degraded_ = false;
+	std::string hostname_; // display label only; per-address names live in records_
 	std::string localAddr_; // local IP for responses
+	// Per-address records: lowercased hostname -> address. Guarded by
+	// recordsMutex_ because addRecord() runs on the agent/gather thread while
+	// run() answers queries on the mDNS thread.
+	std::map<std::string, std::string> records_;
+	std::mutex recordsMutex_;
 
 	socket_t sock_ = STICE_INVALID_SOCKET;
+	// IPv6 transport (ff02::fb). Optional: created on a best-effort basis, so a
+	// host without usable IPv6 simply keeps the IPv4-only resolver.
+	socket_t sock6_ = STICE_INVALID_SOCKET;
 	std::atomic<bool> running_{false};
 	std::thread thread_;
 
@@ -154,9 +186,18 @@ private:
 	};
 	std::mutex queriesMutex_;
 	std::vector<PendingQuery> queries_;
+	// RFC 6762 §10: cache answers for their advertised TTL so repeated
+	// resolution of the same .local name does not re-query the network. Guarded
+	// by queriesMutex_.
+	struct CachedAnswer {
+		std::string addr;
+		std::chrono::steady_clock::time_point expiry;
+	};
+	std::map<std::string, CachedAnswer> cache_;
 
-	// Multicast destination.
+	// Multicast destinations.
 	sockaddr_in mcastAddr4_{};
+	sockaddr_in6 mcastAddr6_{};
 };
 
 } // namespace stice::net

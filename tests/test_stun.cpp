@@ -950,7 +950,7 @@ TEST_CASE("Fuzz: random garbage bytes rejected as STUN", "[stun][fuzz]") {
 
 TEST_CASE("Fuzz: ChannelData with invalid channel number", "[turn][fuzz]") {
 	using namespace stice::turn;
-	// Channel number 0x0001 is invalid (valid range: 0x4000-0x7FFF).
+	// Channel number 0x0001 is invalid (valid range: 0x4000-0x4FFF).
 	unsigned char buf[] = {0x00, 0x01, 0x00, 0x04, 0xDE, 0xAD, 0xBE, 0xEF};
 	REQUIRE_FALSE(isChannelData(buf, sizeof(buf)));
 }

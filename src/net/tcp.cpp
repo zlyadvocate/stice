@@ -18,6 +18,7 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <mstcpip.h>
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -29,6 +30,11 @@
 namespace stice::net {
 
 namespace {
+
+// Upper bound on the unconsumed receive backlog. An RFC 4571 frame is at most
+// 64 KiB and the poll thread drains the socket on every readable event, so a
+// backlog this deep only happens when the application has stopped reading.
+constexpr std::size_t kMaxRecvBuffer = 8u * 1024 * 1024;
 
 // Socket options shared by every TCP transport: outgoing connects
 // (beginConnect) and accepted sockets (attach). Kept in one place so the two
@@ -48,9 +54,9 @@ void applyTcpSocketOptions(socket_t s) {
 	// control between refreshes, RFC 6062 data pipes between bursts) and be
 	// silently reaped by a NAT/middlebox, which then surfaces as a one-way
 	// stall with no local error. SO_KEEPALIVE probes the peer so the failure is
-	// reported here instead. Linux gets a tightened probe schedule; Windows has
-	// no per-socket tuning before Win10 1709 and ICE/TURN keepalives already run
-	// above this layer there.
+	// reported here instead. Linux uses TCP_KEEPIDLE/INTVL/CNT and Windows uses
+	// SIO_KEEPALIVE_VALS, both tuned to 30 s idle / 10 s probes; the Windows
+	// default (~2 h idle) is far too slow for NAT-reaped relayed connections.
 	setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char *>(&on), sizeof(on));
 #ifdef __linux__
 	int keepIdle = 30;  // first probe after 30 s idle
@@ -59,6 +65,17 @@ void applyTcpSocketOptions(socket_t s) {
 	setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, reinterpret_cast<const char *>(&keepIdle), sizeof(keepIdle));
 	setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, reinterpret_cast<const char *>(&keepIntvl), sizeof(keepIntvl));
 	setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, reinterpret_cast<const char *>(&keepCnt), sizeof(keepCnt));
+#elif defined(_WIN32)
+	// Windows defaults to a ~2 h idle before the first probe, which is useless
+	// for detecting a NAT-reaped relayed connection. SIO_KEEPALIVE_VALS gives
+	// the same 30 s / 10 s schedule as the Linux branch without requiring the
+	// Win10 1709+ TCP_KEEPIDLE socket options.
+	tcp_keepalive ka{};
+	ka.onoff = 1;
+	ka.keepalivetime = 30000;   // first probe after 30 s idle
+	ka.keepaliveinterval = 10000; // then every 10 s
+	DWORD bytesOut = 0;
+	WSAIoctl(s, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), nullptr, 0, &bytesOut, nullptr, nullptr);
 #endif
 	// SO_LINGER{1,0} (RST on close, skipping TIME_WAIT) was tried here and
 	// REVERTED: it aborts the connection while the peer may still have unread
@@ -132,7 +149,8 @@ void TcpTransport::setConnectTimeoutMs(int timeoutMs) {
 }
 
 bool TcpTransport::beginConnect(const AddrRecord &dst, const std::string &sni, bool useTls,
-                                bool skipVerify, const std::string &caFile) {
+                                bool skipVerify, const std::string &caFile,
+                                const AddrRecord *bindLocal) {
 	close();
 	useTls_ = useTls;
 	skipVerify_ = skipVerify;
@@ -144,6 +162,15 @@ bool TcpTransport::beginConnect(const AddrRecord &dst, const std::string &sni, b
 		STICE_LOG_WARN("TCP socket creation failed, errno=%d", sticeSockerrno);
 		state_ = TcpState::Failed;
 		return false;
+	}
+	// P1-C6: bind the outgoing connection to a specific local address so the
+	// local candidate is a gathered host address. A bind failure is non-fatal
+	// (the OS default route is still usable), so it only logs.
+	if (bindLocal && bindLocal->addr.ss_family == dst.addr.ss_family && bindLocal->len > 0) {
+		if (::bind(sock_, reinterpret_cast<const struct sockaddr *>(&bindLocal->addr),
+		           bindLocal->len) != 0) {
+			STICE_LOG_WARN("TCP bind to local address failed, errno=%d", sticeSockerrno);
+		}
 	}
 	setNonBlocking(sock_);
 	applyTcpSocketOptions(sock_);
@@ -292,6 +319,17 @@ short TcpTransport::onReadable() {
 			if (recvOff_ > 0 && (recvOff_ >= 1048576 || recvOff_ >= recvBuf_.size())) {
 				recvBuf_.erase(recvBuf_.begin(), recvBuf_.begin() + recvOff_);
 				recvOff_ = 0;
+			}
+			// Byte cap (P2-T8): an application that stops calling recv() must not
+			// be able to grow this buffer without bound. An RFC 4571 frame is at
+			// most 64 KiB, so a backlog this deep means the consumer is gone or
+			// wedged; failing the transport is the only safe answer.
+			const std::size_t pending = recvBuf_.size() - recvOff_;
+			if (pending + n > kMaxRecvBuffer) {
+				STICE_LOG_WARN("TcpTransport: receive backlog %zu + %zu exceeds %zu bytes, failing transport",
+				               pending, n, kMaxRecvBuffer);
+				state_ = TcpState::Failed;
+				return 0;
 			}
 			recvBuf_.insert(recvBuf_.end(), tmp, tmp + n);
 		}
@@ -451,8 +489,9 @@ bool TcpTransport::send(const char *data, std::size_t size) {
 		// never drains), the queue would otherwise grow without bound and the
 		// caller would never observe backpressure. Rejecting the write (false)
 		// propagates EAGAIN-like backpressure up to sendRaw/stice_send, aligning
-		// TCP with the UDP path's negative-errno semantics.
-		const std::size_t kSendQueueHighWater = 16 * 1024 * 1024; // 16 MiB
+		// TCP with the UDP path's negative-errno semantics. Uses the same
+		// high-water mark reported by sendQueueFull() so the "full" signal and
+		// the rejection point cannot diverge.
 		if (sendQueue_.size() > kSendQueueHighWater) {
 			STICE_LOG_WARN("TcpTransport: send queue at high watermark (%zu), rejecting write",
 			               sendQueue_.size());

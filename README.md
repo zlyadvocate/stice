@@ -1,7 +1,7 @@
 # stice
 
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
-[![Version](https://img.shields.io/badge/version-0.13.1-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-0.14.1-blue.svg)]()
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)]()
 
 **C++17 ICE + TURN client library, ported from [pion/webrtc](https://github.com/pion/webrtc) (Go), designed as a drop-in replacement for [libjuice](https://github.com/paullouisageneau/libjuice).**
@@ -14,27 +14,67 @@ stice implements the ICE (Interactive Connectivity Establishment, RFC 8445) agen
 |----------|--------------|:--------------:|:-----------------:|
 | STUN Message | RFC 8489 | ✅ | ✅ |
 | ICE Agent | RFC 8445 | ✅ | — |
-| ICE-TCP (TCP candidates) | RFC 6544 | ✅ active/passive/SO | ✅ passive (via TCPMux) |
+| ICE-TCP (TCP candidates) | RFC 6544 | ✅ active/passive（SO: experimental，仅对称破缺框架） | ✅ 6062 中继被动（非 ICE-TCP TCPMux） |
 | TURN (UDP relay) | RFC 8656 | ✅ | ✅ |
 | TURN over TCP (control) | RFC 8656 | ✅ | ✅ |
 | TURN over TLS | RFC 8656 | ✅ | — |
-| TURN TCP Allocations (Mode-A/B) | RFC 6062 | ✅ CONNECT/CONNECTION-ATTEMPT/CONNECTION-BIND | ✅ data pipe relay |
-| mDNS Candidates | draft-ietf-rtcweb-mdns-ice-candidates | ✅ query/gather | — |
+| TURN TCP Allocations (Mode-A/B) | RFC 6062 | ✅ opt-in（`STICE_TURN_TCP_RFC6062`）CONNECT/CONNECTION-ATTEMPT/CONNECTION-BIND | ✅ data pipe relay（精简 Mode-B 子集） |
+| mDNS Candidates | draft-ietf-rtcweb-mdns-ice-candidates | ✅ gather（本地宣告）+ query（远端 .local 解析，库内自带组播查询） | — |
 | Trickle ICE | draft-ietf-ice-trickle | ✅ | — |
 
 ## Features
 
-- **ICE Agent (RFC 8445)** — full connectivity checks, aggressive/regular nomination, trickle ICE, ICE restart, controlled/controlling role
-- **STUN client (RFC 8489)** — server-reflexive candidate gathering, multi-STUN parallel queries, authentication
-- **TURN client (RFC 8656 + RFC 6062)** — UDP/TCP/TLS transports; channel data; permissions; **RFC 6062 TCP allocations** with Mode-A control connection and Mode-B data pipe (CONNECT / CONNECTION-ATTEMPT / CONNECTION-BIND / CONNECTION-ID)
-- **ICE-TCP (RFC 6544)** — active / passive / simultaneous-open modes, TCP priority offset, per-pair TCPMux for passive listeners
-- **Multicast DNS (mDNS)** — query-only and query-and-gather modes for local candidate privacy
+- **ICE Agent (RFC 8445)** — full connectivity checks, aggressive/regular nomination, trickle ICE, controlled/controlling role; ICE restart (`stice_agent_restart`) starts a new generation with fresh ufrag/pwd and a clean checklist
+- **STUN client (RFC 8489)** — server-reflexive candidate gathering, multi-STUN parallel queries, authentication; responses are expected to carry XOR-MAPPED-ADDRESS, and a legacy response with only MAPPED-ADDRESS (removed in RFC 8489) is still accepted with a warning
+- **TURN client (RFC 8656 + RFC 6062)** — UDP/TCP/TLS transports; channel data; permissions; **RFC 6062 TCP allocations** (opt-in via `STICE_TURN_TCP_RFC6062`) with Mode-A control connection and Mode-B data pipe (CONNECT / CONNECTION-ATTEMPT / CONNECTION-BIND / CONNECTION-ID)
+- **ICE-TCP (RFC 6544)** — active / passive modes, TCP priority offset, per-pair TCPMux for passive listeners; simultaneous-open is **experimental** (symmetric-breakout framework only, no `so` candidates are emitted)
+- **Multicast DNS (mDNS)** — local announcement (gather) plus query-mode resolution of remote `.local` candidates through the library's own multicast resolver; names are random UUIDv4 labels, so the draft's SHOULD-level conflict probing is skipped (a colliding name is not detected)
 - **NAT 1:1 Address Rewrite** — replace or append external IP mappings for host/srflx/relay candidates
 - **UDP / TCP Multiplexing** — share a single socket across multiple agents (UDPMux / TCPMux)
 - **Configurable Pairing Strategy** — RFC 8445 strict, serial, limited-concurrent, phased-UDP-first scheduling; aggressive / regular / stable nomination; RFC 6062 TCP-relay fallback policies; lazy Mode-B pre-allocation
 - **Built-in TURN Server (`stserver`)** — UDP + TCP listeners, STUN binding, TURN UDP relay, TURN TCP relay (RFC 6062 Mode-B data piping), ICE-TCP passive candidate support; epoll / IOCP / select backends; multi-threaded UDP-listener reader pool and a **local-relay (hairpin) shortcut** for co-located peers
 - **libjuice Compatibility** — `juice_*` C API drop-in replacement via `juice_compat.cpp`
 - **Cross-platform** — Windows (MSVC/MinGW), Linux, macOS
+
+### Known limitations and documented deviations
+
+- **Single ICE component.** Only component 1 is gathered, paired and checked; a
+  separate RTCP component is not supported. This matches a BUNDLE-only media
+  stack (one 5-tuple per session) and is the same restriction libjuice applies.
+- **No ICE-lite agent role.** `a=ice-lite` is serialized and parsed from SDP, but
+  the agent never acts as a lite implementation (it always runs full
+  connectivity checks). A lite peer is handled correctly as a peer; acting as
+  lite is a reserved extension.
+- **mDNS conflict probing.** Advertised names are random UUIDv4 labels, so the
+  draft's SHOULD-level conflict probing is skipped: a name collision would not
+  be detected. See the mDNS feature bullet above.
+- **`raddr`/`rport` compatibility hack.** srflx/relay candidates are serialized
+  with `raddr 0.0.0.0 rport 0` for Firefox interoperability, which is not the
+  real base address required by RFC 8839 §5.1.1. Set `STICE_SDP_RADDR_HACK=0` to
+  emit spec-clean lines.
+- **Selected-candidate introspection.** `stice_get_selected_candidates()` returns
+  the SDP form of the pair, so in `QueryAndGather` mDNS mode the local host
+  candidate appears under its `.local` name. `stice_get_selected_addresses()`
+  returns the raw resolved addresses and therefore does reveal the IP.
+- **Consent keepalive cadence.** Every profile now checks consent every 5 s for
+  UDP (the low-power profile previously used 15 s, which left too little
+  margin under the 30 s timeout once jitter was applied), jittered ±20% and
+  stretched to 10 s on idle sessions that have stopped carrying application
+  data. Inbound application data also refreshes consent (RFC 7675 mutual).
+- **Checking wall clock vs transaction budget.** The whole check phase is
+  capped at 30 s (`MaxCheckingWallMs`, pion-aligned), while one pair's STUN
+  transaction budget is 31.5 s (Rc=7 at 500 ms exponential backoff capped at
+  8 s) and the PAC backstop is 31.5 s. The agent wall clock normally ends the
+  phase first; the longer per-transaction budget only covers the last
+  in-flight check.
+- **Error-response retries.** Transient connectivity-check errors (401/500) are
+  retried up to 2 times before the pair fails; a 400 (ufrag/pwd mismatch) fails
+  the pair immediately, because it cannot heal within a generation.
+- **stserver answers 420 before authentication.** Unknown comprehension-required
+  attributes are reported to unauthenticated clients so a misconfigured
+  endpoint fails fast with the real cause. RFC 8489 §9.2.1 authenticates first,
+  but this ordering is not a MUST-level violation and no interop issue has been
+  observed.
 
 ## Project Structure
 
@@ -106,6 +146,22 @@ ctest --test-dir build --output-on-failure
 | `STICE_BUILD_STSERVER` | `ON` | Build the built-in TURN/STUN server (`stserver`) |
 | `STICE_USE_OPENSSL` | `ON` | Use OpenSSL for crypto and TURN/TLS |
 | `BUILD_SHARED_LIBS` | `OFF` | Build shared library (default: static) |
+
+### TLS backends and certificate verification
+
+TURN-over-TLS is built on exactly one backend, selected at configure time:
+OpenSSL (default), GnuTLS (`STICE_USE_GNUTLS=ON`), or Mbed TLS (`STICE_USE_MBEDTLS=ON`).
+
+- **OpenSSL / GnuTLS** — the peer is verified against the platform trust store
+  (OpenSSL `SSL_CTX_set_default_verify_paths`, GnuTLS
+  `gnutls_certificate_set_x509_system_trust`), so Linux and macOS verify out of
+  the box. An explicit bundle can be supplied with `STICE_TLS_CA_FILE`.
+- **Mbed TLS** — ships no OS trust store and does not locate one. Without
+  `STICE_TLS_CA_FILE` the verifying session fails closed (the connection is
+  refused instead of degrading to `VERIFY_NONE`); point `STICE_TLS_CA_FILE` at
+  a PEM bundle to verify.
+- `skip_tls_verify` (or the per-server flag) disables verification for
+  self-signed test rigs on every backend.
 
 ### Integration as a Subproject
 

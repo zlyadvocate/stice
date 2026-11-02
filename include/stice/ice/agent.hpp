@@ -46,6 +46,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace stice::ice {
@@ -133,8 +134,10 @@ private:
 // Timing constants (mirrors libjuice agent.h).
 constexpr int MinStunRetransmissionTimeoutMs = 500;
 constexpr int LastStunRetransmissionTimeoutMs = 500 * 16; // 8000
-constexpr int MaxStunCheckRetransmissions = 6;            // ~39.5s total
-constexpr int MaxStunServerRetransmissions = 5;
+// Rc=7 retransmissions at 500ms-exp backoff capped at 8s:
+// 0.5+1+2+4+8+8+8 = 31.5 s total (RFC 5389 §7.2.1 default). The previous
+// value 6 (23.5 s) plus a stale "~39.5s" comment understated both budgets.
+constexpr int MaxStunCheckRetransmissions = 7;            // 31.5s total
 constexpr int StunTcpTimeoutMs = 8000;
 // Soft gathering timeout. If srflx/relay entries stay pending (STUN server
 // unreachable, or high-load packet loss) the gathering MUST still complete so
@@ -168,8 +171,31 @@ constexpr int GatherLockTimeoutMs = 1000;
 constexpr int StunPacingTimeMs = 50; // Ta
 constexpr int StunKeepalivePeriodMs = 15000;
 // RFC 8863 (Patiently Awaiting Connectivity) recommends the PAC timer be the
-// agent's connectivity check transaction timeout, i.e. 39.5 s.
-constexpr int IcePacTimeoutMs = 39500;
+// agent's connectivity check transaction timeout, i.e. 31.5 s at Rc=7
+// (0.5+1+2+4+8+8+8, RFC 5389 §7.2.1). It sits just above MaxCheckingWallMs
+// (30 s) on purpose: the agent wall clock normally ends the phase first and the
+// PAC deadline is the backstop for the "more pairs may still appear" case.
+constexpr int IcePacTimeoutMs = 31500;
+// Agent-level ceiling on the whole connectivity-check phase while CONNECTING
+// (pion agent.go:696 uses the same 30 s). Without it a peer that never
+// answers (no end-of-candidates to short-circuit) waits out the full PAC
+// window before reporting failure — 9.5 s slower than pion for the same
+// terminal outcome.
+constexpr int MaxCheckingWallMs = 30000;
+// Bounded retry budget for transient connectivity-check error responses
+// (401/500) before the pair is failed: a 401 can race the credential exchange
+// across an ICE restart, 500 can be momentary overload. 400 stays terminal
+// (ufrag/pwd mismatch never heals within a generation; fast-failure choice).
+constexpr int MaxStunErrorResponseRetries = 2;
+// Total wall-clock budget for a TCP redial campaign. reconnectAttempts resets
+// on every transient success, so a flapping link could otherwise redial
+// forever; the budget ends the campaign regardless.
+constexpr int TcpRedialWallBudgetMs = 60000;
+// Grace window between the DISCONNECTED report and the terminal FAILED after a
+// live session loses all pairs (consent expiry, selected-link loss). pion
+// reports Disconnected before Failed; the window gives the application time to
+// observe the loss and lets an in-flight TCP redial revive the session.
+constexpr int DisconnectedGraceMs = 5000;
 constexpr int ConsentTimeoutMs = 30000;
 // RFC 7675 §5.1: the consent check period is randomized within [0.8, 1.2] x the
 // basic period, "SHOULD set a default interval of 5 seconds" -> 4-6 s, and
@@ -225,6 +251,11 @@ struct StunEntry {
 	std::chrono::milliseconds retransmissionTimeout{MinStunRetransmissionTimeoutMs};
 	int retransmissions = 0;
 	bool transactionIdExpired = true;
+	// Error-response retry budget (#11): 400/401/500 responses are retried a
+	// bounded number of times before the pair is failed (pion agent.go:1730
+	// keeps the full retransmission budget on error responses; we cap at 2
+	// retries so a deterministic 401 cannot stretch the handshake).
+	int errorRetries = 0;
 	// For TURN RELAY entries: the underlying TURN client.
 	std::unique_ptr<turn::Client> turn;
 	// For TURN RELAY entries over TCP/TLS: dedicated control transport +
@@ -269,6 +300,26 @@ public:
 
 	// C API entry points.
 	int gatherCandidates();
+    // RFC 8445 §9: ICE restart. New ufrag/pwd, cleared checklist and a fresh
+    // gathering pass; the peer must be re-signalled with the new local
+    // description (and re-send its candidates).
+    int restart();
+    // Drop the checklist, nomination and every in-flight check entry. Shared by
+    // Agent::restart and the setRemoteDescription handshake-completion path:
+    // pairs hold raw pointers into remote_.candidates, so the checklist MUST be
+    // reset before remote_ is replaced by a new generation's description.
+    void resetChecklist();
+	// N-11: monotonic remote-generation guard. `remoteGenUfrag_/remoteGenPwd_`
+	// hold the credentials of the generation last applied from the peer (kept
+	// across our own restart, which clears remote_ but not the peer's last known
+	// generation). Every superseded pair is appended to `retiredRemoteCreds_`,
+	// so a description delivered late from an older generation is recognised and
+	// dropped instead of triggering a second restart and re-tearing the checklist
+	// that is already converging. The most recent generation is still accepted:
+	// a peer that accepts our restart without restarting itself re-sends its
+	// (unchanged) current description, which must keep working.
+	void noteRemoteGeneration(const Description &d);
+	bool isRetiredRemoteGeneration(const Description &d) const;
 	int getLocalDescription(char *buf, std::size_t size) const;
 	int setRemoteDescription(const char *sdp);
 	int addRemoteCandidate(const char *sdp);
@@ -308,9 +359,21 @@ public:
 
 	// PollParticipant interface (called from the PollRegistry thread).
 	socket_t udpSocket() const override { return sock_.valid() ? sock_.handle() : STICE_INVALID_SOCKET; }
-	bool hasTcp() const override { return tcpTransport_ != nullptr; }
+	// Legacy single-slot TCP hooks: they expose the first active connection so
+	// older dispatch paths keep working. Every connection is also enumerated
+	// through the indexed ICE-TCP slots below.
+	bool hasTcp() const override {
+		std::lock_guard<std::recursive_mutex> lock(mutex_);
+		for (const auto &c : tcpConns_)
+			if (c.transport) return true;
+		return false;
+	}
 	socket_t tcpSocket() const override;
 	short tcpDesiredEvents() const override;
+	int iceTcpSlotCount() const override;
+	socket_t iceTcpSocketAt(int i) const override;
+	short iceTcpDesiredEventsAt(int i) const override;
+	void onIceTcpEventsSock(socket_t sock, short events) override;
 	// Indexed TURN-TCP slots: one control transport per TCP/TLS relay entry
 	// (base-class legacy single-slot hooks stay at their defaults).
 	int turnTcpSlotCount() const override;
@@ -338,9 +401,12 @@ private:
 	                     const net::AddrRecord *mapped = nullptr);
 	// Send a STUN Binding Indication keepalive / consent freshness request.
 	void sendKeepalive(StunEntry &e);
-	// Build a Binding success/error response to an incoming request.
+	// Build a Binding success/error response to an incoming request. When
+	// `unknown` is non-null, an UNKNOWN-ATTRIBUTES attribute listing those
+	// comprehension-required types is attached (420 Unknown Attribute).
 	void sendBindingResponse(const stun::Message &req, const net::AddrRecord &dst,
-	                         int errorCode);
+	                         int errorCode,
+	                         const std::vector<std::uint16_t> *unknown = nullptr);
 	// Process an incoming STUN message (request / response / indication).
 	// `transport` indicates the transport the message arrived on (UDP/TCP),
 	// used to create peer-reflexive candidates with the correct transport type.
@@ -363,15 +429,49 @@ private:
 	// Aligned with pion-ice addRemotePassiveTCPCandidate.
 	void addRemotePassiveTcpCandidate(const Candidate &remote);
 	// Establish an active TCP connection to a remote passive candidate.
-	// Returns the local port used, or 0 on failure.
-	bool beginActiveTcpConnect(const net::AddrRecord &remoteAddr, net::AddrRecord &localAddr);
+	// ICE-TCP keeps one connection per active pair (RFC 6544 §7.1/§12); the
+	// helpers below locate a connection by socket fd, by pair, or return the
+	// primary one used by the legacy single-slot hooks.
+	struct TcpConnection;
+	TcpConnection *findTcpConnBySocket(socket_t sock);
+	TcpConnection *tcpConnForPair(const CandidatePair *pair);
+	TcpConnection *primaryTcpConn();
+	bool hasConnectedTcpForPair(const CandidatePair *pair) const;
+	// Drive readiness/failure for one connection and, on a lost selected
+	// connection, schedule the RFC 6544 §11.1 redial.
+	void onTcpConnEvents(TcpConnection &conn, short events);
+	bool startTcpConn(TcpConnection &conn, const net::AddrRecord &remoteAddr,
+	                  const std::string &sni);
+	void scheduleTcpReconnect(TcpConnection &conn);
+      // RFC 6544 §8: after ICE completes, close every direct TCP connection
+      // that does not carry the selected/nominated pair.
+      void closeUnselectedTcpConns();
 	// Find or create a STUN entry for a pair (or nullptr).
 	StunEntry *findEntry(CandidatePair *pair);
+    // Reclaim Check entries that can never fire again (Cancelled/Failed on a
+    // pair that is neither selected nor nominated). Returns true when the
+    // entry table has room afterwards.
+    bool reclaimDeadEntries();
+	// Drop terminal Failed pairs (RFC 8445 §6.1.2.4 pruning) when the pair
+	// table is full, so a later valid pair can still be added. Only pairs that
+	// are neither selected/nominated nor referenced by a STUN entry or a live
+	// TCP connection are removed. Returns true when at least one pair was
+	// dropped.
+	bool pruneFailedPairs();
 	// Arm a STUN entry's next transmission time with the given delay.
 	void armTransmission(StunEntry &e, int delayMs);
 	void armKeepalive(StunEntry &e);
 	// Sort the candidate pairs by priority descending.
 	void updateOrderedPairs();
+	// Recompute every existing pair's priority under the current role
+	// (RFC 8445 §7.3.1.1 MUST after a role switch), then re-sort.
+	void updateAllPairPriorities();
+	// Flip the local role after a 487 / ICE-CONTROLLING conflict, recomputing
+	// all pair priorities (and optionally the tiebreaker).
+	void applyRoleSwitch();
+	// RFC 8445 §7.2.5.3.2: classify the valid pair from the response's mapped
+	// address instead of assuming the generating pair is valid.
+	void classifyValidPair(CandidatePair &generating, const net::AddrRecord &mapped);
 	// Arm the next Frozen pair(s) per the active pairing-strategy schedule
 	// mode (RFC8445_STRICT / SERIAL / LIMITED_CONCURRENT / PHASED_UDP_FIRST).
 	void armNextFrozenPair();
@@ -408,8 +508,11 @@ private:
 	bool isNominatable(const CandidatePair *pair) const;
 	// Trigger the user callbacks (state, candidate, gathering_done, recv).
 	void emitCandidate(const Candidate &c);
+	// Deliver candidates buffered while trickle was disabled. Called once from
+	// checkGatheringComplete, right before gathering_done.
+	void flushDeferredCandidates();
 	void emitGatheringDone();
-	void emitRecv(const char *data, std::size_t size);
+	void emitRecv(const char *data, std::size_t size, CandidatePair *onPair = nullptr);
 	void emitState(stice_state_t s);
 	// Resolve a hostname:port into a list of AddrRecords.
 	std::vector<net::AddrRecord> resolveServer(const std::string &host, std::uint16_t port,
@@ -451,9 +554,10 @@ private:
 	void handleInboundUdp(const char *buf, int len, const net::AddrRecord &src,
 	                      CandidateTransport transport = CandidateTransport::UDP);
 	// Demultiplex inbound TCP: RFC 4571 framed STUN / app data.
-	void handleInboundTcp();
+	void handleInboundTcp(TcpConnection &conn);
 	// Process a single de-framed TCP packet (from TcpMuxConn or handleInboundTcp).
-	void handleInboundTcpPacket(const char *data, int len, const net::AddrRecord &src);
+	void handleInboundTcpPacket(const char *data, int len, const net::AddrRecord &src,
+                                    TcpConnection *conn);
 	// Demultiplex inbound TURN TCP: self-delimited STUN / ChannelData frames
 	// parsed by StunConn, then routed to the TURN client.
 	void handleInboundTurnTcp(StunEntry &entry);
@@ -484,7 +588,7 @@ private:
 	// Check if a candidate pair uses TCP transport.
 	bool pairIsTcp(const CandidatePair *p) const;
 	// Check if a candidate pair uses TURN TCP-relayed transport (RFC 6062).
-	// Such pairs route data through turnDataConn_ instead of tcpTransport_.
+	// Such pairs route data through turnDataConn_ instead of tcpConns_.
 	bool pairIsTurnTcpRelay(const CandidatePair *p) const;
 	// Begin a TURN over TCP/TLS connection for one relay entry. Called from
 	// createRelayEntry when the transport is TCP or TLS. The transport is
@@ -574,9 +678,28 @@ private:
 	// Optional shared TCP mux for ICE-TCP passive mode.
 	net::TCPMux *tcpMux_ = nullptr;
 	bool tcpMuxRegistered_ = false;
-	std::unique_ptr<net::TcpTransport> tcpTransport_;
-	net::AddrRecord tcpPeerAddr_;
-	std::string tcpSni_;
+	// ICE-TCP direct connections, one per active candidate pair (RFC 6544
+	// §7.1/§12). Each entry owns the TCP socket dialed to a remote passive
+	// candidate, so several pairs can be checked concurrently instead of
+	// sharing a single transport. `pair` binds lazily once the pair exists.
+	struct TcpConnection {
+		std::unique_ptr<net::TcpTransport> transport;
+		net::AddrRecord peerAddr;
+		std::string sni;
+		CandidatePair *pair = nullptr;
+		// RFC 6544 §11.1: a lost selected TCP pair MUST be redialed.
+		int reconnectAttempts = 0;
+		bool reconnectPending = false;
+		bool everConnected = false;
+		std::chrono::steady_clock::time_point nextReconnect{};
+		// Wall-clock start of the current redial campaign: reconnectAttempts
+		// resets on transient successes, so a flapping link could otherwise
+		// redial forever. 60 s total budget ends the campaign (#12).
+		std::chrono::steady_clock::time_point redialStart{};
+	};
+	// deque keeps element addresses stable across growth, so the pointers held
+	// by `pair` and by in-flight event dispatch stay valid.
+	std::deque<TcpConnection> tcpConns_;
 	// RFC 6062 TCP allocation data connection. Separate TCP connection to the
 	// TURN server, bound via CONNECTION-BIND. After binding, raw application
 	// data (STUN checks + app data) flows end-to-end through the TURN server.
@@ -593,6 +716,11 @@ private:
 		// is transparent, so we frame STUN + app data with 2-byte prefix).
 		std::vector<unsigned char> rfc4571Buf;
 	};
+	// TURN allocation the current inbound datagram arrived through. Set only
+	// for the duration of a turn::Client::onData dispatch. Binding responses
+	// must leave through the same allocation so their source address equals
+	// the destination the peer targeted (RFC 8445 §7.2.5.2.1).
+	turn::Client *inboundTurn_ = nullptr;
 	std::unique_ptr<TurnDataConn> turnDataConn_;
 	// Begin opening a data connection to the TURN server for RFC 6062.
 	// After connect, sends CONNECTION-BIND with the given connectionId.
@@ -622,8 +750,11 @@ private:
 	// RFC 6062 CONNECT retry state. The TURN server may return 447 (Connection
 	// Timeout or Failure) if the peer's relay listener isn't fully ready when
 	// the CONNECT is processed. We retry up to MaxConnectRetries times with
-	// ConnectRetryDelayMs between attempts, so the retry budget spans
-	// MaxConnectRetries * ConnectRetryDelayMs = 20 s.
+	// ConnectRetryDelayMs between attempts (MaxConnectRetries * ConnectRetryDelayMs
+	// = 20 s of pacing). Each attempt itself is bounded by the TURN client's
+	// TurnConnectTimeoutMs (32 s), which must stay above the server's 30 s peer
+	// dial window (RFC 6062 §4.3); a transaction timeout is reported as 447 so it
+	// lands on this retry path rather than failing the pair outright.
 	//
 	// The delay used to be 500 ms, i.e. a 1.5 s total window - far too short:
 	// before a CONNECT can succeed the peer must finish its own TCP allocation,
@@ -672,6 +803,18 @@ private:
 	std::uint32_t turnDataRetryConnId_ = 0;
 	net::AddrRecord turnDataRetryPeer_;
 
+	// RFC 6062 §3.2: a data connection that drops AFTER CONNECTION-BIND is
+	// rebuilt with the same connection-id (the server keeps the binding); if
+	// the server has dropped it, the bind fails and the pre-bind CONNECT
+	// retry path above re-establishes a fresh connection-id.
+	static constexpr int MaxTurnDataRebindRetries = 5;
+	static constexpr int TurnDataRebindDelayMs = 500;
+	bool pendingTurnDataRebind_ = false;
+	int turnDataRebindAttempts_ = 0;
+	std::uint32_t turnDataRebindConnId_ = 0;
+	net::AddrRecord turnDataRebindPeer_;
+	std::chrono::steady_clock::time_point nextTurnDataRebind_{};
+
 	// NAT 1:1 IP address rewrite mapper.
 	std::unique_ptr<AddressRewriteMapper> addrRewrite_;
 	std::vector<AddressRewriteRule> pendingRewriteRules_;
@@ -679,16 +822,35 @@ private:
 	// mDNS client.
 	std::unique_ptr<net::MDnsClient> mdns_;
 	stice_multicast_dns_mode_t mdnsMode_ = STICE_MDNS_MODE_DISABLED;
-	std::string mdnsHostname_;
 	bool mdnsInitialized_ = false;
 
 	Description local_;
 	Description remote_;
+	// N-11: last remote generation applied + every superseded generation's
+	// credentials (bounded). See noteRemoteGeneration().
+	std::string remoteGenUfrag_;
+	std::string remoteGenPwd_;
+	std::vector<std::pair<std::string, std::string>> retiredRemoteCreds_;
 	bool gatheringDone_ = false;
 	std::chrono::steady_clock::time_point gatherStartedAt_{}; // soft gathering deadline
 	bool remoteGatheringDone_ = false;
 	int pendingRelayAllocations_ = 0;
 	int pendingServerReflexive_ = 0;
+	// enable_trickle=false: local candidates are held here until gathering
+	// completes and then delivered in one batch.
+	std::vector<std::string> deferredCandidates_;
+	// In-flight mDNS resolutions. Blocks the "both sides done, no pairs" fast
+	// failure so an unresolved `.local` candidate is not mistaken for an
+	// unusable one. Atomic because the resolver callback decrements it before
+	// acquiring mutex_ (so a callback that fires during teardown still balances
+	// the count instead of leaking it).
+	std::atomic<int> pendingMdnsResolutions_{0};
+	// Identity of every `.local` candidate already handed to the resolver
+	// (hostname|port|transport|component). The same candidate can arrive twice
+	// (batch description + trickle, or a repeated trickle line); without this
+	// key each arrival would fire a second query and append a duplicate
+	// resolved copy, producing duplicate pairs.
+	std::unordered_set<std::string> mdnsQueryKeys_;
 
 	std::deque<StunEntry> entries_;
 	std::vector<std::unique_ptr<CandidatePair>> pairs_;
@@ -734,6 +896,19 @@ private:
 	// the transition happens. Exposed through nextTimestampMs() so the poll
 	// thread wakes exactly at the deadline.
 	std::chrono::steady_clock::time_point pacDeadline_{};
+	// pion-aligned lifecycle (#10): when a live session (CONNECTED/COMPLETED)
+	// loses every pair, updateState reports DISCONNECTED once and starts this
+	// grace timestamp; FAILED follows after DisconnectedGraceMs unless a pair
+	// recovers first (redial revival), which returns the session to COMPLETED.
+	// Zero means "no disconnect grace in progress".
+	std::chrono::steady_clock::time_point disconnectedAt_{};
+	// RFC 8445 §9: set while OUR OWN restart has not yet been acknowledged by
+	// the peer's fresh generation. Gates setRemoteDescription's remote-restart
+	// detection: once we restarted, the peer's new ufrag/pwd is the expected
+	// second half of the handshake, not another restart (which would ping-pong
+	// the two agents forever). Cleared when the new generation reaches
+	// CONNECTED/COMPLETED (or dies in FAILED).
+	bool restartingLocally_ = false;
 
 	// Worker thread for parallel candidate gathering. Resolves all STUN/TURN
 	// server DNS in parallel, then creates entries under the mutex. Stopped in

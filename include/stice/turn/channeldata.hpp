@@ -24,12 +24,25 @@
 
 namespace stice::turn {
 
-// RFC 5766/8656: channel numbers 0x4000 through 0x7FFF.
+// RFC 8656 §12.1: channel numbers are 0x4000 through 0x4FFF (4096 channels).
+// RFC 5766's wider 0x4000-0x7FFF range is obsolete. The legacy upper half
+// (0x5000-0x7FFF) is still ACCEPTED on receive so older peers keep working,
+// but it is never allocated by this implementation.
 constexpr std::uint16_t ChannelMin = 0x4000;
-constexpr std::uint16_t ChannelMax = 0x7FFF;
+constexpr std::uint16_t ChannelMax = 0x4FFF;
+// Receive-side compatibility ceiling (RFC 5766 legacy range, never allocated).
+constexpr std::uint16_t ChannelMaxLegacy = 0x7FFF;
 constexpr std::size_t ChannelDataHeaderSize = 4;
 
+// Strict validity for numbers this implementation allocates/accepts on
+// ChannelBind (RFC 8656 §12.1).
 inline bool channelValid(std::uint16_t c) { return c >= ChannelMin && c <= ChannelMax; }
+
+// Receive-side check: strict range plus the legacy RFC 5766 upper half. Used
+// when demultiplexing inbound frames from peers we did not configure.
+inline bool channelAcceptable(std::uint16_t c) {
+	return c >= ChannelMin && c <= ChannelMaxLegacy;
+}
 
 // Demultiplex: does this datagram look like ChannelData?
 // Per RFC 7982, must check both the first byte (0x40..0x7F for channel
@@ -48,10 +61,12 @@ inline bool isChannelData(const unsigned char *data, std::size_t size) {
 }
 
 // Wrap application data in a ChannelData frame. `out` will contain the 4-byte
-// header + data + zero padding to 4-byte boundary (padded form is safe on both
-// UDP and TCP). Returns the total frame size.
+// header + data, then zero padding to a 4-byte boundary when `pad` is true.
+// RFC 8656 §12.5: padding is REQUIRED on TCP/TLS streams and MUST NOT be added
+// on UDP, where the frame length is exactly 4 + Length. Returns the total
+// frame size.
 std::size_t wrapChannelData(std::uint16_t channel, const unsigned char *data,
-                            std::size_t size, bytes &out);
+                            std::size_t size, bytes &out, bool pad = true);
 
 // Unwrap a ChannelData frame. Returns the data length (without padding) and
 // writes a pointer to the data into `outData`. Returns 0 if the buffer is too
@@ -60,7 +75,7 @@ std::size_t unwrapChannelData(const unsigned char *buf, std::size_t size,
                               std::uint16_t &channel, const unsigned char *&outData,
                               std::size_t &frameSize);
 
-// Pick a random channel number in 0x4000..0x7FFF (RFC 5766/8656 range).
+// Pick a random channel number in 0x4000..0x4FFF (RFC 8656 §12.1).
 std::uint16_t randomChannelNumber();
 
 } // namespace stice::turn

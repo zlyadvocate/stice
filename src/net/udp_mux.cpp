@@ -11,7 +11,6 @@
 #include "stice/stun/attributes.hpp"
 #include "stice/stun/message.hpp"
 
-#include <algorithm>
 #include <cstring>
 
 #ifdef _WIN32
@@ -24,6 +23,14 @@
 #endif
 
 namespace stice::net {
+
+namespace {
+// Upper bound on queued loopback attributions and the age after which an
+// unmatched entry is dropped. A healthy loopback turnaround is well under
+// 1 ms; the window only absorbs pathological stalls.
+constexpr std::size_t MaxLoopbackPending = 64;
+constexpr int LoopbackAttributionWindowMs = 50;
+} // namespace
 
 UDPMux::UDPMux() = default;
 
@@ -83,44 +90,61 @@ void UDPMux::removeAgent(const std::string &ufrag) {
 			agentsByAddr_.erase(addrIt);
 		}
 	}
+	// Purge this agent from the loopback attribution queue: its in-flight
+	// packets (if any) then arrive with no matching entry and are broadcast
+	// to all agents — a removed generation must never remain the attributed
+	// sender that loopback broadcasts exclude.
+	for (auto lit = loopbackPending_.begin(); lit != loopbackPending_.end();) {
+		if (lit->sender == it->second)
+			lit = loopbackPending_.erase(lit);
+		else
+			++lit;
+	}
 	agentsByUfrag_.erase(it);
 	STICE_LOG_INFO("UDPMux: removed agent ufrag=%s", ufrag.c_str());
 }
 
+bool UDPMux::isLoopbackDst(const AddrRecord &dst) const {
+	AddrRecord bound;
+	if (!boundAddr(bound)) return false;
+	auto *boundSa = reinterpret_cast<const struct sockaddr *>(&bound.addr);
+	auto *dstSa = reinterpret_cast<const struct sockaddr *>(&dst.addr);
+	return addrPort(boundSa) == addrPort(dstSa);
+}
+
 int UDPMux::sendto(const char *data, std::size_t size, const AddrRecord &dst,
                    const std::string &ufrag) {
-	// Register the destination address for fast-path routing of replies.
-	// For loopback (destination is our own bound address), always overwrite
-	// the address map entry with the current sender so routePacket knows
-	// who sent the last packet and can deliver the looped-back data to the
-	// OTHER agents (excluding the sender). Compare by port only since the
-	// mux may bind to 0.0.0.0.
-	AddrRecord bound;
-	bool isLoopback = false;
-	if (boundAddr(bound)) {
-		auto *boundSa = reinterpret_cast<const struct sockaddr *>(&bound.addr);
-		auto *dstSa = reinterpret_cast<const struct sockaddr *>(&dst.addr);
-		isLoopback = (addrPort(boundSa) == addrPort(dstSa));
+	bool loopback = isLoopbackDst(dst);
+
+	// Loopback non-STUN data: enqueue the per-packet sender attribution and
+	// send under ONE critical section, so concurrent agents' enqueue order
+	// matches the shared socket's wire order (the recvfrom side pairs by
+	// FIFO). STUN loopback packets are routed by USERNAME on receive and
+	// carry no attribution. The address map is NOT touched: it only ever
+	// holds remote addresses, and registering the mux's own address under
+	// any agent would poison loopback routing after a restart.
+	if (loopback && !stun::Message::isMessage(reinterpret_cast<const unsigned char *>(data), size)) {
+		std::lock_guard<std::mutex> lock(mutex_);
+		auto it = agentsByUfrag_.find(ufrag);
+		if (it != agentsByUfrag_.end()) {
+			loopbackPending_.push_back({std::chrono::steady_clock::now(), it->second});
+			while (loopbackPending_.size() > MaxLoopbackPending) loopbackPending_.pop_front();
+		}
+		// Unknown ufrag (restart window, retired generation): send without
+		// attribution — the packet is broadcast to all agents on arrival.
+		return sock_.sendto(data, size, dst);
 	}
-	{
+
+	// Register the remote destination for fast-path routing of replies
+	// (only if not already present, to avoid duplicate remoteAddressKeys).
+	if (!loopback) {
 		std::lock_guard<std::mutex> lock(mutex_);
 		auto it = agentsByUfrag_.find(ufrag);
 		if (it != agentsByUfrag_.end()) {
 			auto key = addrKey(dst);
-			if (isLoopback) {
-				// Always update to the latest sender for loopback.
+			if (agentsByAddr_.find(key) == agentsByAddr_.end()) {
 				agentsByAddr_[key] = it->second;
-				auto &keys = it->second->remoteAddressKeys;
-				if (std::find(keys.begin(), keys.end(), key) == keys.end()) {
-					keys.push_back(key);
-				}
-			} else {
-				// Only register if not already present (avoid duplicate entries
-				// in remoteAddressKeys).
-				if (agentsByAddr_.find(key) == agentsByAddr_.end()) {
-					agentsByAddr_[key] = it->second;
-					it->second->remoteAddressKeys.push_back(key);
-				}
+				it->second->remoteAddressKeys.push_back(key);
 			}
 		}
 	}
@@ -140,18 +164,57 @@ int UDPMux::setDiffserv(int ds) {
 }
 
 int UDPMux::sendtoWithDiffserv(const char *data, std::size_t size,
-                               const AddrRecord &dst, int ds) {
-	// Delegated to the shared socket so the set/send/reset window is serialized
-	// across every agent multiplexed on it.
+                               const AddrRecord &dst, int ds,
+                               const std::string &ufrag) {
+	// Same discipline as sendto(): loopback non-STUN app data gets a
+	// per-packet sender attribution (enqueued and sent under one critical
+	// section so enqueue order matches wire order); remote destinations get
+	// fast-path registration. Without the attribution, app data sent by
+	// muxed agents would be broadcast as if the last STUN sender sent it.
+	bool loopback = isLoopbackDst(dst);
+	if (loopback && !stun::Message::isMessage(reinterpret_cast<const unsigned char *>(data), size)) {
+		std::lock_guard<std::mutex> lock(mutex_);
+		auto it = agentsByUfrag_.find(ufrag);
+		if (it != agentsByUfrag_.end()) {
+			loopbackPending_.push_back({std::chrono::steady_clock::now(), it->second});
+			while (loopbackPending_.size() > MaxLoopbackPending) loopbackPending_.pop_front();
+		}
+		// The set/send/reset DSCP window stays serialized on the socket;
+		// holding the mux mutex here additionally serializes it against
+		// concurrent loopback senders.
+		return sock_.sendtoWithDiffserv(data, size, dst, ds);
+	}
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		auto it = agentsByUfrag_.find(ufrag);
+		if (it != agentsByUfrag_.end() && !loopback) {
+			auto key = addrKey(dst);
+			if (agentsByAddr_.find(key) == agentsByAddr_.end()) {
+				agentsByAddr_[key] = it->second;
+				it->second->remoteAddressKeys.push_back(key);
+			}
+		}
+	}
 	return sock_.sendtoWithDiffserv(data, size, dst, ds);
 }
 
 int64_t UDPMux::nextTimestampMs() const {
-	std::lock_guard<std::mutex> lock(mutex_);
+	// Snapshot the entries under the lock, then invoke the agent callbacks
+	// OUTSIDE it. The callbacks take the agent's own mutex, and an agent
+	// thread holds that mutex while calling into this mux (restart()'s
+	// removeAgent/registerAgent, sendto's sendtoWithDiffserv) — holding
+	// mux mutex across the callback would form an AB-BA cycle with the
+	// mux poll thread, which runs this function every poll iteration.
+	std::vector<std::shared_ptr<MuxAgentEntry>> snapshot;
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		snapshot.reserve(agentsByUfrag_.size());
+		for (const auto &kv : agentsByUfrag_) snapshot.push_back(kv.second);
+	}
 	int64_t earliest = 0;
-	for (const auto &kv : agentsByUfrag_) {
-		if (!kv.second->nextTimestampMs) continue;
-		int64_t t = kv.second->nextTimestampMs();
+	for (const auto &entry : snapshot) {
+		if (!entry->nextTimestampMs) continue;
+		int64_t t = entry->nextTimestampMs();
 		if (t > 0 && (earliest == 0 || t < earliest)) earliest = t;
 	}
 	return earliest;
@@ -174,6 +237,17 @@ void UDPMux::routePacket(const char *buf, int len, const AddrRecord &src) {
 
 	const auto *data = reinterpret_cast<const unsigned char *>(buf);
 	bool isStun = stun::Message::isMessage(data, static_cast<std::size_t>(len));
+
+	// Loopback detection: the source is our own bound address, i.e. the
+	// packet was sent by one of our own agents through the shared socket.
+	// The mux may bind to 0.0.0.0 (INADDR_ANY), so compare by port only.
+	AddrRecord bound;
+	bool isLoopback = false;
+	if (boundAddr(bound)) {
+		auto *boundSa = reinterpret_cast<const struct sockaddr *>(&bound.addr);
+		auto *srcSa = reinterpret_cast<const struct sockaddr *>(&src.addr);
+		isLoopback = (addrPort(boundSa) == addrPort(srcSa));
+	}
 
 	// For STUN messages with USERNAME (binding requests), route by local
 	// ufrag. This is necessary because multiple agents sharing the same
@@ -205,8 +279,15 @@ void UDPMux::routePacket(const char *buf, int len, const AddrRecord &src) {
 					auto it = agentsByUfrag_.find(localUfrag);
 					if (it != agentsByUfrag_.end()) {
 						entry = it->second;
-						// Register this address for non-STUN fast-path routing.
-						if (agentsByAddr_.find(key) == agentsByAddr_.end()) {
+						// Register this remote address for non-STUN
+						// fast-path routing. Loopback sources are NOT
+						// address-map material: the map only ever holds
+						// remote addresses, and registering the mux's own
+						// address under the DESTINATION agent would poison
+						// loopback attribution (agentsByAddr_ must never
+						// mix the two semantics).
+						if (!isLoopback &&
+						    agentsByAddr_.find(key) == agentsByAddr_.end()) {
 							agentsByAddr_[key] = entry;
 							entry->remoteAddressKeys.push_back(key);
 						}
@@ -244,29 +325,30 @@ void UDPMux::routePacket(const char *buf, int len, const AddrRecord &src) {
 	}
 
 	// Non-STUN: use the address map (fast path).
-	// Special case: when the source address is the mux's own bound address
-	// (local loopback with shared socket), the address map entry points to
-	// the SENDER, not the receiver. Broadcast to all agents EXCEPT the
-	// sender so the data reaches the intended recipient without echoing
-	// back to the sender.
-	// The mux may bind to 0.0.0.0 (INADDR_ANY), so we compare by port only:
-	// if the source port matches the mux's bound port, the packet was sent
-	// from our own socket (loopback).
-	AddrRecord bound;
-	bool isLoopback = false;
-	if (boundAddr(bound)) {
-		auto *boundSa = reinterpret_cast<const struct sockaddr *>(&bound.addr);
-		auto *srcSa = reinterpret_cast<const struct sockaddr *>(&src.addr);
-		isLoopback = (addrPort(boundSa) == addrPort(srcSa));
-	}
-
+	// Special case: loopback app data (sent by one of our own agents to the
+	// shared mux address). Pair with the FIFO attribution queue: the queue
+	// head is this in-flight packet's sender (single shared socket delivers
+	// loopback datagrams in send order). Broadcast to every agent EXCEPT
+	// that sender; no matching entry (expired, purged by removeAgent, or
+	// sent by an unknown ufrag) broadcasts to ALL agents — over-delivery is
+	// benign, permanent under-delivery is not.
 	std::shared_ptr<MuxAgentEntry> senderEntry;
 	std::vector<std::shared_ptr<MuxAgentEntry>> snapshot;
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		if (isLoopback) {
-			auto it = agentsByAddr_.find(key);
-			if (it != agentsByAddr_.end()) senderEntry = it->second;
+			auto now = std::chrono::steady_clock::now();
+			while (!loopbackPending_.empty()) {
+				auto &front = loopbackPending_.front();
+				if (now - front.sent >
+				    std::chrono::milliseconds(LoopbackAttributionWindowMs)) {
+					loopbackPending_.pop_front();
+					continue;
+				}
+				senderEntry = front.sender;
+				loopbackPending_.pop_front();
+				break;
+			}
 			snapshot.reserve(agentsByUfrag_.size());
 			for (const auto &kv : agentsByUfrag_) {
 				if (kv.second != senderEntry) snapshot.push_back(kv.second);

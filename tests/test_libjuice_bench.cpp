@@ -213,8 +213,13 @@ static BenchResult runBench(AgentState &sa, AgentState &sb, juice_agent_t *a,
         }
     }
 
-    // Wait for all sent packets to be received
-    waitFor([&] { return sb.recvCount.load() - c0 >= (size_t)sent * 95 / 100; }, 15000);
+    // Wait for FULL receipt before sampling. The send loop can only exit once
+    // received >= sent - window, so up to one window of packets is still in
+    // flight here; sampling at 95% (already satisfied) counted that residual as
+    // "lost" — the signature was loss == window (32 lost @ window 32, 2 lost @
+    // window 2), scaling with the window rather than the wire. Real losses
+    // still surface: they burn the 15s wait and then report exactly.
+    waitFor([&] { return sb.recvCount.load() - c0 >= (size_t)sent; }, 15000);
 
     auto t1 = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(t1 - t0).count();
@@ -232,7 +237,11 @@ static BenchResult runBench(AgentState &sa, AgentState &sb, juice_agent_t *a,
 }
 
 int main(int argc, char **argv) {
-    const char *host = "192.168.3.223";
+    // Default to the local stserver instance (regress.conf listens on 3478).
+    // A hardcoded cross-host address silently pointed this bench at the Linux
+    // VM's coturn, whose load ceiling shows up as sub-1% packet loss — an
+    // environment artifact, not a library regression.
+    const char *host = "127.0.0.1";
     uint16_t port = 3478;
     const char *user = "testuser";
     const char *pass = "123456";

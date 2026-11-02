@@ -30,6 +30,13 @@
 
 namespace stice::net {
 
+namespace {
+// Upper bound on established (first STUN packet routed) connections per mux.
+// Pending connections have their own cap; this bounds the long-lived set so a
+// peer cannot grow connsByAddr_ without limit.
+constexpr std::size_t kMaxEstablishedConns = 1024;
+} // namespace
+
 // ---------------------------------------------------------------------------
 // TcpMuxConn
 // ---------------------------------------------------------------------------
@@ -513,24 +520,58 @@ void TCPMux::onConnEstablished(TcpMuxConn *conn, const std::string &ufrag) {
 		// Critical (C-1): do NOT drop the last shared_ptr here. The calling stack
 		// (onTcpEvents -> tryReadFirstPacket -> onConnEstablished) still accesses
 		// this after this return, so destroying TcpMuxConn now would be a UAF.
-		// Remove + sync so the poll thread holds no raw pointer, then defer the
-		// destruction through toDestroy_ (freed by the next onBookkeeping pass),
-		// matching cleanupConns() deferred-cleanup semantics.
+		// Remove from the registry and defer the destruction through toDestroy_
+		// (freed by the next onBookkeeping pass), matching cleanupConns()
+		// deferred-cleanup semantics. Do NOT call pollReg_->sync() here: this
+		// runs ON the poll thread inside its own dispatch, so sync() would wait
+		// for a new iteration that cannot start until this callback returns and
+		// block the event loop for its full 2s timeout per rejected connection.
 		if (pollReg_) {
 			pollReg_->remove(conn);
-			pollReg_->sync();
 		}
 		std::lock_guard<std::mutex> lock(mutex_);
 		if (connShared) toDestroy_.push_back(connShared);
 		return;
 	}
 
-	conn->setAgent(agent);
-
 	if (connShared) {
 		std::lock_guard<std::mutex> lock(mutex_);
-		connsByAddr_[addrKey(conn->peerAddr())] = connShared;
+		const std::string key = addrKey(conn->peerAddr());
+		// P2-C5: a new connection from an address that already has an entry
+		// replaces it. Overwriting without closing the old socket left it open
+		// (the poll registry kept waking on it and the fd leaked until the mux
+		// shut down). Close it here and hand the shared_ptr to the deferred
+		// cleanup queue so it is not destroyed while the poll thread may still
+		// hold a raw pointer to it.
+		auto it = connsByAddr_.find(key);
+		if (it != connsByAddr_.end() && it->second && it->second.get() != conn) {
+			std::shared_ptr<TcpMuxConn> old = it->second;
+			old->close();
+			if (pollReg_) pollReg_->remove(old.get());
+			toDestroy_.push_back(std::move(old));
+		}
+		if (connsByAddr_.size() >= kMaxEstablishedConns && it == connsByAddr_.end()) {
+			STICE_LOG_WARN("TCPMux: established connection limit (%zu) reached, rejecting %s",
+			               kMaxEstablishedConns, conn->peerAddr().toString().c_str());
+			conn->close();
+			// Same as the !agent branch: no sync() on the poll thread's own
+			// dispatch (2s self-block per rejection). toDestroy_ defers the
+			// destruction to the next bookkeeping pass, after this dispatch
+			// has fully returned.
+			if (pollReg_) {
+				pollReg_->remove(conn);
+			}
+			toDestroy_.push_back(connShared);
+			return;
+		}
+		connsByAddr_[key] = connShared;
 	}
+
+	// Attach the agent only once the connection is actually accepted. Setting it
+	// before the capacity check left a rejected connection bound to this agent
+	// while its ufrag still resolved here, opening a window where the poll
+	// thread could hand it packets belonging to another agent's ufrag.
+	conn->setAgent(agent);
 
 	STICE_LOG_INFO("TCPMux: connection from %s established → ufrag=%s",
 	               conn->peerAddr().toString().c_str(), ufrag.c_str());

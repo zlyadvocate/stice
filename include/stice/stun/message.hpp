@@ -72,9 +72,14 @@ enum class AttrType : std::uint16_t {
 	XorMappedAddress = 0x0020,
 	Priority = 0x0024,
 	UseCandidate = 0x0025,
-	// RFC 6544 §8.1: TCP-TYPE encodes the TCP candidate type (active/passive/so)
-	// as a 32-bit enum. Used in connectivity checks over TCP.
-	TcpType = 0x0026,
+	// TCP-TYPE encodes the TCP candidate type (active/passive/so) as a 32-bit
+	// enum, used in connectivity checks over TCP. RFC 6544 does not actually
+	// allocate a STUN code point for it, and 0x0026 (the value previously used
+	// here) is assigned by IANA to PADDING (RFC 5780) in the comprehension-
+	// required range — a real collision. Use an unassigned comprehension-
+	// optional value (IANA: 0xC004-0xC055 unassigned) so peers that do not
+	// understand it simply ignore it instead of rejecting it with 420.
+	TcpType = 0xC004,
 	ChannelNumber = 0x000C,
 	Lifetime = 0x000D,
 	XorPeerAddress = 0x0012,
@@ -86,6 +91,9 @@ enum class AttrType : std::uint16_t {
 	ReservationToken = 0x0022,
 	RequestedAddressFamily = 0x0017,
 	ConnectionId = 0x002A,
+	// RFC 8489 §14.1: list of 16-bit password algorithm IDs the server accepts.
+	// Comprehension-optional, so a peer that does not know it simply ignores it.
+	PasswordAlgorithms = 0x8002,
 	Software = 0x8022,
 	AlternateServer = 0x8023,
 	Fingerprint = 0x8028,
@@ -124,6 +132,28 @@ inline bool isResponseType(Class cls) {
 	return (static_cast<std::uint16_t>(cls) & 0x02) != 0;
 }
 
+// RFC 8489 §6.3.1 / RFC 8656: only the methods this implementation defines are
+// valid. decode() stays permissive so a server can answer an unknown method with
+// 400 instead of silently dropping it; callers that act on a decoded message
+// use this whitelist.
+inline bool isKnownMethod(Method method) {
+	switch (method) {
+	case Method::Binding:
+	case Method::Allocate:
+	case Method::Refresh:
+	case Method::Send:
+	case Method::Data:
+	case Method::CreatePermission:
+	case Method::ChannelBind:
+	case Method::Connect:
+	case Method::ConnectionBind:
+	case Method::ConnectionAttempt:
+		return true;
+	default:
+		return false;
+	}
+}
+
 // Address families for XOR-MAPPED-ADDRESS / MAPPED-ADDRESS.
 constexpr std::uint8_t FamilyIPv4 = 0x01;
 constexpr std::uint8_t FamilyIPv6 = 0x02;
@@ -143,6 +173,9 @@ constexpr int StunErrorPeerAddressFamilyMismatch = 443;
 constexpr int StunErrorAllocationQuotaReached = 486;
 constexpr int StunErrorServerError = 500;
 constexpr int StunErrorInsufficientCapacity = 508;
+// RFC 6062 §5.3.5: CONNECT-specific recoverable errors.
+constexpr int StunErrorConnectionAlreadyExists = 446;
+constexpr int StunErrorConnectionTimeoutOrFailure = 447;
 // libjuice-internal sentinel: not on the wire.
 constexpr int StunErrorInternalValidationFailed = 599;
 
@@ -153,13 +186,34 @@ struct Attribute {
 	bytes value;
 };
 
+// Password algorithm IDs for PASSWORD-ALGORITHMS (RFC 8489 §14.1) and
+// PASSWORD-ALGORITHM (0x001D). 0x0001 is MD5 (the RFC 5389 default) and 0x0002
+// is SHA-256 (introduced by RFC 8489 for MESSAGE-INTEGRITY-SHA256).
+constexpr std::uint16_t PasswordAlgorithmMd5 = 0x0001;
+constexpr std::uint16_t PasswordAlgorithmSha256 = 0x0002;
+
+// Which integrity attribute a message carries / should be signed with.
+enum class IntegrityAlgo : std::uint8_t { HmacSha1 = 0, HmacSha256 = 1 };
+
 // Long-term credentials captured from a 401/438 response.
 struct Credentials {
 	std::string username;
 	std::string realm;
 	std::string nonce;
-	// Long-term HMAC key (MD5(username:realm:password) by default).
+	// Long-term HMAC key for MESSAGE-INTEGRITY: MD5(username:realm:password).
 	bytes key;
+	// Long-term HMAC key for MESSAGE-INTEGRITY-SHA256:
+	// SHA-256(username:realm:password) (RFC 8489 §9.2.2).
+	bytes keySha256;
+	// Integrity algorithm negotiated with the server. HmacSha1 keeps the
+	// RFC 5389 behaviour; HmacSha256 makes encode() append
+	// MESSAGE-INTEGRITY-SHA256 (in addition to MESSAGE-INTEGRITY, so peers that
+	// only understand SHA-1 still verify the message).
+	IntegrityAlgo algo = IntegrityAlgo::HmacSha1;
+	// Emit USERHASH instead of USERNAME (RFC 8489 §14.2). The value is the
+	// binary SHA-256 of "username:realm"; the server resolves the user by
+	// hashing each known username the same way.
+	bool useUserhash = false;
 };
 
 // Build the 16-byte XOR mask used by XOR-MAPPED-ADDRESS and friends:
@@ -178,6 +232,11 @@ public:
 	std::array<unsigned char, TransactionIDSize> transactionID{};
 	std::vector<Attribute> attributes;
 	bytes raw; // encoded form (valid after encode() / decode())
+	// Comprehension-required attribute types (< 0x8000) that decode() found but
+	// this implementation does not understand (RFC 8489 §6.3.4). A recipient
+	// MUST reject such a request with 420 (Unknown Attribute) listing these
+	// types; comprehension-optional (>= 0x8000) attributes are never collected.
+	std::vector<std::uint16_t> unknownComprehensionRequired;
 
 	// Generate a random transaction ID.
 	void newTransactionID();
@@ -186,9 +245,12 @@ public:
 	// message is not an indication, MESSAGE-INTEGRITY (HMAC-SHA1 keyed
 	// with `longTermKey` if present, else the password) is appended.
 	// FINGERPRINT is always appended last.
-	// If `creds` is non-null, USERNAME/REALM/NONCE are emitted before MI.
+	// If `creds` is non-null, USERNAME/REALM/NONCE are emitted before MI —
+	// except on responses when `emitAuthAttributes` is false. A server signs
+	// its responses with the long-term key but must not echo the client's
+	// USERNAME/REALM/NONCE back (RFC 8489 §9.2.2).
 	bool encode(const char *password = nullptr, const Credentials *creds = nullptr,
-	            const char *software = "stice");
+	            const char *software = "stice", bool emitAuthAttributes = true);
 
 	// Decode a STUN message from a wire buffer. Validates magic cookie
 	// and length. Does not verify MESSAGE-INTEGRITY or FINGERPRINT —
@@ -206,10 +268,19 @@ public:
 	}
 
 	// Verify MESSAGE-INTEGRITY against the given HMAC key (raw password for
-	// short-term, MD5/SHA256 hash for long-term). Returns true if the
-	// attribute is present and matches. If `allowMissing` is true, returns
-	// true when the attribute is absent.
+	// short-term, MD5/SHA256 hash for long-term). The attribute type present on
+	// the wire selects the HMAC: MESSAGE-INTEGRITY (0x0008) uses HMAC-SHA1,
+	// MESSAGE-INTEGRITY-SHA256 (0x001C) uses HMAC-SHA256 over the same key.
+	// When both are present the SHA-256 attribute is preferred. If
+	// `allowMissing` is true, returns true when neither attribute is present.
 	bool checkIntegrity(const unsigned char *key, std::size_t keyLen, bool allowMissing = false) const;
+
+	// Long-term variant: each attribute type is verified with its own key
+	// (MESSAGE-INTEGRITY with `sha1Key`, MESSAGE-INTEGRITY-SHA256 with
+	// `sha256Key`). SHA-256 is preferred when both attributes are present.
+	bool checkIntegrityDual(const unsigned char *sha1Key, std::size_t sha1KeyLen,
+	                        const unsigned char *sha256Key, std::size_t sha256KeyLen,
+	                        bool allowMissing = false) const;
 
 	// Verify FINGERPRINT. Returns true if present and matches.
 	bool checkFingerprint(bool allowMissing = false) const;

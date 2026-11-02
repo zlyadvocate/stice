@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 
@@ -47,6 +48,8 @@ void Client::init(TurnConfig cfg, TurnSink sink) {
 	state_ = AllocState::Idle;
 	failedEmitted_ = false;
 	nonceRetries_ = 0;
+	allocRetries_ = 0;
+	teardownRetryPending_ = false;
 }
 
 bool Client::handleAuthError(const stun::Message &msg, int code, bool retryAuthed) {
@@ -62,6 +65,17 @@ bool Client::handleAuthError(const stun::Message &msg, int code, bool retryAuthe
 		creds_->username = cfg_.username;
 		creds_->realm = stun::getString(msg, stun::AttrType::Realm);
 		creds_->nonce = stun::getString(msg, stun::AttrType::Nonce);
+		// RFC 8489 §9.2.3: the server lists the password algorithms it accepts
+		// in PASSWORD-ALGORITHMS. Prefer SHA-256 when offered; fall back to the
+		// RFC 5389 MD5/SHA-1 mechanism otherwise.
+		std::vector<std::uint16_t> algorithms;
+		if (stun::readPasswordAlgorithms(msg, algorithms)) {
+			bool offersSha256 = false;
+			for (std::uint16_t a : algorithms)
+				if (a == stun::PasswordAlgorithmSha256) offersSha256 = true;
+			creds_->algo = offersSha256 ? stun::IntegrityAlgo::HmacSha256
+			                            : stun::IntegrityAlgo::HmacSha1;
+		}
 		return true;
 	}
 	if (code == stun::StunErrorStaleNonce) {
@@ -82,6 +96,7 @@ void Client::failAllocation(int errorCode, const std::string &reason) {
 	if (failedEmitted_) return;
 	failedEmitted_ = true;
 	state_ = AllocState::Failed;
+	teardownRetryPending_ = false;
 	pending_.clear();
 	if (sink_.onFailed) sink_.onFailed(errorCode, reason);
 }
@@ -106,6 +121,10 @@ void Client::allocate() {
 	m.newTransactionID();
 	allocateTid_ = m.transactionID;
 	stun::addRequestedTransport(m, proto);
+	// RFC 8656 §14.6/§7.1: LIFETIME lets the client ask for the allocation
+	// lifetime it wants instead of silently taking the server default. It is
+	// comprehension-optional, so a server that ignores it is still compliant.
+	if (cfg_.requestedLifetime > 0) stun::addLifetime(m, cfg_.requestedLifetime);
 	prepareRequest(m);
 
 	auto now = std::chrono::steady_clock::now();
@@ -124,10 +143,15 @@ void Client::allocate() {
 }
 
 void Client::applyCredentials(stun::Message &m) {
+	(void)m;
 	if (!creds_ || creds_->username.empty()) return;
-	// Re-derive the long-term key in case the password changed.
+	// Re-derive the long-term keys in case the password changed. Both are kept:
+	// MESSAGE-INTEGRITY uses the MD5 form and MESSAGE-INTEGRITY-SHA256 the
+	// SHA-256 form (RFC 8489 §9.2.2).
 	auto key = crypto::longTermKey(creds_->username, creds_->realm, cfg_.password);
 	creds_->key = bytes(key.begin(), key.end());
+	auto key256 = crypto::longTermKeySha256(creds_->username, creds_->realm, cfg_.password);
+	creds_->keySha256 = bytes(key256.begin(), key256.end());
 }
 
 void Client::sendRequest(stun::Message &m) {
@@ -138,6 +162,13 @@ void Client::sendRequest(stun::Message &m) {
 void Client::prepareRequest(stun::Message &m) {
 	applyCredentials(m);
 	if (creds_ && !creds_->username.empty()) {
+		// RFC 8489 §9.2.4: when a non-default algorithm was negotiated the
+		// client MUST say so via PASSWORD-ALGORITHM; without it a server
+		// (e.g. coturn) verifies with the RFC 5389 default MD5 and the
+		// SHA-256 MESSAGE-INTEGRITY never validates. Must precede encode(),
+		// which appends the MESSAGE-INTEGRITY TLVs after all attributes.
+		if (creds_->algo == stun::IntegrityAlgo::HmacSha256)
+			stun::addPasswordAlgorithm(m, stun::PasswordAlgorithmSha256);
 		m.encode(cfg_.password.c_str(), &*creds_, "stice");
 		log(STICE_LOG_LEVEL_DEBUG, "TURN sendRequest: authed method=%d raw=%zu bytes",
 		    static_cast<int>(m.method), m.raw.size());
@@ -290,7 +321,8 @@ int Client::prepareChannelData(const net::AddrRecord &peer, const unsigned char 
 	for (const auto &b : bindings_) {
 		if (b.peer == peer) {
 			if (!b.channelReady) return 0;
-			std::size_t n = wrapChannelData(b.channel, data, size, out);
+			std::size_t n = wrapChannelData(b.channel, data, size, out,
+			                                cfg_.transport != TurnTransport::UDP);
 			if (n == 0) return -1;
 			return 1;
 		}
@@ -309,13 +341,31 @@ int Client::sendData(const net::AddrRecord &peer, const unsigned char *data, std
 		if (!b.permissionTidFresh) sendCreatePermission(peer);
 		// Buffer the data until CreatePermission completes (D1): bound the
 		// pending buffer so a stalled CreatePermission (slow/lost response or
-		// TCP head-of-line blocking) cannot grow unboundedly. When full, drop
-		// the oldest packet and report backpressure to the caller.
-		const std::size_t kMaxPendingDataPkts = 512;
-		if (b.pendingData.size() >= kMaxPendingDataPkts) {
-			b.pendingData.erase(b.pendingData.begin());
+		// TCP head-of-line blocking) cannot grow unboundedly. The bound is in
+		// BYTES, not packets: a 512-packet cap let 512 full-size media packets
+		// (hundreds of MiB) accumulate, while 512 tiny packets wasted nothing.
+		const std::size_t kMaxPendingDataBytes = 1u * 1024 * 1024;
+		const std::size_t kMaxPendingDataPkts = 1024; // sanity cap on vector overhead
+		if (size > kMaxPendingDataBytes) {
 			log(STICE_LOG_LEVEL_WARN,
-				    "TURN sendData: pending buffer full, dropping oldest packet (backpressure)");
+			    "TURN sendData: %zu-byte payload exceeds the %zu-byte pending cap, rejecting",
+			    size, kMaxPendingDataBytes);
+			return -1;
+		}
+		std::size_t pendingBytes = 0;
+		for (const auto &pkt : b.pendingData) pendingBytes += pkt.size();
+		bool dropped = false;
+		while (!b.pendingData.empty() &&
+		       (pendingBytes + size > kMaxPendingDataBytes ||
+		        b.pendingData.size() >= kMaxPendingDataPkts)) {
+			pendingBytes -= b.pendingData.front().size();
+			b.pendingData.erase(b.pendingData.begin());
+			dropped = true;
+		}
+		if (dropped) {
+			log(STICE_LOG_LEVEL_WARN,
+			    "TURN sendData: pending buffer full (%zu bytes), dropping oldest packet "
+			    "(backpressure)", kMaxPendingDataBytes);
 		}
 		b.pendingData.emplace_back(data, data + size);
 		log(STICE_LOG_LEVEL_DEBUG, "TURN sendData: BUFFERED %zu bytes peer=%s (permission pending, perm=%d chan=%d chanReady=%d)",
@@ -327,7 +377,8 @@ int Client::sendData(const net::AddrRecord &peer, const unsigned char *data, std
 	if (b.channelReady) {
 		// ChannelData path (preferred).
 		bytes frame;
-		if (!wrapChannelData(b.channel, data, size, frame)) {
+		if (!wrapChannelData(b.channel, data, size, frame,
+		                     cfg_.transport != TurnTransport::UDP)) {
 			log(STICE_LOG_LEVEL_ERROR,
 			    "TURN sendData: payload too large for ChannelData (F1)");
 			return -1; // reject oversized payload rather than truncate
@@ -403,6 +454,19 @@ void Client::handleInbound(const unsigned char *data, std::size_t size) {
 		log(STICE_LOG_LEVEL_WARN, "TURN handleInbound: STUN decode failed (%zu bytes)", size);
 		return;
 	}
+	// RFC 8489 §14.5: drop messages whose FINGERPRINT is present but wrong.
+	// Missing FINGERPRINT is tolerated; STICE_FP_STRICT=0 logs instead of drops.
+	if (!m.checkFingerprint(true)) {
+		static const bool strict = []() {
+			const char *v = std::getenv("STICE_FP_STRICT");
+			return !(v && v[0] == '0');
+		}();
+		if (strict) {
+			log(STICE_LOG_LEVEL_WARN, "TURN handleInbound: FINGERPRINT mismatch, dropping");
+			return;
+		}
+		log(STICE_LOG_LEVEL_DEBUG, "TURN handleInbound: FINGERPRINT mismatch tolerated (STICE_FP_STRICT=0)");
+	}
 	log(STICE_LOG_LEVEL_DEBUG, "TURN-IN method=%d cls=%d tid=%02x%02x%02x%02x pending=%zu state=%d",
 	    static_cast<int>(m.method), static_cast<int>(m.cls),
 	    m.transactionID[0], m.transactionID[1], m.transactionID[2], m.transactionID[3],
@@ -412,12 +476,64 @@ void Client::handleInbound(const unsigned char *data, std::size_t size) {
 	    m.transactionID[0], m.transactionID[1], m.transactionID[2], m.transactionID[3],
 	    pending_.size());
 	if (stun::isResponseType(m.cls)) {
+		if (!verifyResponseIntegrity(m)) return;
 		handleStunResponse(m);
 	} else if (m.cls == stun::Class::Indication && m.method == stun::Method::Data) {
 		handleDataIndication(m);
 	} else if (m.cls == stun::Class::Indication && m.method == stun::Method::ConnectionAttempt) {
 		handleConnectionAttempt(m);
 	}
+}
+
+bool Client::verifySideChannelResponse(const stun::Message &m) {
+	// FINGERPRINT follows the same policy as handleInbound: present-but-wrong is
+	// rejected, missing is tolerated unless STICE_FP_STRICT says otherwise.
+	if (!m.checkFingerprint(true)) {
+		static const bool fpStrict = [] {
+			const char *v = std::getenv("STICE_FP_STRICT");
+			return !(v && v[0] == '0');
+		}();
+		if (fpStrict) {
+			log(STICE_LOG_LEVEL_WARN,
+			    "TURN side channel: FINGERPRINT mismatch, rejecting (method=%d)",
+			    static_cast<int>(m.method));
+			return false;
+		}
+		log(STICE_LOG_LEVEL_DEBUG,
+		    "TURN side channel: FINGERPRINT mismatch tolerated (STICE_FP_STRICT=0)");
+	}
+	return verifyResponseIntegrity(m);
+}
+
+bool Client::verifyResponseIntegrity(const stun::Message &m) {
+	// No credentials yet (the first Allocate has not been challenged): the
+	// server cannot have signed anything, so there is nothing to verify.
+	if (!creds_ || creds_->key.empty()) return true;
+	// N3-2: strictness is runtime-configurable. STICE_TURN_MI_STRICT=0 relaxes
+	// the "success responses must carry MESSAGE-INTEGRITY" rule for
+	// interoperability with servers that omit it; the default stays strict.
+	static const bool strict = [] {
+		const char *v = std::getenv("STICE_TURN_MI_STRICT");
+		return !v || std::atoi(v) != 0;
+	}();
+	// 401/438 challenges and stale-nonce errors are produced before (or instead
+	// of) authenticating the request, so MI may legitimately be absent.
+	const bool allowMissing = !strict || m.cls == stun::Class::ErrorResponse;
+	// Dispatch on the attribute actually present: MESSAGE-INTEGRITY-SHA256
+	// (0x001C) is verified with the SHA-256 long-term key, MESSAGE-INTEGRITY
+	// (0x0008) with the MD5 one. Before this dispatch, a peer that answered
+	// with MI-SHA256 looked like a response "missing MI" and was dropped.
+	const unsigned char *key1 = creds_->key.empty() ? nullptr : creds_->key.data();
+	const unsigned char *key256 = creds_->keySha256.empty() ? nullptr : creds_->keySha256.data();
+	if (!m.checkIntegrityDual(key1, creds_->key.size(), key256, creds_->keySha256.size(),
+	                          allowMissing)) {
+		log(STICE_LOG_LEVEL_WARN,
+		    "TURN response MESSAGE-INTEGRITY invalid (method=%d tid=%02x%02x%02x%02x), dropping",
+		    static_cast<int>(m.method), m.transactionID[0], m.transactionID[1],
+		    m.transactionID[2], m.transactionID[3]);
+		return false;
+	}
+	return true;
 }
 
 void Client::handleStunResponse(const stun::Message &m) {
@@ -501,12 +617,70 @@ void Client::handleAllocateResponse(const stun::Message &msg, bool isError) {
 			return;
 		}
 		log(STICE_LOG_LEVEL_ERROR, "TURN allocate failed: %d %s", code, reason.c_str());
+		// RFC 8656 §10.2: recoverable Allocate errors must be consumed rather
+		// than failing the allocation outright. 437 (Allocation Mismatch) means
+		// a stale allocation exists on the server, so release it before retrying;
+		// 486 (Quota) / 508 (Capacity) / 300 (Try Alternate) are retried bounded.
+		if (allocRetries_ < MaxAllocateRetries &&
+			(code == stun::StunErrorTryAlternate ||
+			 code == stun::StunErrorAllocationMismatch ||
+			 code == stun::StunErrorAllocationQuotaReached ||
+			 code == stun::StunErrorInsufficientCapacity)) {
+			++allocRetries_;
+			if (code == stun::StunErrorTryAlternate) {
+				// RFC 8489 §14.11: the redirect target is ALTERNATE-SERVER
+				// (0x8023), not MAPPED-ADDRESS. Reading the wrong attribute left
+				// the redirect address empty and the retry hit the same server.
+				net::AddrRecord alt;
+				if (stun::readAlternateServer(msg, alt)) {
+					STICE_LOG_WARN("TURN allocate 300: alternate server %s (retry %d/%d)",
+						alt.toString().c_str(), allocRetries_, MaxAllocateRetries);
+					// The owner retargets its send path; the retry below then
+					// reaches the server the response asked for.
+					if (sink_.onAlternateServer) sink_.onAlternateServer(alt);
+					else {
+						STICE_LOG_WARN("TURN allocate 300: no redirect handler, retry will "
+							"hit the original server");
+					}
+				}
+			}
+			else {
+				STICE_LOG_WARN("TURN allocate recoverable error %d, retrying (%d/%d)",
+					code, allocRetries_, MaxAllocateRetries);
+			}
+			if (code == stun::StunErrorAllocationMismatch) {
+				// RFC 8656 §10.2: best-effort teardown of the stale allocation.
+				// The Allocate retry is deferred until the Refresh(0) reaches a
+				// terminal state: a fire-and-forget teardown races the retried
+				// Allocate and can delete the FRESH allocation when the teardown
+				// (or its auth-retried re-send) lands after the retry succeeded.
+				teardownRetryPending_ = true;
+				sendRefresh(0);
+				return;
+			}
+			// P2-N3: defer the retry with exponential backoff + ±20% jitter
+			// (1s on the first retry, 2s on the second) instead of re-sending at
+			// round-trip speed. tick() fires the deferred Allocate once it is due.
+			const std::uint32_t baseMs = (allocRetries_ == 1) ? 1000u : 2000u;
+			const std::int64_t jitterPct = static_cast<std::int64_t>(crypto::randomU32() % 41) - 20;
+			const std::uint32_t delayMs = static_cast<std::uint32_t>(
+				static_cast<std::int64_t>(baseMs) * (100 + jitterPct) / 100);
+			const auto retryBase = lastTickNow_ != std::chrono::steady_clock::time_point{}
+				? lastTickNow_
+				: std::chrono::steady_clock::now();
+			nextAllocateRetryAt_ = retryBase + std::chrono::milliseconds(delayMs);
+			state_ = AllocState::Idle;
+			STICE_LOG_WARN("TURN allocate retry %d/%d deferred by %ums",
+				allocRetries_, MaxAllocateRetries, delayMs);
+			return;
+		}
 		failAllocation(code, reason);
 		return;
 	}
 	// Success: read XOR-RELAYED-ADDRESS and LIFETIME. Reset the nonce-retry
 	// budget — the credential path is proven working (aligned with pion).
 	nonceRetries_ = 0;
+	allocRetries_ = 0;
 	net::AddrRecord relayed;
 	if (!stun::readXorAddress(msg, stun::AttrType::XorRelayedAddress, relayed, msg.transactionID)) {
 		log(STICE_LOG_LEVEL_ERROR, "TURN allocate success missing XOR-RELAYED-ADDRESS");
@@ -536,7 +710,29 @@ void Client::handleRefreshResponse(const stun::Message &msg, bool isError) {
 		stun::readErrorCode(msg, code, reason);
 		if (handleAuthError(msg, code, /*retryAuthed=*/true)) {
 			log(STICE_LOG_LEVEL_DEBUG, "TURN refresh auth refresh: code=%d, retrying", code);
-			sendRefresh(lifetime_);
+			// A 437 teardown Refresh(0) keeps lifetime 0 across the auth retry;
+			// a normal periodic refresh re-arms with the current lifetime.
+			sendRefresh(teardownRetryPending_ ? 0 : lifetime_);
+			return;
+		}
+		// RFC 8656 §10.2: 437 in answer to Refresh(0) means the allocation is
+		// already gone — exactly the state deallocation wants. Treating it as
+		// failure fired a spurious onFailed after the allocation had ended.
+		if (state_ == AllocState::Deallocated &&
+		    code == stun::StunErrorAllocationMismatch) {
+			log(STICE_LOG_LEVEL_DEBUG,
+			    "TURN deallocate: 437 (allocation already gone), treating as success");
+			refreshTidFresh_ = false;
+			return;
+		}
+		// 437 on the 437-teardown Refresh(0): the stale allocation vanished in
+		// the meantime — nothing to release, proceed with the bounded retry.
+		if (teardownRetryPending_ && code == stun::StunErrorAllocationMismatch) {
+			log(STICE_LOG_LEVEL_DEBUG,
+			    "TURN 437 teardown: allocation already gone, retrying allocate");
+			teardownRetryPending_ = false;
+			state_ = AllocState::Idle;
+			allocate();
 			return;
 		}
 		log(STICE_LOG_LEVEL_ERROR, "TURN refresh failed: %d %s", code, reason.c_str());
@@ -545,6 +741,17 @@ void Client::handleRefreshResponse(const stun::Message &msg, bool isError) {
 	}
 	// Refresh succeeded: credentials proven, reset the nonce-retry budget.
 	nonceRetries_ = 0;
+	// 437 teardown completed: the stale allocation is released, now run the
+	// bounded Allocate retry (allocRetries_ already incremented). No refresh
+	// timer to re-arm — the allocation this Refresh(0) touched no longer
+	// exists, and allocate() owns the schedule from here.
+	if (teardownRetryPending_) {
+		teardownRetryPending_ = false;
+		log(STICE_LOG_LEVEL_DEBUG, "TURN 437 teardown complete, retrying allocate");
+		state_ = AllocState::Idle;
+		allocate();
+		return;
+	}
 	// A success response to Refresh(0) (deallocate) must NOT re-arm the
 	// refresh timer — the allocation is gone (C2: Deallocated terminal).
 	if (state_ == AllocState::Deallocated) return;
@@ -571,7 +778,8 @@ std::size_t Client::flushPendingData(PeerBinding &b) {
 		int r = -1;
 		if (b.channelReady) {
 			bytes frame;
-			if (wrapChannelData(b.channel, pkt.data(), pkt.size(), frame))
+			if (wrapChannelData(b.channel, pkt.data(), pkt.size(), frame,
+			                    cfg_.transport != TurnTransport::UDP))
 				r = sink_.sendRaw(frame.data(), frame.size());
 		} else {
 			stun::Message sm;
@@ -654,7 +862,9 @@ void Client::handleChannelBindResponse(const stun::Message &msg, bool isError,
 	// 400 BadRequest: aligned with pion-turn's recoverChannelBindBadRequest.
 	// Coturn may return 400 for "same peer different channel" or channel
 	// already bound. If the channel was previously ready (refresh scenario),
-	// keep the old binding. Otherwise the initial ChannelBind failed fatally.
+	// keep the old binding. On the initial bind, fall back to Send indications:
+	// the permission is still valid, so data keeps flowing. Failing the whole
+	// allocation here took down a working relay over a channel-number clash.
 	if (code == 400) {
 		if (b.channelReady) {
 			// Channel was already bound — keep the old binding, Coturn still
@@ -663,9 +873,12 @@ void Client::handleChannelBindResponse(const stun::Message &msg, bool isError,
 			b.channelRefreshAt = std::chrono::steady_clock::now() + std::chrono::seconds(300);
 			return;
 		}
-		log(STICE_LOG_LEVEL_ERROR, "TURN ChannelBind 400 on initial bind: %s", reason.c_str());
-		state_ = AllocState::Failed;
-		if (sink_.onFailed) sink_.onFailed(code, "ChannelBind bad request: " + reason);
+		log(STICE_LOG_LEVEL_WARN,
+		    "TURN ChannelBind 400 on initial bind (%s): falling back to Send indications",
+		    reason.c_str());
+		b.channel = 0;
+		b.channelTidFresh = false;
+		b.channelReady = false;
 		return;
 	}
 	log(STICE_LOG_LEVEL_WARN, "TURN ChannelBind failed: %d %s", code, reason.c_str());
@@ -730,7 +943,7 @@ void Client::sendConnect(const net::AddrRecord &peer) {
 	tx.kind = PendingTx::Kind::Connect;
 	tx.peer = peer;
 	tx.sentAt = now;
-	tx.nextRetransmitAt = now + std::chrono::milliseconds(TurnRtoMs);
+	tx.nextRetransmitAt = now + std::chrono::milliseconds(TurnConnectRtoMs);
 	tx.rawBytes = m.raw;
 	pending_[tidKey(m.transactionID)] = std::move(tx);
 	sendPrepared(m);
@@ -746,6 +959,12 @@ std::vector<unsigned char> Client::buildConnectionBindRequest(std::uint32_t conn
 	stun::addConnectionId(m, connectionId);
 	applyCredentials(m);
 	if (creds_ && !creds_->username.empty()) {
+		// RFC 8489 §9.2.4: same PASSWORD-ALGORITHM advertisement as
+		// prepareRequest — this path builds its message by hand, so it would
+		// otherwise be the one authenticated request that never names the
+		// negotiated algorithm.
+		if (creds_->algo == stun::IntegrityAlgo::HmacSha256)
+			stun::addPasswordAlgorithm(m, stun::PasswordAlgorithmSha256);
 		m.encode(cfg_.password.c_str(), &*creds_, "stice");
 	} else {
 		m.encode(nullptr, nullptr, "stice");
@@ -761,6 +980,14 @@ void Client::handleConnectResponse(const stun::Message &msg, bool isError,
 		stun::readErrorCode(msg, code, reason);
 		log(STICE_LOG_LEVEL_WARN, "TURN CONNECT error: code=%d reason=%s peer=%s",
 		    code, reason.c_str(), peer.toString().c_str());
+		if (code == stun::StunErrorConnectionAlreadyExists) {
+			// RFC 6062 §5.3.5: a connection to this peer already exists. The
+			// peer may be usable once that connection settles, so surface it
+			// like 447 (the agent retries after the 10 s backoff).
+			log(STICE_LOG_LEVEL_WARN,
+			    "TURN CONNECT 446 (connection already exists) peer=%s; treating as recoverable",
+			    peer.toString().c_str());
+		}
 		if (sink_.onConnectFailed)
 			sink_.onConnectFailed(code, reason, peer);
 		return;
@@ -792,23 +1019,37 @@ void Client::handleConnectionAttempt(const stun::Message &msg) {
 }
 
 std::chrono::steady_clock::time_point Client::tick() {
-	auto now = std::chrono::steady_clock::now();
+	return tick(std::chrono::steady_clock::now());
+}
+
+std::chrono::steady_clock::time_point Client::tick(std::chrono::steady_clock::time_point now) {
 	nextTick_ = std::chrono::steady_clock::time_point::max();
+	lastTickNow_ = now;
 
 	// Unified transaction timer for ALL pending transactions.
 	//
-	// UDP (RFC 5389 §7.2.1): RTO=200ms, doubling to 1600ms, max 7 retransmits.
+	// UDP (RFC 8489 §6.2.1): initial RTO 500 ms, doubling with an 8 s cap,
+	// Rc=7 retransmissions (0.5+1+2+4+8+8+8 = 31.5 s total budget).
 	// TCP/TLS (RFC 8656 §7): the transport is already reliable, so we MUST NOT
 	// retransmit the application-layer transaction (a duplicate Allocate/
 	// CreatePermission on the same control connection confuses servers like
-	// coturn). We only run the timeout-to-failure clock (~TurnRtoMs * 2^7 =
-	// the same overall budget as UDP) and fail the transaction when no
-	// response arrives, which in turn drives the Agent's transport-loss path.
+	// coturn). We only run the timeout-to-failure clock and fail the transaction
+	// when no response arrives, which in turn drives the Agent's transport-loss
+	// path. CONNECT is the exception: its budget is TurnConnectTimeoutMs (32 s)
+	// because the server's own peer dial may take up to 30 s (RFC 6062 §4.3).
 	const bool reliable = cfg_.transport != TurnTransport::UDP;
 	for (auto it = pending_.begin(); it != pending_.end();) {
 		auto &tx = it->second;
 		if (now >= tx.nextRetransmitAt) {
-			if (tx.retries >= TurnMaxRtxCount) {
+			// CONNECT is bounded by wall-clock elapsed time rather than by the
+			// generic 7-retransmit count: the TURN server may dial the peer for
+			// up to 30 s before answering (RFC 6062 §4.3), while the generic
+			// 31.5 s retransmit budget would fail the pair mid-dial.
+			const bool isConnect = tx.kind == PendingTx::Kind::Connect;
+			const bool timedOut = isConnect
+				? (now - tx.sentAt) >= std::chrono::milliseconds(TurnConnectTimeoutMs)
+				: tx.retries >= TurnMaxRtxCount;
+			if (timedOut) {
 				// Transaction timeout — handle based on kind.
 				auto kind = tx.kind;
 				auto peer = tx.peer;
@@ -821,6 +1062,15 @@ std::chrono::steady_clock::time_point Client::tick() {
 				case PendingTx::Kind::Refresh:
 					log(STICE_LOG_LEVEL_ERROR, "TURN refresh timeout after %d retransmits", TurnMaxRtxCount);
 					refreshTidFresh_ = false;
+					if (teardownRetryPending_) {
+						// Teardown outcome unknown: proceed with the bounded
+						// Allocate retry. If the stale allocation still exists the
+						// next 437 re-enters this path; allocRetries_ bounds the loop.
+						teardownRetryPending_ = false;
+						state_ = AllocState::Idle;
+						allocate();
+						return {};
+					}
 					failAllocation(0, "refresh timeout");
 					return {};
 				case PendingTx::Kind::CreatePermission:
@@ -857,8 +1107,15 @@ std::chrono::steady_clock::time_point Client::tick() {
 					break;
 				}
 			case PendingTx::Kind::Connect:
-				log(STICE_LOG_LEVEL_WARN, "TURN CONNECT timeout (retransmits exhausted) peer=%s",
-				    peer.toString().c_str());
+				log(STICE_LOG_LEVEL_WARN, "TURN CONNECT timeout (%.1fs budget exhausted) peer=%s",
+				    static_cast<double>(TurnConnectTimeoutMs) / 1000.0, peer.toString().c_str());
+				// 447 (Connection Timeout or Failure) is the RFC 6062 recoverable
+				// code. Reporting it here keeps the timeout on the agent's 2×10 s
+				// retry path, so a peer that becomes ready just after the server's
+				// dial window is still reached. A non-standard 408 bypassed that
+				// path (the agent only retries 447) and failed the pair immediately.
+				if (sink_.onConnectFailed)
+					sink_.onConnectFailed(447, "CONNECT transaction timeout", peer);
 				break;
 			}
 			continue;
@@ -872,16 +1129,31 @@ std::chrono::steady_clock::time_point Client::tick() {
 		if (!reliable && !tx.rawBytes.empty() && sink_.sendRaw)
 			sink_.sendRaw(tx.rawBytes.data(), tx.rawBytes.size());
 		++tx.retries;
-		int interval = std::min(TurnRtoMs << tx.retries, TurnMaxRtxIntervalMs);
+		int interval = isConnect
+			? std::min(TurnConnectRtoMs << tx.retries, TurnConnectMaxRtxIntervalMs)
+			: std::min(TurnRtoMs << tx.retries, TurnMaxRtxIntervalMs);
 		tx.nextRetransmitAt = now + std::chrono::milliseconds(interval);
-		// TEMP-DIAG: elevated from DEBUG so a 128 MiB/s repro shows the retransmit
-		// cadence at the default WARN log level.
-		log(STICE_LOG_LEVEL_WARN, "DIAG: TURN retransmit kind=%d retry=%d next=%dms",
+		if (isConnect) {
+			// Never schedule the next evaluation past the CONNECT deadline. If we
+			// did, the timeout would only be checked at that later tick and the
+			// budget would overrun instead of failing at 32 s.
+			const auto deadline = tx.sentAt + std::chrono::milliseconds(TurnConnectTimeoutMs);
+			if (tx.nextRetransmitAt > deadline) tx.nextRetransmitAt = deadline;
+		}
+		log(STICE_LOG_LEVEL_DEBUG, "TURN retransmit kind=%d retry=%d next=%dms",
 		    static_cast<int>(tx.kind), tx.retries, interval);
 	}
 		if (tx.nextRetransmitAt < nextTick_)
 			nextTick_ = tx.nextRetransmitAt;
 		++it;
+	}
+
+	// P2-N3: fire a deferred Allocate retry once its backoff has elapsed.
+	if (state_ == AllocState::Idle &&
+	    nextAllocateRetryAt_ != std::chrono::steady_clock::time_point{} &&
+	    now >= nextAllocateRetryAt_) {
+		nextAllocateRetryAt_ = {};
+		allocate();
 	}
 
 	// Refresh allocation if due.
@@ -936,6 +1208,10 @@ std::chrono::steady_clock::time_point Client::tick() {
 	}
 	if (state_ == AllocState::Allocated && refreshAt_ < nextTick_)
 		nextTick_ = refreshAt_;
+	if (state_ == AllocState::Idle &&
+	    nextAllocateRetryAt_ != std::chrono::steady_clock::time_point{} &&
+	    nextAllocateRetryAt_ < nextTick_)
+		nextTick_ = nextAllocateRetryAt_;
 	if (nextTick_ == std::chrono::steady_clock::time_point::max())
 		return {};
 	return nextTick_;

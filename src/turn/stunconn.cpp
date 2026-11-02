@@ -8,6 +8,8 @@
 
 #include "stice/turn/stunconn.hpp"
 
+#include "stice/log.hpp"
+
 #include <cstdint>
 #include <cstring>
 
@@ -19,6 +21,9 @@ namespace {
 constexpr std::size_t kStunHeaderSize = 20;
 constexpr std::uint32_t kStunMagicCookie = 0x2112A442u;
 constexpr std::uint16_t kChannelMin = 0x4000;
+// Receive-side demux accepts the RFC 5766 legacy ceiling (0x7FFF) as well as
+// the RFC 8656 §12.1 range (0x4FFF) so older peers keep parsing; allocation is
+// restricted to 0x4000-0x4FFF by channeldata.hpp.
 constexpr std::uint16_t kChannelMax = 0x7FFF;
 constexpr std::size_t kChannelDataHeaderSize = 4;
 constexpr std::size_t kChannelDataPadding = 4;
@@ -87,6 +92,15 @@ void StunConn::feed(const unsigned char *data, std::size_t size) {
 	if (consumed_ > 0 && consumed_ >= buf_.size() / 2) {
 		buf_.erase(buf_.begin(), buf_.begin() + consumed_);
 		consumed_ = 0;
+	}
+	// Bound the reassembly buffer. A peer that never completes a frame (or
+	// floods partial frames) could otherwise grow it without limit; the caller
+	// treats a full buffer as a fatal stream error and closes the connection.
+	constexpr std::size_t kMaxBufferedBytes = 1u * 1024 * 1024;
+	if (buf_.size() - consumed_ + size > kMaxBufferedBytes) {
+		STICE_LOG_WARN("StunConn: receive buffer would exceed %zu bytes, dropping %zu-byte chunk",
+			kMaxBufferedBytes, size);
+		return;
 	}
 	buf_.insert(buf_.end(), data, data + size);
 }

@@ -45,6 +45,20 @@ net::AddrRecord makeV4(std::uint32_t ip, std::uint16_t port) {
 	return r;
 }
 
+// Sign a response the way a compliant TURN server does (RFC 8489 §10.1.2):
+// MESSAGE-INTEGRITY over the long-term key, and no USERNAME/REALM/NONCE
+// echoed back. The key uses the harness's fixed credentials
+// (alice / example.org / secret); tests that never receive a 401 do not
+// verify it.
+void encodeSignedResponse(Message &m) {
+	Credentials creds;
+	creds.username = "alice";
+	creds.realm = "example.org";
+	auto key = crypto::longTermKey(creds.username, creds.realm, "secret");
+	creds.key.assign(key.begin(), key.end());
+	m.encode("secret", &creds, nullptr, /*emitAuthAttributes=*/false);
+}
+
 // Build an Allocate Success Response that the server would send back.
 // `relayedIp`/`relayedPort` is the XOR-RELAYED-ADDRESS; `lifetime` is the
 // granted allocation lifetime.
@@ -60,7 +74,7 @@ bytes buildAllocateSuccess(const std::array<unsigned char, 12> &reqTid,
 	addLifetime(m, lifetime);
 	// Also include XOR-MAPPED-ADDRESS for completeness (RFC 8489).
 	writeXorAddress(m, AttrType::XorMappedAddress, makeV4(0xC0A80101u, 12345), m.transactionID);
-	m.encode(nullptr, nullptr, nullptr);
+	encodeSignedResponse(m);
 	return m.raw;
 }
 
@@ -86,7 +100,7 @@ bytes buildSuccessResponse(Method method, const std::array<unsigned char, 12> &r
 	m.cls = Class::SuccessResponse;
 	m.transactionID = reqTid;
 	if (lifetime > 0) addLifetime(m, lifetime);
-	m.encode(nullptr, nullptr, nullptr);
+	encodeSignedResponse(m);
 	return m.raw;
 }
 
@@ -112,6 +126,8 @@ struct TurnHarness {
 		net::AddrRecord peer;
 	};
 	std::vector<ConnectFailEvent> connectFailures; // onConnectFailed
+	// RFC 8489 §14.11 redirect targets delivered via onAlternateServer.
+	std::vector<net::AddrRecord> alternates;
 
 	Client client;
 
@@ -150,6 +166,9 @@ struct TurnHarness {
 		sink.onConnectFailed = [this](int code, const std::string &reason, const net::AddrRecord &peer) {
 			connectFailures.push_back({code, reason, peer});
 		};
+		sink.onAlternateServer = [this](const net::AddrRecord &alt) {
+			alternates.push_back(alt);
+		};
 		client.init(cfg, std::move(sink));
 	}
 
@@ -184,6 +203,9 @@ struct TurnHarness {
 		};
 		sink.onConnectFailed = [this](int code, const std::string &reason, const net::AddrRecord &peer) {
 			connectFailures.push_back({code, reason, peer});
+		};
+		sink.onAlternateServer = [this](const net::AddrRecord &alt) {
+			alternates.push_back(alt);
 		};
 		client.init(cfg, std::move(sink));
 
@@ -235,7 +257,7 @@ TEST_CASE("ChannelData wrap/unwrap round-trip (no padding needed)", "[turn][chan
 TEST_CASE("ChannelData wrap pads to 4 bytes", "[turn][channeldata]") {
 	unsigned char data[] = {1, 2, 3}; // 3 bytes -> pad 1
 	bytes out;
-	auto n = wrapChannelData(0x7FFF, data, sizeof(data), out);
+	auto n = wrapChannelData(0x4FFF, data, sizeof(data), out);
 	REQUIRE(n == 8);
 	REQUIRE(out[3] == 0x03); // length field is unpadded size
 	REQUIRE(out[4] == 1);
@@ -244,11 +266,38 @@ TEST_CASE("ChannelData wrap pads to 4 bytes", "[turn][channeldata]") {
 	REQUIRE(out[7] == 0); // padding
 }
 
+TEST_CASE("ChannelData UDP form adds no padding (RFC 8656 §12.5)",
+          "[turn][channeldata]") {
+	unsigned char data[] = {1, 2, 3}; // 3 bytes
+	bytes out;
+	auto n = wrapChannelData(0x4001, data, sizeof(data), out, /*pad=*/false);
+	REQUIRE(n == 7); // 4 header + 3 data, no padding on UDP
+	REQUIRE(out[2] == 0x00);
+	REQUIRE(out[3] == 0x03);
+	REQUIRE(out[6] == 3);
+}
+
 TEST_CASE("ChannelData wrap rejects out-of-range channel", "[turn][channeldata]") {
 	unsigned char data[] = {1};
 	bytes out;
 	REQUIRE(wrapChannelData(0x3FFF, data, 1, out) == 0);
 	REQUIRE(wrapChannelData(0x8000, data, 1, out) == 0);
+	// RFC 8656 §12.1 narrowed the range: 0x5000-0x7FFF is no longer allocatable.
+	REQUIRE(wrapChannelData(0x5000, data, 1, out) == 0);
+	REQUIRE(wrapChannelData(0x7FFF, data, 1, out) == 0);
+}
+
+TEST_CASE("ChannelData legacy range still parses on receive",
+          "[turn][channeldata]") {
+	// A pre-RFC-8656 peer may allocate 0x5000-0x7FFF; we must still decode it.
+	unsigned char frame[] = {0x7F, 0xFE, 0x00, 0x01, 0xAA, 0x00, 0x00, 0x00};
+	std::uint16_t ch = 0;
+	const unsigned char *payload = nullptr;
+	std::size_t fs = 0;
+	std::size_t len = unwrapChannelData(frame, sizeof(frame), ch, payload, fs);
+	REQUIRE(len == 1);
+	REQUIRE(ch == 0x7FFE);
+	REQUIRE(payload[0] == 0xAA);
 }
 
 TEST_CASE("ChannelData unwrap recovers data and channel", "[turn][channeldata]") {
@@ -357,6 +406,226 @@ TEST_CASE("TURN allocate success stores relayed address + lifetime", "[turn]") {
 	REQUIRE(ntohs(reinterpret_cast<const sockaddr_in *>(&h.client.relayedAddr().addr)->sin_port)
 	        == 5000);
 	REQUIRE(h.allocatedLifetime == 600);
+}
+
+// ---------------------------------------------------------------------------
+// TURN Allocate: recoverable errors (486/508/300) are retried with an
+// exponential backoff + jitter instead of an immediate re-send (P1-#6).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("TURN allocate 486 retry is deferred by backoff, not immediate",
+          "[turn][allocate][backoff]") {
+	TurnHarness h;
+	h.init();
+	h.client.allocate();
+	auto req = h.popLastMessage();
+	REQUIRE(req.method == Method::Allocate);
+
+	// 486 (Allocation Quota Reached) is recoverable: the client must NOT
+	// re-send at round-trip speed.
+	Message err;
+	err.method = Method::Allocate;
+	err.cls = Class::ErrorResponse;
+	err.transactionID = req.transactionID;
+	addErrorCode(err, 486, "Allocation Quota Reached");
+	err.encode(nullptr, nullptr, nullptr);
+	// Clock seam: the poll loop ticks first, then dispatches the response, so
+	// the backoff base and the tick clock share one time domain.
+	const auto t0 = std::chrono::steady_clock::now();
+	h.client.tick(t0);
+	h.client.handleInbound(err.raw.data(), err.raw.size());
+
+	REQUIRE(h.client.state() == AllocState::Idle);
+	REQUIRE(h.sent.size() == 1); // no immediate re-send
+
+	// The deferred retry is armed at 1s ±20%.
+	const auto due = h.client.tick(t0);
+	const auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(due - t0);
+	INFO("first retry delay: " << delay.count() << " ms");
+	REQUIRE(delay >= std::chrono::milliseconds(800));
+	REQUIRE(delay <= std::chrono::milliseconds(1200));
+
+	// Nothing goes out before the delay elapses.
+	h.client.tick(t0 + std::chrono::milliseconds(700));
+	REQUIRE(h.sent.size() == 1);
+
+	// Once due, the Allocate is re-sent.
+	h.client.tick(due + std::chrono::milliseconds(1));
+	REQUIRE(h.sent.size() == 2);
+	Message retried;
+	REQUIRE(retried.decode(h.sent.back().data(), h.sent.back().size()));
+	REQUIRE(retried.method == Method::Allocate);
+}
+
+TEST_CASE("TURN allocate 508 doubles the backoff then fails after the retry budget",
+          "[turn][allocate][backoff]") {
+	TurnHarness h;
+	h.init();
+	h.client.allocate();
+	auto req = h.popLastMessage();
+	REQUIRE(req.method == Method::Allocate);
+
+	Message err;
+	err.method = Method::Allocate;
+	err.cls = Class::ErrorResponse;
+	err.transactionID = req.transactionID;
+	addErrorCode(err, 508, "Insufficient Capacity");
+	err.encode(nullptr, nullptr, nullptr);
+	// Clock seam: tick first (poll iteration), then dispatch the response.
+	const auto t0 = std::chrono::steady_clock::now();
+	h.client.tick(t0);
+	h.client.handleInbound(err.raw.data(), err.raw.size());
+
+	const auto firstDue = h.client.tick(t0);
+	const auto firstDelay = std::chrono::duration_cast<std::chrono::milliseconds>(firstDue - t0);
+	REQUIRE(firstDelay >= std::chrono::milliseconds(800));
+	REQUIRE(firstDelay <= std::chrono::milliseconds(1200));
+
+	// Fire the first retry and answer it with another 508.
+	const auto t1 = firstDue + std::chrono::milliseconds(1);
+	h.client.tick(t1);
+	REQUIRE(h.sent.size() == 2);
+	Message retried;
+	REQUIRE(retried.decode(h.sent.back().data(), h.sent.back().size()));
+
+	Message err2;
+	err2.method = Method::Allocate;
+	err2.cls = Class::ErrorResponse;
+	err2.transactionID = retried.transactionID;
+	addErrorCode(err2, 508, "Insufficient Capacity");
+	err2.encode(nullptr, nullptr, nullptr);
+	h.client.handleInbound(err2.raw.data(), err2.raw.size());
+
+	// Second attempt doubles the base to 2s ±20%.
+	const auto secondDue = h.client.tick(t1);
+	const auto secondDelay = std::chrono::duration_cast<std::chrono::milliseconds>(secondDue - t1);
+	INFO("second retry delay: " << secondDelay.count() << " ms");
+	REQUIRE(secondDelay >= std::chrono::milliseconds(1600));
+	REQUIRE(secondDelay <= std::chrono::milliseconds(2400));
+
+	// The third 508 exhausts MaxAllocateRetries -> terminal failure.
+	const auto t2 = secondDue + std::chrono::milliseconds(1);
+	h.client.tick(t2);
+	REQUIRE(h.sent.size() == 3);
+	Message retried2;
+	REQUIRE(retried2.decode(h.sent.back().data(), h.sent.back().size()));
+
+	Message err3;
+	err3.method = Method::Allocate;
+	err3.cls = Class::ErrorResponse;
+	err3.transactionID = retried2.transactionID;
+	addErrorCode(err3, 508, "Insufficient Capacity");
+	err3.encode(nullptr, nullptr, nullptr);
+	h.client.handleInbound(err3.raw.data(), err3.raw.size());
+	REQUIRE(h.client.state() == AllocState::Failed);
+	REQUIRE(h.failedCode == 508);
+}
+
+// Encode ALTERNATE-SERVER (0x8023) as RFC 8489 §14.11 specifies: a plain
+// MAPPED-ADDRESS-style value (family byte + port + address), not XOR-encoded.
+void addAlternateServer(Message &m, std::uint32_t ip, std::uint16_t port) {
+	const unsigned char v[8] = {0,
+	                            FamilyIPv4,
+	                            static_cast<unsigned char>(port >> 8),
+	                            static_cast<unsigned char>(port & 0xFF),
+	                            static_cast<unsigned char>(ip >> 24),
+	                            static_cast<unsigned char>((ip >> 16) & 0xFF),
+	                            static_cast<unsigned char>((ip >> 8) & 0xFF),
+	                            static_cast<unsigned char>(ip & 0xFF)};
+	m.addAttribute(AttrType::AlternateServer, v, sizeof(v));
+}
+
+TEST_CASE("TURN allocate 300 reports the alternate server and defers the retry",
+          "[turn][allocate][300]") {
+	TurnHarness h;
+	h.init();
+	h.client.allocate();
+	auto req = h.popLastMessage();
+	REQUIRE(req.method == Method::Allocate);
+
+	Message err;
+	err.method = Method::Allocate;
+	err.cls = Class::ErrorResponse;
+	err.transactionID = req.transactionID;
+	addErrorCode(err, 300, "Try Alternate");
+	addAlternateServer(err, 0xC0A80102u, 3479);
+	err.encode(nullptr, nullptr, nullptr);
+	const auto t0 = std::chrono::steady_clock::now();
+	h.client.tick(t0);
+	h.client.handleInbound(err.raw.data(), err.raw.size());
+
+	// The redirect target must reach the owner (it retargets its send path),
+	// decoded from ALTERNATE-SERVER rather than MAPPED-ADDRESS.
+	REQUIRE(h.alternates.size() == 1);
+	REQUIRE(h.alternates[0].socktype == SOCK_DGRAM);
+	sockaddr_in alt{};
+	std::memcpy(&alt, &h.alternates[0].addr, sizeof(alt));
+	REQUIRE(ntohs(alt.sin_port) == 3479);
+	REQUIRE(ntohl(alt.sin_addr.s_addr) == 0xC0A80102u);
+
+	// No immediate re-send: 300 shares the 1s ±20% Allocate backoff.
+	REQUIRE(h.client.state() == AllocState::Idle);
+	REQUIRE(h.sent.size() == 1);
+	const auto due = h.client.tick(t0);
+	const auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(due - t0);
+	INFO("300 retry delay: " << delay.count() << " ms");
+	REQUIRE(delay >= std::chrono::milliseconds(800));
+	REQUIRE(delay <= std::chrono::milliseconds(1200));
+	h.client.tick(due + std::chrono::milliseconds(1));
+	REQUIRE(h.sent.size() == 2);
+	Message retried;
+	REQUIRE(retried.decode(h.sent.back().data(), h.sent.back().size()));
+	REQUIRE(retried.method == Method::Allocate);
+}
+
+TEST_CASE("TURN allocate 437 releases the stale allocation before retrying",
+          "[turn][allocate][437]") {
+	TurnHarness h;
+	h.init();
+	h.client.allocate();
+	auto req = h.popLastMessage();
+	REQUIRE(req.method == Method::Allocate);
+
+	Message err;
+	err.method = Method::Allocate;
+	err.cls = Class::ErrorResponse;
+	err.transactionID = req.transactionID;
+	addErrorCode(err, 437, "Allocation Mismatch");
+	err.encode(nullptr, nullptr, nullptr);
+	h.client.handleInbound(err.raw.data(), err.raw.size());
+
+	// Teardown first: Refresh(0) goes out immediately, the Allocate does not.
+	// (The allocation stays in Allocating until the retry succeeds or fails.)
+	REQUIRE(h.client.state() == AllocState::Allocating);
+	REQUIRE(h.sent.size() == 2);
+	Message refresh;
+	REQUIRE(refresh.decode(h.sent.back().data(), h.sent.back().size()));
+	REQUIRE(refresh.method == Method::Refresh);
+	REQUIRE(refresh.cls == Class::Request);
+	std::uint32_t lt = 1;
+	REQUIRE(readLifetime(refresh, lt));
+	REQUIRE(lt == 0);
+
+	// The retry is serialized behind the teardown: while the Refresh(0) is
+	// unanswered no Allocate may be re-sent (a late teardown landing after the
+	// retry would otherwise delete the FRESH allocation). Ticking far ahead only
+	// retransmits the Refresh (same TID), never the Allocate.
+	const auto t0 = std::chrono::steady_clock::now();
+	h.client.tick(t0 + std::chrono::milliseconds(3000));
+	std::size_t allocateCount = 0;
+	for (const auto &b : h.sent) {
+		Message m;
+		if (m.decode(b.data(), b.size()) && m.method == Method::Allocate) ++allocateCount;
+	}
+	REQUIRE(allocateCount == 1);
+
+	// Refresh(0) success is the terminal teardown state -> the retry runs.
+	auto ok = buildSuccessResponse(Method::Refresh, refresh.transactionID);
+	h.client.handleInbound(ok.data(), ok.size());
+	REQUIRE(h.sent.size() >= 3);
+	Message retried;
+	REQUIRE(retried.decode(h.sent.back().data(), h.sent.back().size()));
+	REQUIRE(retried.method == Method::Allocate);
 }
 
 TEST_CASE("TURN allocate failure triggers onFailed", "[turn]") {
@@ -780,7 +1049,7 @@ TEST_CASE("StunConn parses ChannelData with no padding needed", "[turn][stunconn
 	// 4 bytes of data -> no padding -> total frame = 4 + 4 = 8.
 	unsigned char data[] = {1, 2, 3, 4};
 	bytes cd;
-	wrapChannelData(0x7FFE, data, sizeof(data), cd);
+	wrapChannelData(0x4FFE, data, sizeof(data), cd);
 	REQUIRE(cd.size() == 8);
 
 	StunConn sc;
@@ -1280,17 +1549,16 @@ TEST_CASE("TURN Allocate retransmission timeout invokes onFailed", "[turn][failu
 	h.client.allocate();
 	REQUIRE(h.client.state() == AllocState::Allocating);
 
-	// Drive the retransmission timer past TurnMaxRtxCount retries.
-	// Each tick() advances the clock; we simulate time passing by calling
-	// tick() enough times with the harness clock advancing.
-	auto start = std::chrono::steady_clock::now();
+	// Drive the retransmission timer past TurnMaxRtxCount retries. Use the
+	// explicit-now tick overload so the whole ≈31.5 s RFC 8489 §6.2.1 budget
+	// (500 ms doubling to 8 s, Rc=7) elapses in virtual time instead of real
+	// sleeps; each tick handles at most one retransmit, so Rc+1 ticks are needed.
+	auto now = std::chrono::steady_clock::now();
 	bool failed = false;
-	for (int i = 0; i < 200; ++i) {
-		// Simulate time advancing: tick() uses steady_clock, so we sleep.
-		std::this_thread::sleep_for(std::chrono::milliseconds(TurnMaxRtxIntervalMs + 50));
-		h.client.tick();
+	for (int i = 0; i <= TurnMaxRtxCount + 2; ++i) {
+		now += std::chrono::milliseconds(TurnMaxRtxIntervalMs + 50);
+		h.client.tick(now);
 		if (h.client.state() == AllocState::Failed) { failed = true; break; }
-		if (std::chrono::steady_clock::now() - start > std::chrono::seconds(30)) break;
 	}
 	REQUIRE(failed);
 	REQUIRE(h.client.state() == AllocState::Failed);
@@ -1370,7 +1638,7 @@ bytes buildConnectSuccess(const std::array<unsigned char, 12> &reqTid,
 	m.cls = Class::SuccessResponse;
 	m.transactionID = reqTid;
 	addConnectionId(m, connectionId);
-	m.encode(nullptr, nullptr, nullptr);
+	encodeSignedResponse(m);
 	return m.raw;
 }
 
@@ -1417,6 +1685,44 @@ TEST_CASE("RFC 6062: sendConnect builds CONNECT request with XOR-PEER-ADDRESS", 
 	net::AddrRecord decoded;
 	REQUIRE(readXorAddress(m, AttrType::XorPeerAddress, decoded, m.transactionID));
 	REQUIRE(decoded.isEqual(peer, true));
+}
+
+TEST_CASE("RFC 6062: CONNECTION-BIND request carries PASSWORD-ALGORITHM after SHA-256 negotiation",
+          "[turn][rfc6062][password-agility]") {
+	TurnHarness h;
+	h.init();
+	h.client.allocate();
+	auto allocReq = h.popLastMessage();
+	REQUIRE(allocReq.method == Method::Allocate);
+
+	// 401 advertising SHA-256: the client negotiates HMAC-SHA256 (RFC 8489 §9.2.3).
+	Message challenge;
+	challenge.method = Method::Allocate;
+	challenge.cls = Class::ErrorResponse;
+	challenge.transactionID = allocReq.transactionID;
+	addErrorCode(challenge, 401, "Unauthenticated");
+	addString(challenge, AttrType::Realm, "example.org");
+	addString(challenge, AttrType::Nonce, "nonce1");
+	addPasswordAlgorithms(challenge, {PasswordAlgorithmSha256});
+	challenge.encode(nullptr, nullptr, nullptr);
+	h.client.handleInbound(challenge.raw.data(), challenge.raw.size());
+
+	// The retried Allocate advertises the algorithm via prepareRequest.
+	auto retry = h.popLastMessage();
+	REQUIRE(retry.method == Method::Allocate);
+	REQUIRE(retry.find(AttrType::PasswordAlgorithm) != nullptr);
+
+	// CONNECTION-BIND is built by hand; it must not be the one authenticated
+	// request that omits the advertisement (P2-N10).
+	auto bindRaw = h.client.buildConnectionBindRequest(1);
+	Message bind;
+	REQUIRE(bind.decode(bindRaw.data(), bindRaw.size()));
+	REQUIRE(bind.method == Method::ConnectionBind);
+	const auto *bindAlg = bind.find(AttrType::PasswordAlgorithm);
+	REQUIRE(bindAlg != nullptr);
+	REQUIRE(bindAlg->value.size() >= 2);
+	REQUIRE(bindAlg->value[0] == 0x00);
+	REQUIRE(bindAlg->value[1] == 0x02); // PasswordAlgorithmSha256
 }
 
 TEST_CASE("RFC 6062: sendConnect before Allocated is a no-op", "[turn][rfc6062]") {
@@ -1492,6 +1798,83 @@ TEST_CASE("RFC 6062: CONNECT error does NOT fire onConnectSuccess", "[turn][rfc6
 	REQUIRE(h.connectFailures[0].peer.isEqual(peer, true));
 	// Allocation must remain intact — a failed CONNECT does not tear down
 	// the allocation; the agent may retry with another pair.
+	REQUIRE(h.client.state() == AllocState::Allocated);
+}
+
+TEST_CASE("RFC 6062: CONNECT 446 (connection already exists) is recoverable", "[turn][rfc6062][failure]") {
+	// RFC 6062 §5.3.5: the server answers 446 when a connection to the peer
+	// already exists. Like 447 it must surface in onConnectFailed with its
+	// code intact so the agent can take the bounded retry path instead of
+	// failing the pair immediately, and the allocation must survive.
+	TurnHarness h;
+	h.init();
+	h.reachAllocated(/*tcp=*/true);
+
+	auto peer = makeV4(0x0A000005u, 4000);
+	h.client.sendConnect(peer);
+
+	std::array<unsigned char, 12> connectTid{};
+	for (const auto &b : h.sent) {
+		Message m;
+		if (!m.decode(b.data(), b.size())) continue;
+		if (m.method == Method::Connect && m.cls == Class::Request) {
+			connectTid = m.transactionID;
+			break;
+		}
+	}
+
+	auto err = buildConnectError(connectTid, 446, "Connection Already Exists");
+	h.client.handleInbound(err.data(), err.size());
+
+	REQUIRE(h.connectSuccess.empty());
+	REQUIRE(h.connectFailures.size() == 1);
+	REQUIRE(h.connectFailures[0].code == 446);
+	REQUIRE(h.connectFailures[0].reason == "Connection Already Exists");
+	REQUIRE(h.connectFailures[0].peer.isEqual(peer, true));
+	// The allocation survives: the agent re-sends CONNECT after the
+	// 10 s ±20% backoff, expecting the server to hand over the existing
+	// connection once it settles.
+	REQUIRE(h.client.state() == AllocState::Allocated);
+}
+
+TEST_CASE("RFC 6062: CONNECT silent timeout reports 447 (recoverable)", "[turn][rfc6062][failure]") {
+	// A TURN server may spend up to 30 s dialing the peer before answering
+	// CONNECT (RFC 6062 §4.3). When no response ever arrives the client must
+	// exhaust the 32 s CONNECT budget and report 447 (Connection Timeout or
+	// Failure) so the agent's bounded retry path is taken. A non-standard 408
+	// bypassed that retry path and failed the pair immediately.
+	TurnHarness h;
+	h.init();
+	h.reachAllocated(/*tcp=*/true);
+
+	auto peer = makeV4(0x0A000005u, 4000);
+	h.client.sendConnect(peer);
+	REQUIRE(h.connectFailures.empty());
+
+	// Drive the timer past the CONNECT deadline using a synthetic clock; the
+	// transaction was sent at ~steady_clock::now(), so +33 s is past the 32 s
+	// budget without sleeping in real time.
+	h.client.tick(std::chrono::steady_clock::now() + std::chrono::seconds(33));
+
+	REQUIRE(h.connectSuccess.empty());
+	REQUIRE(h.connectFailures.size() == 1);
+	REQUIRE(h.connectFailures[0].code == 447);
+	REQUIRE(h.connectFailures[0].peer.isEqual(peer, true));
+	// The allocation survives a failed CONNECT; the agent retries the pair.
+	REQUIRE(h.client.state() == AllocState::Allocated);
+}
+
+TEST_CASE("RFC 6062: CONNECT inside its budget does not time out", "[turn][rfc6062]") {
+	TurnHarness h;
+	h.init();
+	h.reachAllocated(/*tcp=*/true);
+
+	auto peer = makeV4(0x0A000005u, 4000);
+	h.client.sendConnect(peer);
+
+	// 10 s after sending is still inside the 32 s window: no failure yet.
+	h.client.tick(std::chrono::steady_clock::now() + std::chrono::seconds(10));
+	REQUIRE(h.connectFailures.empty());
 	REQUIRE(h.client.state() == AllocState::Allocated);
 }
 

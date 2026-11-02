@@ -121,9 +121,15 @@ STICE_EXPORT void stice_destroy(stice_agent_t *agent) {
 }
 
 STICE_EXPORT int stice_gather_candidates(stice_agent_t *agent) {
-	auto *a = agent_check(agent);
-	if (!a) return STICE_ERR_INVALID;
-	return a->agent.gatherCandidates();
+    auto *a = agent_check(agent);
+    if (!a) return STICE_ERR_INVALID;
+    return a->agent.gatherCandidates();
+}
+
+STICE_EXPORT int stice_agent_restart(stice_agent_t *agent) {
+    auto *a = agent_check(agent);
+    if (!a) return STICE_ERR_INVALID;
+    return a->agent.restart();
 }
 
 STICE_EXPORT int stice_get_local_description(stice_agent_t *agent, char *buffer, size_t size) {

@@ -347,6 +347,16 @@ void PollRegistry::epollSync(const std::vector<PollParticipant *> &participants,
 			if (tfd != STICE_INVALID_SOCKET)
 				desired.push_back({tfd, p, 2, -1, static_cast<short>(p->tcpDesiredEvents())});
 		}
+		{
+			int n = p->iceTcpSlotCount();
+			for (int si = 0; si < n; ++si) {
+				socket_t tfd = p->iceTcpSocketAt(si);
+				if (tfd == STICE_INVALID_SOCKET) continue;
+				if (p->hasTcp() && tfd == p->tcpSocket()) continue; // legacy dup
+				desired.push_back({tfd, p, 7, si,
+				                   static_cast<short>(p->iceTcpDesiredEventsAt(si))});
+			}
+		}
 		if (p->hasTurnTcp()) {
 			socket_t tfd = p->turnTcpSocket();
 			if (tfd != STICE_INVALID_SOCKET)
@@ -575,6 +585,7 @@ void PollRegistry::run() {
 				case 4: s.participant->onAccept(); break;
 				case 5: s.participant->onTurnDataTcpEvents(rev); break;
 				case 6: s.participant->onTurnTcpEventsSock(s.fd, rev); break;
+				case 7: s.participant->onIceTcpEventsSock(s.fd, rev); break;
 			}
 		}
 #else
@@ -609,6 +620,16 @@ void PollRegistry::run() {
 					if (tfd != STICE_INVALID_SOCKET) {
 						pollfd t{}; t.fd = tfd; t.events = p->tcpDesiredEvents();
 						pfds.push_back(t); slots.push_back({p, 2});
+					}
+				}
+				{
+					int nslot = p->iceTcpSlotCount();
+					for (int si = 0; si < nslot; ++si) {
+						socket_t tfd = p->iceTcpSocketAt(si);
+						if (tfd == STICE_INVALID_SOCKET) continue;
+						if (p->hasTcp() && tfd == p->tcpSocket()) continue;
+						pollfd t{}; t.fd = tfd; t.events = p->iceTcpDesiredEventsAt(si);
+						pfds.push_back(t); slots.push_back({p, 7, si});
 					}
 				}
 				if (p->hasTurnTcp()) {
@@ -684,6 +705,8 @@ void PollRegistry::run() {
 				slot.participant->onTurnDataTcpEvents(pfds[i].revents);
 			else if (slot.kind == 6)
 				slot.participant->onTurnTcpEventsSock(pfds[i].fd, pfds[i].revents);
+			else if (slot.kind == 7)
+				slot.participant->onIceTcpEventsSock(pfds[i].fd, pfds[i].revents);
 		}
 #endif // STICE_EPOLL_BACKEND (epoll event source vs poll(2) fallback)
 

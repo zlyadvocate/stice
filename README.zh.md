@@ -1,7 +1,7 @@
 # stice
 
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
-[![Version](https://img.shields.io/badge/version-0.13.1-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-0.14.1-blue.svg)]()
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)]()
 
 **C++17 ICE + TURN 客户端库，从 [pion/webrtc](https://github.com/pion/webrtc) (Go) 移植，设计为 [libjuice](https://github.com/paullouisageneau/libjuice) 的 drop-in 替代品。**
@@ -16,27 +16,39 @@ stice 用现代 C++17 实现了 ICE（Interactive Connectivity Establishment，R
 |------|------|:--------------:|:-----------------:|
 | STUN Message | RFC 8489 | ✅ | ✅ |
 | ICE Agent | RFC 8445 | ✅ | — |
-| ICE-TCP (TCP 候选者) | RFC 6544 | ✅ active/passive/SO | ✅ passive (via TCPMux) |
+| ICE-TCP (TCP 候选者) | RFC 6544 | ✅ active/passive（SO：experimental，仅对称破缺框架） | ✅ 6062 中继被动（非 ICE-TCP TCPMux） |
 | TURN (UDP 中继) | RFC 8656 | ✅ | ✅ |
 | TURN over TCP (控制) | RFC 8656 | ✅ | ✅ |
 | TURN over TLS | RFC 8656 | ✅ | — |
-| TURN TCP Allocations (Mode-A/B) | RFC 6062 | ✅ CONNECT/CONNECTION-ATTEMPT/CONNECTION-BIND | ✅ data pipe relay |
-| mDNS 候选者 | draft-ietf-rtcweb-mdns-ice-candidates | ✅ query/gather | — |
+| TURN TCP Allocations (Mode-A/B) | RFC 6062 | ✅ opt-in（`STICE_TURN_TCP_RFC6062`）CONNECT/CONNECTION-ATTEMPT/CONNECTION-BIND | ✅ data pipe relay（精简 Mode-B 子集） |
+| mDNS 候选者 | draft-ietf-rtcweb-mdns-ice-candidates | ✅ gather（本地宣告）+ query（远端 .local 解析，库内自带组播查询） | — |
 | Trickle ICE | draft-ietf-ice-trickle | ✅ | — |
 
 ## 特性
 
-- **ICE Agent (RFC 8445)** — 完整连接性检查、aggressive/regular 提名、trickle ICE、ICE restart、controlled/controlling 角色
-- **STUN client (RFC 8489)** — server-reflexive 候选者收集、多 STUN 并行查询、认证
-- **TURN client (RFC 8656 + RFC 6062)** — UDP/TCP/TLS 传输；channel data；permissions；**RFC 6062 TCP allocations**，含 Mode-A 控制连接和 Mode-B 数据管道（CONNECT / CONNECTION-ATTEMPT / CONNECTION-BIND / CONNECTION-ID）
-- **ICE-TCP (RFC 6544)** — active / passive / simultaneous-open 模式、TCP 优先级偏移、per-pair TCPMux 被动监听
-- **Multicast DNS (mDNS)** — query-only 和 query-and-gather 模式，保护本地候选者隐私
+- **ICE Agent (RFC 8445)** — 完整连接性检查、aggressive/regular 提名、trickle ICE、controlled/controlling 角色；ICE restart（`stice_agent_restart`）会生成新的 ufrag/pwd 并重建 checklist
+- **STUN client (RFC 8489)** — server-reflexive 候选者收集、多 STUN 并行查询、认证；响应以 XOR-MAPPED-ADDRESS 为准，仅返回 MAPPED-ADDRESS 的旧式响应（RFC 8489 已移除该属性）仍可接受并记录告警
+- **TURN client (RFC 8656 + RFC 6062)** — UDP/TCP/TLS 传输；channel data；permissions；**RFC 6062 TCP allocations**（需 `STICE_TURN_TCP_RFC6062` 显式开启），含 Mode-A 控制连接和 Mode-B 数据管道（CONNECT / CONNECTION-ATTEMPT / CONNECTION-BIND / CONNECTION-ID）
+- **ICE-TCP (RFC 6544)** — active / passive 模式、TCP 优先级偏移、per-pair TCPMux 被动监听；simultaneous-open 为 **experimental**（仅对称破缺框架，不产出 `so` 候选）
+- **Multicast DNS (mDNS)** — 本地候选者宣告（gather）+ 远端 `.local` 候选查询解析（使用库内自带组播解析器）；主机名为随机 UUIDv4 标签，因此跳过草案 SHOULD 级的冲突探测（同名冲突不会被检测）
 - **NAT 1:1 地址重写** — replace 或 append 外部 IP 映射，支持 host/srflx/relay 候选者
 - **UDP / TCP 多路复用** — 多个 agent 共享单个 socket（UDPMux / TCPMux）
 - **可配置配对策略** — RFC 8445 strict、serial、limited-concurrent、phased-UDP-first 调度；aggressive / regular / stable 提名；RFC 6062 TCP-relay 回退策略；lazy Mode-B 预分配
 - **内置 TURN 服务器 (`stserver`)** — UDP + TCP 监听、STUN binding、TURN UDP 中继、TURN TCP 中继（RFC 6062 Mode-B 数据管道）、ICE-TCP 被动候选者支持；epoll / IOCP / select 后端
 - **libjuice 兼容** — 通过 `juice_compat.cpp` 实现 `juice_*` C API 的 drop-in 替换
 - **跨平台** — Windows (MSVC/MinGW)、Linux、macOS
+
+### 已知限制与文档化偏离
+
+- **单一 ICE component。** 仅收集、配对与检查 component 1，不支持独立的 RTCP component。这与 BUNDLE 单 5-tuple 媒体栈一致，也是 libjuice 的限制。
+- **不实现 ICE-lite 角色。** `a=ice-lite` 可序列化与解析，但 agent 始终执行完整连接性检查，从不以 lite 身份运行；对端为 lite 时按普通对端处理，作为 lite 运行属预留扩展。
+- **mDNS 冲突探测。** 宣告名为随机 UUIDv4 标签，因此跳过草案 SHOULD 级冲突探测，同名冲突不会被检测（见上方 mDNS 特性条目）。
+- **`raddr`/`rport` 兼容性 hack。** srflx/relay 候选者会序列化为 `raddr 0.0.0.0 rport 0` 以兼容 Firefox，并非 RFC 8839 §5.1.1 要求的真实 base 地址。设置 `STICE_SDP_RADDR_HACK=0` 可输出规范行。
+- **选中候选者自省接口。** `stice_get_selected_candidates()` 返回配对的 SDP 形式，因此在 `QueryAndGather` mDNS 模式下本地 host 候选以 `.local` 名出现；`stice_get_selected_addresses()` 返回解析后的真实地址，会暴露 IP。
+- **consent 保活周期。** 所有 profile 的 UDP consent 检查统一为 5 s（低功耗档此前为 15 s，叠加抖动后距 30 s 超时余量过小），并带 ±20% 抖动；已无应用数据的空闲会话拉伸到 10 s。入向应用数据同样刷新 consent（RFC 7675 双向）。
+- **检查阶段墙钟与事务预算。** 整个检查阶段以 30 s 封顶（`MaxCheckingWallMs`，对齐 pion），而单对 STUN 事务预算为 31.5 s（Rc=7、500 ms 指数退避封顶 8 s），PAC 兜底同为 31.5 s。正常情况下由 agent 墙钟先结束阶段，较长的事务预算只覆盖最后在途的检查。
+- **错误响应重试。** 连接性检查的瞬态错误（401/500）最多重试 2 次后判定该对失败；400（ufrag/pwd 不匹配）立即判定失败，因为它不会在同一代内自愈。
+- **stserver 在鉴权之前应答 420。** 未鉴权客户端也能获知无法理解的必选属性，便于错误配置端快速拿到真实原因。RFC 8489 §9.2.1 要求先鉴权，但该顺序不属于 MUST 级违例，且未观察到互操作问题。
 
 ## 项目结构
 
@@ -110,6 +122,14 @@ ctest --test-dir build --output-on-failure
 | `STICE_BUILD_STSERVER` | `ON` | 构建内置 TURN/STUN 服务器 (`stserver`) |
 | `STICE_USE_OPENSSL` | `ON` | 使用 OpenSSL 进行加密和 TURN/TLS |
 | `BUILD_SHARED_LIBS` | `OFF` | 构建共享库（默认：静态库） |
+
+### TLS 后端与证书校验
+
+TURN over TLS 在配置阶段选定唯一后端：OpenSSL（默认）、GnuTLS（`STICE_USE_GNUTLS=ON`）或 Mbed TLS（`STICE_USE_MBEDTLS=ON`）。
+
+- **OpenSSL / GnuTLS** — 对端证书按平台信任库校验（OpenSSL `SSL_CTX_set_default_verify_paths`、GnuTLS `gnutls_certificate_set_x509_system_trust`），Linux 与 macOS 开箱即校验；可用 `STICE_TLS_CA_FILE` 指定显式 CA bundle。
+- **Mbed TLS** — 不自带也不定位操作系统信任库。未设置 `STICE_TLS_CA_FILE` 时校验会话直接 fail-closed（拒绝建立连接，而非降级为 `VERIFY_NONE`）；设置该变量指向 PEM bundle 即可校验。
+- `skip_tls_verify`（或按服务器粒度开关）在所有后端上关闭校验，仅供自签测试环境使用。
 
 ### 作为子项目集成
 

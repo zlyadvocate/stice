@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // Author: zlyadvocate
-// Version: 0.13.1
+// Version: 0.14.1
 // stserver TURN/STUN server implementation.
 //
 // Implements STUN Binding (RFC 5389), TURN Allocate/Refresh/CreatePermission/
@@ -65,6 +65,22 @@ using namespace stice::turn;
 using namespace stice::net;
 
 namespace {
+// RFC 8489 §14.5: discard messages whose FINGERPRINT is present but wrong.
+// Missing FINGERPRINT is tolerated for legacy peers; STICE_FP_STRICT=0
+// downgrades the drop to a log for grayscale rollout.
+bool fingerprintAcceptable(const Message &msg) {
+	static const bool strict = []() {
+		const char *v = std::getenv("STICE_FP_STRICT");
+		return !(v && v[0] == '0');
+	}();
+	if (msg.checkFingerprint(true)) return true;
+	if (strict) {
+		STICE_LOG_WARN("stserver: FINGERPRINT mismatch, dropping message");
+		return false;
+	}
+	STICE_LOG_DEBUG("stserver: FINGERPRINT mismatch tolerated (STICE_FP_STRICT=0)");
+	return true;
+}
 constexpr int PermissionLifetimeMs = 5 * 60 * 1000;   // RFC 8656 §2.5
 constexpr int ChannelBindLifetimeMs = 10 * 60 * 1000;  // RFC 8656 §2.6
 constexpr int PendingConnectLifetimeMs = 30 * 1000;   // RFC 6062 conn attempt
@@ -297,7 +313,18 @@ bool TurnServer::init(const Config &cfg) {
 }
 
 void TurnServer::refreshNonce() {
-	nonce_ = stice::crypto::randomStr64(32);
+	// RFC 8489 §9.1.1: a nonce SHOULD be constructed so the server can judge
+	// its freshness without keeping per-nonce state. The RFC's example layout
+	// is a fixed cookie ("obMatJos2") followed by a security-feature field and
+	// a random tail. We keep a single active nonce, but emitting the cookie and
+	// the feature bits keeps the format interoperable with clients that parse
+	// the RFC example, and makes the expiry self-describing across a restart.
+	//   obMatJos2:<features>:<expiry-unix-sec>:<random>
+	// features bit 0 advertises that MESSAGE-INTEGRITY-SHA256 is supported.
+	std::uint32_t features = 0x01;
+	std::int64_t expirySec = (nowMs() + nonceLifetimeMs_) / 1000;
+	nonce_ = std::string("obMatJos2:") + std::to_string(features) + ":" +
+	         std::to_string(expirySec) + ":" + stice::crypto::randomStr64(32);
 	nonceExpiryMs_ = nowMs() + nonceLifetimeMs_;
 }
 
@@ -486,7 +513,8 @@ bool TurnServer::buildRelayedAddr(std::uint16_t port, AddrRecord &out) const {
 // On success, outUsername holds the verified username.
 int TurnServer::authenticate(const Message &msg, std::string &outUsername) {
 	const Attribute *mi = msg.find(AttrType::MessageIntegrity);
-	if (!mi) return StunErrorUnauthenticated;
+	const Attribute *mi256 = msg.find(AttrType::MessageIntegritySha256);
+	if (!mi && !mi256) return StunErrorUnauthenticated;
 
 	std::string username = getString(msg, AttrType::Username);
 	std::string realm = getString(msg, AttrType::Realm);
@@ -510,11 +538,33 @@ int TurnServer::authenticate(const Message &msg, std::string &outUsername) {
 	}
 	if (nonce != nonce_) return StunErrorStaleNonce;
 
+	// RFC 8489 §14.2: USERHASH is the binary SHA-256 of "username:realm" and may
+	// replace USERNAME. Resolve it by hashing each configured user the same way.
+	if (username.empty()) {
+		const Attribute *uh = msg.find(AttrType::Userhash);
+		if (!uh || uh->value.size() != stice::crypto::SHA256_SIZE) return StunErrorUnauthenticated;
+		for (const auto &kv : users_) {
+			std::string combined = kv.first + ":" + realm;
+			auto h = stice::crypto::sha256(
+			    reinterpret_cast<const unsigned char *>(combined.data()), combined.size());
+			if (std::memcmp(h.data(), uh->value.data(), h.size()) == 0) {
+				username = kv.first;
+				break;
+			}
+		}
+		if (username.empty()) return StunErrorUnauthenticated;
+	}
+
 	auto it = users_.find(username);
 	if (it == users_.end()) return StunErrorUnauthenticated;
 
+	// RFC 8489 §9.2.2: MESSAGE-INTEGRITY uses the MD5 key, MESSAGE-INTEGRITY-SHA256
+	// the SHA-256 key. checkIntegrityDual verifies whichever attribute the
+	// request actually carries (SHA-256 preferred).
 	auto key = stice::crypto::longTermKey(username, realm, it->second);
-	if (!msg.checkIntegrity(key.data(), key.size())) return StunErrorUnauthenticated;
+	auto key256 = stice::crypto::longTermKeySha256(username, realm, it->second);
+	if (!msg.checkIntegrityDual(key.data(), key.size(), key256.data(), key256.size()))
+		return StunErrorUnauthenticated;
 
 	outUsername = username;
 	return 0;
@@ -617,6 +667,11 @@ void TurnServer::sendAuthErrorResponse(const AddrRecord &dst, const Message &req
 	addErrorCode(resp, code);
 	addString(resp, AttrType::Realm, realm_);
 	addString(resp, AttrType::Nonce, nonce_);
+	// RFC 8489 §9.2.4: both the 401 challenge and the 438 stale-nonce error
+	// advertise the password algorithms the server accepts so the client can
+	// pick SHA-256 instead of defaulting to MD5.
+	if (code == 401 || code == 438)
+		addPasswordAlgorithms(resp, {PasswordAlgorithmMd5, PasswordAlgorithmSha256});
 	resp.encode(nullptr, nullptr, "stserver");
 	sendUdp(dst, resp);
 }
@@ -629,26 +684,49 @@ void TurnServer::sendAuthErrorResponseTcp(TcpConn &conn, const Message &req, int
 	addErrorCode(resp, code);
 	addString(resp, AttrType::Realm, realm_);
 	addString(resp, AttrType::Nonce, nonce_);
+	// RFC 8489 §9.2.4: same as the UDP 401/438 path above.
+	if (code == 401 || code == 438)
+		addPasswordAlgorithms(resp, {PasswordAlgorithmMd5, PasswordAlgorithmSha256});
 	resp.encode(nullptr, nullptr, "stserver");
 	sendTcp(conn, resp);
 }
 
-void TurnServer::sendErrorResponseUdp(const AddrRecord &dst, const Message &req, int code) {
+void TurnServer::sendErrorResponseUdp(const AddrRecord &dst, const Message &req, int code,
+                                      const std::vector<std::uint16_t> *unknown) {
 	Message resp;
 	resp.method = req.method;
 	resp.cls = Class::ErrorResponse;
 	resp.transactionID = req.transactionID;
 	addErrorCode(resp, code);
+	if (unknown && !unknown->empty()) {
+		std::vector<unsigned char> v;
+		v.reserve(unknown->size() * 2);
+		for (std::uint16_t t : *unknown) {
+			v.push_back(static_cast<unsigned char>(t >> 8));
+			v.push_back(static_cast<unsigned char>(t & 0xFF));
+		}
+		resp.addAttribute(AttrType::UnknownAttributes, v.data(), v.size());
+	}
 	resp.encode(nullptr, nullptr, "stserver");
 	sendUdp(dst, resp);
 }
 
-void TurnServer::sendErrorResponseTcp(TcpConn &conn, const Message &req, int code) {
+void TurnServer::sendErrorResponseTcp(TcpConn &conn, const Message &req, int code,
+                                      const std::vector<std::uint16_t> *unknown) {
 	Message resp;
 	resp.method = req.method;
 	resp.cls = Class::ErrorResponse;
 	resp.transactionID = req.transactionID;
 	addErrorCode(resp, code);
+	if (unknown && !unknown->empty()) {
+		std::vector<unsigned char> v;
+		v.reserve(unknown->size() * 2);
+		for (std::uint16_t t : *unknown) {
+			v.push_back(static_cast<unsigned char>(t >> 8));
+			v.push_back(static_cast<unsigned char>(t & 0xFF));
+		}
+		resp.addAttribute(AttrType::UnknownAttributes, v.data(), v.size());
+	}
 	resp.encode(nullptr, nullptr, "stserver");
 	sendTcp(conn, resp);
 }
@@ -672,9 +750,19 @@ void TurnServer::sendSuccessResponse(const Message &req, const std::string &user
 	creds.nonce = nonce_;
 	auto key = stice::crypto::longTermKey(username, realm_, it->second);
 	creds.key = stice::bytes(key.begin(), key.end());
+	// RFC 8489 §9.2.2: mirror the algorithm the request used. A request signed
+	// with MESSAGE-INTEGRITY-SHA256 gets a response carrying MI-SHA256 too (encode
+	// still appends MI so RFC 5389-only peers can verify as well).
+	if (req.find(AttrType::MessageIntegritySha256)) {
+		auto key256 = stice::crypto::longTermKeySha256(username, realm_, it->second);
+		creds.keySha256 = stice::bytes(key256.begin(), key256.end());
+		creds.algo = IntegrityAlgo::HmacSha256;
+	}
 	// password must be non-null to trigger MESSAGE-INTEGRITY; creds.key is
-	// used as the HMAC key.
-	resp.encode("", &creds, "stserver");
+	// used as the HMAC key. Auth attributes are NOT echoed back: a success
+	// response is signed with the long-term key but must not carry the
+	// client's USERNAME/REALM/NONCE (RFC 8489 §9.2.2).
+	resp.encode("", &creds, "stserver", /*emitAuthAttributes=*/false);
 }
 
 // ---- Dispatch -------------------------------------------------------------
@@ -689,6 +777,7 @@ void TurnServer::handleUdpPacket(const unsigned char *data, std::size_t size,
 	if (!Message::isMessage(data, size)) return;
 	Message msg;
 	if (!msg.decode(data, size)) return;
+	if (!fingerprintAcceptable(msg)) return;
 	Allocation *a = findAlloc(allocKey(SOCK_DGRAM, src));
 	dispatchStun(msg, src, nullptr, a);
 }
@@ -719,6 +808,7 @@ void TurnServer::handleTcpFrame(TcpConn &conn, socket_t connSock, const unsigned
 	if (!Message::isMessage(data, size)) return;
 	Message msg;
 	if (!msg.decode(data, size)) return;
+	if (!fingerprintAcceptable(msg)) return;
 	// Control frames mutate allocation state (create/refresh/destroy, permission
 	// and channel tables), so they take the global lock. They are rare next to
 	// media, so this does not restore the old all-media serialization.
@@ -732,9 +822,63 @@ void TurnServer::handleTcpFrame(TcpConn &conn, socket_t connSock, const unsigned
 	dispatchStun(msg, conn.peerAddr, &conn, a);
 }
 
+// Comprehension-required attributes this server understands. Anything else
+// with type < 0x8000 must trigger a 420 (RFC 8489 §6.3.4/§9.3).
+static bool knownComprehensionRequired(std::uint16_t t) {
+	switch (t) {
+	case 0x0001: // MAPPED-ADDRESS
+	case 0x0006: // USERNAME
+	case 0x0008: // MESSAGE-INTEGRITY
+	case 0x0009: // ERROR-CODE
+	case 0x000A: // UNKNOWN-ATTRIBUTES
+	case 0x000C: // CHANNEL-NUMBER
+	case 0x000D: // LIFETIME
+	case 0x0012: // XOR-PEER-ADDRESS
+	case 0x0013: // DATA
+	case 0x0014: // REALM
+	case 0x0015: // NONCE
+	case 0x0016: // XOR-RELAYED-ADDRESS
+	case 0x0017: // REQUESTED-ADDRESS-FAMILY
+	case 0x0018: // EVEN-PORT
+	case 0x0019: // REQUESTED-TRANSPORT
+	case 0x001A: // DONT-FRAGMENT
+	case 0x001C: // MESSAGE-INTEGRITY-SHA256
+	case 0x001D: // PASSWORD-ALGORITHM
+	case 0x001E: // USERHASH
+	case 0x0020: // XOR-MAPPED-ADDRESS
+	case 0x0022: // RESERVATION-TOKEN
+	case 0x0024: // PRIORITY
+	case 0x0025: // USE-CANDIDATE
+	case 0x0026: // PADDING (RFC 5780) — tolerated, ignored
+	case 0x002A: // CONNECTION-ID
+		return true;
+	default:
+		return false;
+	}
+}
+
 void TurnServer::dispatchStun(Message &msg, const AddrRecord &src, TcpConn *tcpConn,
                                Allocation *alloc) {
 	if (msg.cls != Class::Request && msg.cls != Class::Indication) return;
+	// RFC 8489 §6.3.4: a request carrying a comprehension-required attribute
+	// the server does not understand MUST be rejected with 420 listing the
+	// offending attribute types. Comprehension-optional attributes (>= 0x8000)
+	// are ignored by design and never trigger 420.
+	if (msg.cls == Class::Request) {
+		std::vector<std::uint16_t> unknown;
+		for (const auto &a : msg.attributes) {
+			std::uint16_t t = static_cast<std::uint16_t>(a.type);
+			if (t >= 0x8000) continue;
+			if (!knownComprehensionRequired(t)) unknown.push_back(t);
+		}
+		if (!unknown.empty()) {
+			STICE_LOG_WARN("stserver: 420 Unknown-Attribute (%zu type(s)) from %s",
+			               unknown.size(), src.toString().c_str());
+			if (tcpConn) sendErrorResponseTcp(*tcpConn, msg, StunErrorUnknownAttribute, &unknown);
+			else sendErrorResponseUdp(src, msg, StunErrorUnknownAttribute, &unknown);
+			return;
+		}
+	}
 
 	switch (msg.method) {
 	case Method::Binding:
@@ -850,6 +994,12 @@ void TurnServer::dispatchStun(Message &msg, const AddrRecord &src, TcpConn *tcpC
 		break;
 	default:
 		if (msg.cls == Class::Request) {
+			// RFC 8489 §6.3.1: a request with a method the server does not
+			// support is answered with 400 Bad Request rather than silently
+			// dropped (a dropped request leaves the peer retransmitting until
+			// its transaction budget expires).
+			STICE_LOG_WARN("stserver: unsupported STUN method 0x%04x from %s, replying 400",
+			               static_cast<unsigned>(msg.method), src.toString().c_str());
 			if (tcpConn) sendErrorResponseTcp(*tcpConn, msg, StunErrorBadRequest);
 			else sendErrorResponseUdp(src, msg, StunErrorBadRequest);
 		}
@@ -1099,7 +1249,11 @@ void TurnServer::handleCreatePermission(Message &req, const AddrRecord &src, Tcp
 void TurnServer::handleChannelBind(Message &req, const AddrRecord &src, TcpConn *tcpConn,
                                    Allocation *alloc) {
 	std::uint16_t channel = 0;
-	if (!readChannelNumber(req, channel) || !channelValid(channel)) {
+	// Server-side stays permissive: RFC 8656 §12.1 narrows the allocatable
+	// range to 0x4000-0x4FFF, but a pre-0.13.1 client may still bind a legacy
+	// 0x5000-0x7FFF channel. Accepting it keeps the "server wide first" half of
+	// the two-stage rollout; our own client only allocates <= 0x4FFF.
+	if (!readChannelNumber(req, channel) || !channelAcceptable(channel)) {
 		if (tcpConn) sendErrorResponseTcp(*tcpConn, req, StunErrorBadRequest);
 		else sendErrorResponseUdp(src, req, StunErrorBadRequest);
 		return;
@@ -1309,7 +1463,7 @@ void TurnServer::forwardToClient(Allocation &alloc, const AddrRecord &peer,
 		// Prefer a bound channel for this peer (full IP:port).
 		for (const auto &c : alloc.channels) {
 			if (c.peer == peer && c.expiryMs > nowMs()) {
-				if (wrapChannelData(c.number, data, size, frame) > 0) {
+				if (wrapChannelData(c.number, data, size, frame, controlIsTcp) > 0) {
 					if (controlIsTcp) {
 						if (dstTcp) act = Act::ChanTcp;
 					} else {
@@ -1392,12 +1546,11 @@ void TurnServer::forwardToClient(Allocation &alloc, const AddrRecord &peer,
 //    server-to-server, with the two servers relaying between them); that path
 //    is not implemented here.
 //
-//  * NON-STANDARD ERROR MAPPING. A peer address that is not currently allocated
-//    is answered with 403 (Forbidden). RFC 6062 §5.3.5 specifies 447
-//    (Connection Timeout or Failure) for exactly that case - 446 (Connection
-//    Already Exists) is only for a connection that already exists. Our client
-//    and server agree with each other (the client retries on 447), but a
-//    standard RFC 6062 client would not read 403 as a retryable condition.
+//  * ERROR MAPPING. A peer address that is not currently allocated is answered
+//    with 447 (Connection Timeout or Failure), matching RFC 6062 §5.3.5; 446
+//    (Connection Already Exists) is reserved for a connection that already
+//    exists. This keeps both stice peers and standard RFC 6062 clients on the
+//    same recoverable retry path.
 //
 //  * The server never dials the peer itself: it only forwards a
 //    CONNECTION-ATTEMPT indication so the peer opens a data connection and
@@ -1433,8 +1586,23 @@ void TurnServer::handleConnect(Message &req, TcpConn *tcpConn, Allocation *alloc
 	// Find the peer's TCP allocation whose relayed address matches.
 	Allocation *target = findTcpAllocByPeer(peer, alloc);
 	if (!target) {
-		sendErrorResponseTcp(*tcpConn, req, StunErrorForbidden);
+		// RFC 6062 §5.3.5: a peer that is not (yet) allocated is a recoverable
+		// connection failure, not a permanent authorisation failure. 447 lets a
+		// standard RFC 6062 client retry while the peer's allocation settles.
+		sendErrorResponseTcp(*tcpConn, req, StunErrorConnectionTimeoutOrFailure);
 		return;
+	}
+	// RFC 6062 §5.3.5: 446 (Connection Already Exists) is the answer when a
+	// data connection to this peer is already established. A client retrying a
+	// CONNECT (e.g. after its own 447 backoff) would otherwise stack a second
+	// pending connect and a second data connection onto the same peer.
+	for (const auto &pc : alloc->pendingConnects) {
+		if (pc.peerRelayAddr == peer && pc.firstDataSock != STICE_INVALID_SOCKET) {
+			STICE_LOG_INFO("stserver: CONNECT to %s rejected: connection already exists (connId=%u)",
+			               peer.toString().c_str(), pc.connId);
+			sendErrorResponseTcp(*tcpConn, req, StunErrorConnectionAlreadyExists);
+			return;
+		}
 	}
 	std::uint32_t connId = nextConnId_++;
 	Allocation::PendingConnect pc;

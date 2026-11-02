@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace stice::stun {
 
@@ -124,10 +125,12 @@ void addRequestedAddressFamily(Message &msg, std::uint8_t family);
 // RESERVATION-TOKEN (8 bytes).
 void addReservationToken(Message &msg, const unsigned char token[8]);
 
-// TCP-TYPE (RFC 6544 §8.1): 32-bit enum encoding the TCP candidate direction.
+// TCP-TYPE: 32-bit enum encoding the TCP candidate direction, using the
+// ICE-TCP STUN attribute value space (not the SDP string form).
 //   active  = 0x00000006
 //   passive = 0x00000005
 //   so      = 0x00000002
+// Carried at 0xC004 (comprehension-optional; 0x0026 is IANA PADDING, RFC 5780).
 // Used in STUN connectivity checks over TCP so the peer can verify the
 // candidate pair's TCP direction matches.
 constexpr std::uint32_t TcpTypeActive = 0x00000006;
@@ -135,6 +138,27 @@ constexpr std::uint32_t TcpTypePassive = 0x00000005;
 constexpr std::uint32_t TcpTypeSo = 0x00000002;
 void addTcpType(Message &msg, std::uint32_t tcpType);
 bool readTcpType(const Message &msg, std::uint32_t &out);
+
+// UNKNOWN-ATTRIBUTES (0x000A): list of comprehension-required attribute types
+// the server rejected with 420 (RFC 8489 §14.9).
+void addUnknownAttributes(Message &msg, const std::vector<std::uint16_t> &types);
+bool readUnknownAttributes(const Message &msg, std::vector<std::uint16_t> &out);
+
+// PASSWORD-ALGORITHMS (0x8002, RFC 8489 §14.1): the password algorithms the
+// server accepts. Wire format is a sequence of entries: alg(2) | paramLen(2) |
+// params; MD5 (0x0001) and SHA-256 (0x0002) carry no parameters.
+void addPasswordAlgorithms(Message &msg, const std::vector<std::uint16_t> &algorithms);
+bool readPasswordAlgorithms(const Message &msg, std::vector<std::uint16_t> &out);
+
+// PASSWORD-ALGORITHM (0x001D, RFC 8489 §14.2): the algorithm the client chose
+// when it is not the RFC 5389 default. Required in authenticated requests,
+// otherwise the server verifies with MD5 and a SHA-256 MESSAGE-INTEGRITY fails.
+void addPasswordAlgorithm(Message &msg, std::uint16_t algorithm);
+
+// ALTERNATE-SERVER (0x8023, RFC 8489 §14.11): the transport address a 300
+// Try Alternate response points at. Encoded like MAPPED-ADDRESS (plain, not
+// XOR-obfuscated).
+bool readAlternateServer(const Message &msg, net::AddrRecord &out);
 
 } // namespace stice::stun
 

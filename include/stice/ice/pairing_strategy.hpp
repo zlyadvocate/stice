@@ -119,7 +119,11 @@ struct IcePairingConfig {
 	// defaults) when set via setPairingConfig before gatherCandidates.
 	std::chrono::milliseconds rto_initial{600};
 	int max_check_retransmit{4};
-	std::chrono::milliseconds keepalive_udp{10000};
+	// Consent freshness period (RFC 7675 §5.1 mandates a 5 s base, randomized
+	// 4-6 s by the Agent). This doubles as the idle keepalive cadence; keeping
+	// it at the RFC's basic period means consent never silently expires at 30 s
+	// because the configured interval was too long.
+	std::chrono::milliseconds keepalive_udp{5000};
 	std::chrono::milliseconds keepalive_tcp_relay{5000};
 
 	// --- Speed optimization (local behavior only) ---

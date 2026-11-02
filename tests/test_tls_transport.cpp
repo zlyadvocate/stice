@@ -11,14 +11,13 @@
 //
 //   * the handshake completes and application data round-trips byte-exactly,
 //   * a self-signed peer is REJECTED when verification is on and no trust
-//     anchor covers it (the secure default),
+//     anchor covers it (the secure default, enforced on every backend),
 //   * the same peer is ACCEPTED when STICE_TLS_CA_FILE pins its certificate,
 //   * skip_tls_verify accepts it without a trust anchor,
 //   * stice_get_tls_backend() reports the backend that was compiled in.
 //
-// Mbed TLS has no system trust store, so the "rejected" case is only asserted
-// for OpenSSL/GnuTLS; for Mbed TLS the first case proves the documented
-// VERIFY_NONE fallback instead.
+// Mbed TLS has no system trust store, so it fails the "rejected" case closed
+// (the session refuses to start) rather than downgrading to VERIFY_NONE.
 
 #include "stice/net/addr.hpp"
 #include "stice/net/platform.hpp"
@@ -514,10 +513,9 @@ TEST_CASE("TLS: a burst followed by silence is drained by one readable event", "
 
 TEST_CASE("TLS: self-signed peer is rejected without a trust anchor", "[tls][verify]") {
 	if (backendName() == "none") return;
-	// Mbed TLS has no system trust store: without STICE_TLS_CA_FILE it runs
-	// with VERIFY_NONE by design (documented), so the rejection cannot be
-	// asserted there.
-	if (backendName() == "mbedtls") return;
+	// Every backend fails closed here: Mbed TLS has no system trust store, so
+	// without STICE_TLS_CA_FILE it refuses to start the session instead of
+	// silently downgrading to VERIFY_NONE.
 
 	EchoServer server;
 	REQUIRE(server.start());

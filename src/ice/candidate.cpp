@@ -8,6 +8,7 @@
 #include "stice/ice/candidate.hpp"
 
 #include "stice/crypto.hpp"
+#include "stice/net/mdns.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -169,9 +170,12 @@ std::string Candidate::toSdp() const {
 		sdpRaddrHackEnabled()) {
 		suffix += " raddr 0.0.0.0 rport 0";
 	}
-	std::snprintf(buf, sizeof(buf), "a=candidate:%s %d %s %u %s %s typ %s%s",
-	              foundation.c_str(), component, transportString(transport), priority,
-	              hostname.c_str(), service.c_str(), typeString(type), suffix.c_str());
+    // RFC 6544 §4.5: an active candidate does not know its local port until it
+    // connects, so the signaled port MUST be 9 (the discard port).
+    const char* portStr = (transport == CandidateTransport::TCPActive) ? "9" : service.c_str();
+    std::snprintf(buf, sizeof(buf), "a=candidate:%s %d %s %u %s %s typ %s%s",
+                  foundation.c_str(), component, transportString(transport), priority,
+                  hostname.c_str(), portStr, typeString(type), suffix.c_str());
 	return buf;
 }
 
@@ -230,7 +234,13 @@ bool Candidate::parse(const std::string &line, Candidate &out) {
 	{
 		std::uint16_t portNum = static_cast<std::uint16_t>(std::atoi(port));
 		int st = (out.transport == CandidateTransport::UDP) ? SOCK_DGRAM : SOCK_STREAM;
-		if (net::parseAddr(host, portNum, out.resolved.addr, out.resolved.len)) {
+		// mDNS names must NOT go through getaddrinfo: without nss-mdns it
+		// resolves to nothing, and the candidate was then silently dropped.
+		// Leave `resolved` empty here and let the agent resolve it over mDNS
+		// (resolveRemoteMDnsCandidate), which also logs the failure.
+		if (net::MDnsClient::isMDnsName(host)) {
+			out.fromMdns = true;
+		} else if (net::parseAddr(host, portNum, out.resolved.addr, out.resolved.len)) {
 			out.resolved.socktype = st;
 		} else {
 			// Non-numeric hostname: resolve via DNS.

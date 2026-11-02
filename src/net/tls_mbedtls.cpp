@@ -9,8 +9,9 @@
 //
 // Unlike OpenSSL and GnuTLS, Mbed TLS does not ship or locate an OS trust
 // store. A verifying handshake therefore needs an explicit CA bundle
-// (STICE_TLS_CA_FILE); without one the session falls back to VERIFY_NONE and
-// says so loudly, because silently pretending to verify would be worse.
+// (STICE_TLS_CA_FILE); without one the session fails closed rather than
+// silently downgrading to VERIFY_NONE (an explicit skip_tls_verify opt-out
+// still disables verification, as in the other backends).
 
 #include "stice/net/tls.hpp"
 
@@ -337,9 +338,14 @@ struct TlsSession::Impl {
 					canVerify = true;
 					verifyPeer = true;
 				} else {
-					STICE_LOG_WARN("Mbed TLS: no CA bundle configured; Mbed TLS has no system "
-					               "trust store, so the TURN/TLS peer certificate will NOT be "
-					               "verified. Set STICE_TLS_CA_FILE to verify.");
+					// Fail-closed: Mbed TLS has no system trust store, so a
+					// verifying session cannot be established without an
+					// explicit bundle. Silently downgrading to VERIFY_NONE would
+					// turn a misconfiguration into an unauthenticated peer.
+					// Opting out is only possible via the explicit skipVerify
+					// flag, which is handled above.
+					return fail("Mbed TLS: no CA bundle configured and no system trust store; "
+					            "set STICE_TLS_CA_FILE (or explicitly set skip_tls_verify)", 0);
 				}
 			}
 			mbedtls_ssl_conf_authmode(&conf, canVerify ? MBEDTLS_SSL_VERIFY_REQUIRED

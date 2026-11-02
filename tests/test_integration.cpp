@@ -14,6 +14,8 @@
 
 #include "stice/stice.h"
 #include "stice/log.hpp"
+// Socket platform layer (winsock2.h) must come before any windows.h include.
+#include "stice/net/platform.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -85,6 +87,29 @@ bool waitFor(std::function<bool()> cond, int timeoutMs,
 		std::this_thread::sleep_for(std::chrono::milliseconds(10));
 		if (yield) yield();
 	}
+}
+
+// Race-free accessors for AgentState::received: callbacks fire on the
+// agent's poll thread, so reads from the test thread must take the mutex
+// (unsynchronized size()/back() reads are UB under concurrent push_back).
+size_t recvCount(AgentState &s) {
+	std::lock_guard<std::mutex> lk(s.receivedMutex);
+	return s.received.size();
+}
+std::vector<std::string> recvSnapshot(AgentState &s) {
+	std::lock_guard<std::mutex> lk(s.receivedMutex);
+	return s.received;
+}
+// Wait until `msg` shows up in the agent's received stream. The loopback mux
+// broadcast delivers every app-data send to every agent except the (last)
+// sender, so waits must match MESSAGE CONTENT, not received counts.
+bool waitForRecv(AgentState &s, const std::string &msg, int timeoutMs) {
+	return waitFor([&] {
+		auto got = recvSnapshot(s);
+		for (const auto &m : got)
+			if (m == msg) return true;
+		return false;
+	}, timeoutMs);
 }
 
 // Exchange candidates and local descriptions between two agents. Implements
@@ -163,6 +188,219 @@ TEST_CASE("ICE UDP local loopback: Controlling <-> Controlled", "[integration][u
 	// A's local should match B's remote, and vice versa.
 	REQUIRE(std::string(localA) == std::string(remoteB));
 	REQUIRE(std::string(remoteA) == std::string(localB));
+
+	stice_destroy(a);
+	stice_destroy(b);
+}
+
+TEST_CASE("ICE UDP: single-side restart forms a new generation", "[integration][udp][restart]") {
+	stice_set_log_level(STICE_LOG_LEVEL_WARN);
+
+	AgentState sa, sb;
+	auto cfgA = makeConfig(sa);
+	auto cfgB = makeConfig(sb);
+
+	stice_agent_t *a = stice_create(&cfgA);
+	stice_agent_t *b = stice_create(&cfgB);
+	REQUIRE(a != nullptr);
+	REQUIRE(b != nullptr);
+
+	REQUIRE(stice_gather_candidates(b) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_gather_candidates(a) == STICE_ERR_SUCCESS);
+	trickleExchange(a, sa, b, sb);
+
+	REQUIRE(waitFor([&] {
+		auto as = sa.state.load();
+		auto bs = sb.state.load();
+		return (as == STICE_STATE_CONNECTED || as == STICE_STATE_COMPLETED) &&
+		       (bs == STICE_STATE_CONNECTED || bs == STICE_STATE_COMPLETED);
+	}, 5000));
+
+	// Capture both generations' starting credentials.
+	char bufA[4096], bufB[4096];
+	REQUIRE(stice_get_local_description(a, bufA, sizeof(bufA)) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_get_local_description(b, bufB, sizeof(bufB)) == STICE_ERR_SUCCESS);
+	std::string sdpA1(bufA), sdpB1(bufB);
+	auto ufragA1 = sdpA1.substr(sdpA1.find("a=ice-ufrag:") + 12, 4);
+	auto ufragB1 = sdpB1.substr(sdpB1.find("a=ice-ufrag:") + 12, 4);
+
+	// Single-side restart: A starts a new generation. restart() runs the fresh
+	// gathering pass internally (stice.h contract).
+	sa.gatheringDone.store(false);
+	REQUIRE(stice_agent_restart(a) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] { return sa.gatheringDone.load(); }, 3000));
+
+	char bufA2[4096], bufB2[4096];
+	REQUIRE(stice_get_local_description(a, bufA2, sizeof(bufA2)) == STICE_ERR_SUCCESS);
+	std::string sdpA2(bufA2);
+	auto ufragA2 = sdpA2.substr(sdpA2.find("a=ice-ufrag:") + 12, 4);
+	// RFC 8445 §9: the new generation MUST carry fresh credentials.
+	REQUIRE(ufragA2 != ufragA1);
+
+	// B receives A's changed ufrag/pwd: per RFC 8445 §9 B restarts too — fresh
+	// local credentials and a fresh gathering pass (implicit peer-restart
+	// detection in setRemoteDescription). B can check toward A immediately: it
+	// already holds A's NEW credentials from bufA2.
+	sb.gatheringDone.store(false);
+	REQUIRE(stice_set_remote_description(b, bufA2) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] { return sb.gatheringDone.load(); }, 3000));
+
+	REQUIRE(stice_get_local_description(b, bufB2, sizeof(bufB2)) == STICE_ERR_SUCCESS);
+	std::string sdpB2(bufB2);
+	auto ufragB2 = sdpB2.substr(sdpB2.find("a=ice-ufrag:") + 12, 4);
+	REQUIRE(ufragB2 != ufragB1);
+
+	// Complete the renegotiation: A learns B's new generation. A's remote
+	// description was cleared by its own restart, so this cannot trip the
+	// peer-restart detection (no restart ping-pong).
+	REQUIRE(stice_set_remote_description(a, bufB2) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_remote_gathering_done(a) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_remote_gathering_done(b) == STICE_ERR_SUCCESS);
+
+	// The new generation must connect again on both sides.
+	REQUIRE(waitFor([&] {
+		auto as = sa.state.load();
+		auto bs = sb.state.load();
+		return (as == STICE_STATE_CONNECTED || as == STICE_STATE_COMPLETED) &&
+		       (bs == STICE_STATE_CONNECTED || bs == STICE_STATE_COMPLETED);
+	}, 15000));
+
+	// Data still flows bidirectionally in the new generation.
+	const char *msgAtoB = "after restart from A";
+	const char *msgBtoA = "after restart from B";
+	REQUIRE(stice_send(a, msgAtoB, std::strlen(msgAtoB)) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_send(b, msgBtoA, std::strlen(msgBtoA)) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] { return sb.received.size() >= 1 && sa.received.size() >= 1; }, 3000));
+
+	stice_destroy(a);
+	stice_destroy(b);
+}
+
+TEST_CASE("ICE restart: late description from a retired generation is ignored (P2-N11)",
+          "[integration][udp][restart]") {
+	stice_set_log_level(STICE_LOG_LEVEL_WARN);
+
+	AgentState sa, sb;
+	auto cfgA = makeConfig(sa);
+	auto cfgB = makeConfig(sb);
+	stice_agent_t *a = stice_create(&cfgA);
+	stice_agent_t *b = stice_create(&cfgB);
+	REQUIRE(a != nullptr);
+	REQUIRE(b != nullptr);
+
+	REQUIRE(stice_gather_candidates(b) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_gather_candidates(a) == STICE_ERR_SUCCESS);
+	trickleExchange(a, sa, b, sb);
+	REQUIRE(waitFor([&] {
+		auto as = sa.state.load();
+		auto bs = sb.state.load();
+		return (as == STICE_STATE_CONNECTED || as == STICE_STATE_COMPLETED) &&
+		       (bs == STICE_STATE_CONNECTED || bs == STICE_STATE_COMPLETED);
+	}, 5000));
+
+	// Generation 1 of B's description, captured before the restart.
+	char bufB1[4096];
+	REQUIRE(stice_get_local_description(b, bufB1, sizeof(bufB1)) == STICE_ERR_SUCCESS);
+	std::string sdpB1(bufB1);
+
+	// A restarts; B follows on A's new generation; A then learns B's new one.
+	sa.gatheringDone.store(false);
+	REQUIRE(stice_agent_restart(a) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] { return sa.gatheringDone.load(); }, 3000));
+	char bufA2[4096];
+	REQUIRE(stice_get_local_description(a, bufA2, sizeof(bufA2)) == STICE_ERR_SUCCESS);
+	sb.gatheringDone.store(false);
+	REQUIRE(stice_set_remote_description(b, bufA2) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] { return sb.gatheringDone.load(); }, 3000));
+	char bufB2[4096];
+	REQUIRE(stice_get_local_description(b, bufB2, sizeof(bufB2)) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_remote_description(a, bufB2) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_remote_gathering_done(a) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_remote_gathering_done(b) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] {
+		auto as = sa.state.load();
+		auto bs = sb.state.load();
+		return (as == STICE_STATE_CONNECTED || as == STICE_STATE_COMPLETED) &&
+		       (bs == STICE_STATE_CONNECTED || bs == STICE_STATE_COMPLETED);
+	}, 15000));
+
+	// Re-deliver B's generation-1 description (signalling reordering, or a peer
+	// re-sending a pre-restart copy). Without the monotonic generation guard this
+	// looks like another credential change and restarts A a second time, tearing
+	// down a checklist that is already converging.
+	char ufragBefore[4096];
+	REQUIRE(stice_get_local_description(a, ufragBefore, sizeof(ufragBefore)) == STICE_ERR_SUCCESS);
+	const std::string sdpA3(ufragBefore);
+	sa.gatheringDone.store(false);
+	REQUIRE(stice_set_remote_description(a, sdpB1.c_str()) == STICE_ERR_SUCCESS);
+	std::this_thread::sleep_for(std::chrono::milliseconds(400));
+	// No second restart: no fresh gathering, credentials unchanged.
+	REQUIRE(sa.gatheringDone.load() == false);
+	char ufragAfter[4096];
+	REQUIRE(stice_get_local_description(a, ufragAfter, sizeof(ufragAfter)) == STICE_ERR_SUCCESS);
+	REQUIRE(std::string(ufragAfter) == sdpA3);
+
+	// The live session survived the stale delivery.
+	REQUIRE(waitFor([&] {
+		auto as = sa.state.load();
+		return as == STICE_STATE_CONNECTED || as == STICE_STATE_COMPLETED;
+	}, 2000));
+	const char *msg = "still connected after a stale description";
+	REQUIRE(stice_send(a, msg, std::strlen(msg)) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] { return sb.received.size() >= 1; }, 3000));
+
+	stice_destroy(a);
+	stice_destroy(b);
+}
+
+TEST_CASE("ICE restart: re-delivering the current generation is not a restart",
+          "[integration][udp][restart]") {
+	// Complement of the retired-generation guard: a signalling layer may
+	// re-send the description it already delivered (duplicate offer, retry).
+	// The credentials are UNCHANGED, so no restart may trigger and the live
+	// checklist must survive untouched — only a ufrag/pwd CHANGE detects a
+	// peer restart (RFC 8445 §9).
+	stice_set_log_level(STICE_LOG_LEVEL_WARN);
+
+	AgentState sa, sb;
+	auto cfgA = makeConfig(sa);
+	auto cfgB = makeConfig(sb);
+
+	stice_agent_t *a = stice_create(&cfgA);
+	stice_agent_t *b = stice_create(&cfgB);
+	REQUIRE(a != nullptr);
+	REQUIRE(b != nullptr);
+
+	REQUIRE(stice_gather_candidates(b) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_gather_candidates(a) == STICE_ERR_SUCCESS);
+	trickleExchange(a, sa, b, sb);
+	REQUIRE(waitFor([&] {
+		auto as = sa.state.load();
+		auto bs = sb.state.load();
+		return (as == STICE_STATE_CONNECTED || as == STICE_STATE_COMPLETED) &&
+		       (bs == STICE_STATE_CONNECTED || bs == STICE_STATE_COMPLETED);
+	}, 5000));
+
+	char bufB[4096];
+	REQUIRE(stice_get_local_description(b, bufB, sizeof(bufB)) == STICE_ERR_SUCCESS);
+	char before[4096];
+	REQUIRE(stice_get_local_description(a, before, sizeof(before)) == STICE_ERR_SUCCESS);
+	const std::string sdpA1(before);
+
+	// Duplicate delivery of B's CURRENT generation to A.
+	sa.gatheringDone.store(false);
+	REQUIRE(stice_set_remote_description(a, bufB) == STICE_ERR_SUCCESS);
+	std::this_thread::sleep_for(std::chrono::milliseconds(400));
+	// No fresh gathering pass: the credentials did not change.
+	REQUIRE(sa.gatheringDone.load() == false);
+	char after[4096];
+	REQUIRE(stice_get_local_description(a, after, sizeof(after)) == STICE_ERR_SUCCESS);
+	REQUIRE(std::string(after) == sdpA1);
+
+	// The session survived the duplicate delivery.
+	const char *msg = "alive after duplicate description";
+	REQUIRE(stice_send(a, msg, std::strlen(msg)) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] { return recvCount(sb) >= 1; }, 3000));
 
 	stice_destroy(a);
 	stice_destroy(b);
@@ -538,13 +776,12 @@ TEST_CASE("Multi-ICE-server: parallel STUN+TURN gathering and relay ordering",
 	REQUIRE(relayA.size() >= 2);
 	REQUIRE(relayB.size() >= 2);
 
-	// --- Verify relay candidate priority ordering (config array order) ---
-	// computePriority subtracts the TURN server's config index from localPref,
-	// so the relay candidate from index 0 (coturn) must have a HIGHER
-	// priority value than index 1 (stserver). Candidates may arrive in any
-	// order (stserver is local and may allocate faster), so we find the
-	// max and min priorities across all relay candidates and verify they
-	// differ by exactly 1 (the index delta).
+	// --- Verify relay candidate priority shape ---
+	// localPref is subtracted by (config index + allocation-RTT penalty), so the
+	// per-server ordering is not deterministic: a fast TURN server outranks a
+	// slow one even at a lower config index. What must hold is the bit layout —
+	// every per-server difference lives in localPref, i.e. bits 8+, so all relay
+	// priorities differ by multiples of 256 and share the same low byte.
 	std::uint32_t maxPrio = 0, minPrio = UINT32_MAX;
 	for (const auto &c : relayA) {
 		std::uint32_t p = parseCandidatePriority(c);
@@ -552,11 +789,9 @@ TEST_CASE("Multi-ICE-server: parallel STUN+TURN gathering and relay ordering",
 		if (p < minPrio) minPrio = p;
 	}
 	INFO("Relay A max priority: " << maxPrio << "  min priority: " << minPrio);
-	REQUIRE(maxPrio > minPrio);
-	// localPref is shifted left by 8 in the priority formula, so an index
-	// delta of 1 produces a priority delta of 256 (1 << 8).
-	REQUIRE(maxPrio - minPrio == 256);
 	REQUIRE(maxPrio > 0);
+	REQUIRE((maxPrio - minPrio) % 256 == 0);
+	REQUIRE((maxPrio & 0xFF) == (minPrio & 0xFF));
 
 	// --- Filter to relay-only SDP and exchange ---
 	char bufA[4096], bufB[4096];
@@ -815,6 +1050,208 @@ TEST_CASE("UDPMux: two agents share one socket, connect and exchange data",
 
 	stice_destroy(a);
 	stice_destroy(b);
+	stice_destroy_udp_mux(mux);
+}
+
+TEST_CASE("UDPMux: agent restart re-registers the new ufrag and reconnects",
+          "[integration][udpmux][restart]") {
+	// 0.14.0 made restart() drop the old generation's mux registration and
+	// re-register under the new ufrag: the mux demuxes inbound packets by ufrag,
+	// so without it the endpoint was permanently deaf to new inbound traffic
+	// after an ICE restart. This path had no test at all.
+	stice_set_log_level(STICE_LOG_LEVEL_DEBUG);
+
+	stice_udp_mux_t *mux = stice_create_udp_mux(nullptr, 0, 0);
+	REQUIRE(mux != nullptr);
+
+	AgentState sa, sb;
+	auto cfgA = makeConfig(sa);
+	auto cfgB = makeConfig(sb);
+	stice_agent_t *a = stice_create(&cfgA);
+	stice_agent_t *b = stice_create(&cfgB);
+	REQUIRE(a != nullptr);
+	REQUIRE(b != nullptr);
+	REQUIRE(stice_agent_use_udp_mux(a, mux) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_agent_use_udp_mux(b, mux) == STICE_ERR_SUCCESS);
+
+	REQUIRE(stice_gather_candidates(b) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_gather_candidates(a) == STICE_ERR_SUCCESS);
+	trickleExchange(a, sa, b, sb);
+	REQUIRE(waitFor([&] {
+		auto as = sa.state.load();
+		auto bs = sb.state.load();
+		return (as == STICE_STATE_CONNECTED || as == STICE_STATE_COMPLETED) &&
+		       (bs == STICE_STATE_CONNECTED || bs == STICE_STATE_COMPLETED);
+	}, 5000));
+
+	// Restart A; B follows on A's new generation, then A learns B's.
+	sa.gatheringDone.store(false);
+	REQUIRE(stice_agent_restart(a) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] { return sa.gatheringDone.load(); }, 3000));
+	char bufA2[4096];
+	REQUIRE(stice_get_local_description(a, bufA2, sizeof(bufA2)) == STICE_ERR_SUCCESS);
+	sb.gatheringDone.store(false);
+	REQUIRE(stice_set_remote_description(b, bufA2) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] { return sb.gatheringDone.load(); }, 3000));
+	char bufB2[4096];
+	REQUIRE(stice_get_local_description(b, bufB2, sizeof(bufB2)) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_remote_description(a, bufB2) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_remote_gathering_done(a) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_remote_gathering_done(b) == STICE_ERR_SUCCESS);
+
+	// The new generation must connect through the SAME shared socket: if the
+	// mux still routes by the retired ufrag, nothing arrives and this times out.
+	REQUIRE(waitFor([&] {
+		auto as = sa.state.load();
+		auto bs = sb.state.load();
+		return (as == STICE_STATE_CONNECTED || as == STICE_STATE_COMPLETED) &&
+		       (bs == STICE_STATE_CONNECTED || bs == STICE_STATE_COMPLETED);
+	}, 15000));
+
+	const char *msgAtoB = "mux after restart from A";
+	const char *msgBtoA = "mux after restart from B";
+	REQUIRE(stice_send(a, msgAtoB, std::strlen(msgAtoB)) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] { return sb.received.size() >= 1; }, 3000));
+	REQUIRE(stice_send(b, msgBtoA, std::strlen(msgBtoA)) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] { return sa.received.size() >= 1; }, 3000));
+
+	stice_destroy(a);
+	stice_destroy(b);
+	stice_destroy_udp_mux(mux);
+}
+
+TEST_CASE("UDPMux: restarting one pair leaves sibling pairs untouched",
+          "[integration][udpmux][restart][multi]") {
+	// Two independent pairs share one mux socket. Restarting pair 1 must
+	// re-register its agents under fresh ufrags WITHOUT disturbing pair 2 —
+	// registration isolation. The restart also mutates the mux's agent list
+	// while the poll thread iterates it for bookkeeping, exercising the
+	// snapshot-then-callback discipline the AB-BA fix relies on.
+	stice_set_log_level(STICE_LOG_LEVEL_WARN);
+
+	stice_udp_mux_t *mux = stice_create_udp_mux(nullptr, 0, 0);
+	REQUIRE(mux != nullptr);
+
+	AgentState sa, sb, sc, sd;
+	auto cfgA = makeConfig(sa);
+	auto cfgB = makeConfig(sb);
+	auto cfgC = makeConfig(sc);
+	auto cfgD = makeConfig(sd);
+
+	stice_agent_t *a = stice_create(&cfgA);
+	stice_agent_t *b = stice_create(&cfgB);
+	stice_agent_t *c = stice_create(&cfgC);
+	stice_agent_t *d = stice_create(&cfgD);
+	REQUIRE(a != nullptr);
+	REQUIRE(b != nullptr);
+	REQUIRE(c != nullptr);
+	REQUIRE(d != nullptr);
+	REQUIRE(stice_agent_use_udp_mux(a, mux) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_agent_use_udp_mux(b, mux) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_agent_use_udp_mux(c, mux) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_agent_use_udp_mux(d, mux) == STICE_ERR_SUCCESS);
+
+	REQUIRE(stice_gather_candidates(b) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_gather_candidates(a) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_gather_candidates(d) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_gather_candidates(c) == STICE_ERR_SUCCESS);
+
+	trickleExchange(a, sa, b, sb);
+	trickleExchange(c, sc, d, sd);
+
+	REQUIRE(waitFor([&] {
+		auto as = sa.state.load();
+		auto bs = sb.state.load();
+		auto cs = sc.state.load();
+		auto ds = sd.state.load();
+		return (as == STICE_STATE_CONNECTED || as == STICE_STATE_COMPLETED) &&
+		       (bs == STICE_STATE_CONNECTED || bs == STICE_STATE_COMPLETED) &&
+		       (cs == STICE_STATE_CONNECTED || cs == STICE_STATE_COMPLETED) &&
+		       (ds == STICE_STATE_CONNECTED || ds == STICE_STATE_COMPLETED);
+	}, 8000));
+
+	// Baseline traffic on both pairs. On loopback the mux broadcasts app data
+	// to every agent except the sender, so waits match message CONTENT —
+	// cross-delivery to the sibling pair is a known artifact.
+	const char *msgAB1 = "pair1 baseline from A";
+	const char *msgCD1 = "pair2 baseline from C";
+	REQUIRE(stice_send(a, msgAB1, std::strlen(msgAB1)) == STICE_ERR_SUCCESS);
+	REQUIRE(waitForRecv(sb, msgAB1, 2000));
+	REQUIRE(stice_send(c, msgCD1, std::strlen(msgCD1)) == STICE_ERR_SUCCESS);
+	REQUIRE(waitForRecv(sd, msgCD1, 2000));
+
+	// Restart A (pair 1); B follows on A's new generation; C/D keep running.
+	char bufA1[4096];
+	REQUIRE(stice_get_local_description(a, bufA1, sizeof(bufA1)) == STICE_ERR_SUCCESS);
+	std::string sdpA1(bufA1);
+	auto ufragA1 = sdpA1.substr(sdpA1.find("a=ice-ufrag:") + 12, 4);
+
+	sa.gatheringDone.store(false);
+	REQUIRE(stice_agent_restart(a) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] { return sa.gatheringDone.load(); }, 3000));
+
+	char bufA2[4096];
+	REQUIRE(stice_get_local_description(a, bufA2, sizeof(bufA2)) == STICE_ERR_SUCCESS);
+	std::string sdpA2(bufA2);
+	auto ufragA2 = sdpA2.substr(sdpA2.find("a=ice-ufrag:") + 12, 4);
+	REQUIRE(ufragA2 != ufragA1);
+
+	sb.gatheringDone.store(false);
+	REQUIRE(stice_set_remote_description(b, bufA2) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] { return sb.gatheringDone.load(); }, 3000));
+	char bufB2[4096];
+	REQUIRE(stice_get_local_description(b, bufB2, sizeof(bufB2)) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_remote_description(a, bufB2) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_remote_gathering_done(a) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_remote_gathering_done(b) == STICE_ERR_SUCCESS);
+
+	// The sibling pair must keep passing data WHILE pair 1 renegotiates: its
+	// registrations, consent keepalives and poll bookkeeping are independent
+	// of pair 1's restart. On loopback the mux attributes each app-data packet
+	// to the LAST loopback sender, so a probe can be misrouted away from its
+	// target under heavy check traffic — retry until one probe lands.
+	bool c2dAlive = false;
+	bool d2cAlive = false;
+	for (int attempt = 0; attempt < 5 && !(c2dAlive && d2cAlive); ++attempt) {
+		std::string probeC = "pair2 alive c->d #" + std::to_string(attempt);
+		std::string probeD = "pair2 alive d->c #" + std::to_string(attempt);
+		REQUIRE(stice_send(c, probeC.c_str(), probeC.size()) == STICE_ERR_SUCCESS);
+		REQUIRE(stice_send(d, probeD.c_str(), probeD.size()) == STICE_ERR_SUCCESS);
+		c2dAlive = waitForRecv(sd, probeC, 1000);
+		d2cAlive = waitForRecv(sc, probeD, 1000);
+		if (!c2dAlive) {
+			// A missed C->D probe that shows up in C's OWN stream proves the
+			// loopback "last sender" attribution excluded D from the broadcast.
+			bool selfEcho = false;
+			for (const auto &m : recvSnapshot(sc))
+				if (m == probeC) selfEcho = true;
+			WARN("DIAG attempt=" << attempt << " c2d miss selfEcho=" << selfEcho);
+			for (const auto &m : recvSnapshot(sd))
+				WARN("DIAG sd='" << m << "'");
+		}
+	}
+	REQUIRE(c2dAlive);
+	REQUIRE(d2cAlive);
+
+	// Pair 1 reconnects in its new generation through the SAME shared socket.
+	REQUIRE(waitFor([&] {
+		auto as = sa.state.load();
+		auto bs = sb.state.load();
+		return (as == STICE_STATE_CONNECTED || as == STICE_STATE_COMPLETED) &&
+		       (bs == STICE_STATE_CONNECTED || bs == STICE_STATE_COMPLETED);
+	}, 15000));
+
+	const char *msgAB2 = "pair1 after restart from A";
+	const char *msgBA2 = "pair1 after restart from B";
+	REQUIRE(stice_send(a, msgAB2, std::strlen(msgAB2)) == STICE_ERR_SUCCESS);
+	REQUIRE(waitForRecv(sb, msgAB2, 3000));
+	REQUIRE(stice_send(b, msgBA2, std::strlen(msgBA2)) == STICE_ERR_SUCCESS);
+	REQUIRE(waitForRecv(sa, msgBA2, 3000));
+
+	stice_destroy(a);
+	stice_destroy(b);
+	stice_destroy(c);
+	stice_destroy(d);
 	stice_destroy_udp_mux(mux);
 }
 
@@ -1104,7 +1541,7 @@ TEST_CASE("UDP ICE: ufrag mismatch causes STUN 400 → pair Failed → Agent FAI
 	stice_destroy(b);
 }
 
-TEST_CASE("UDP ICE: empty remote candidates does not cause FAILED",
+TEST_CASE("UDP ICE: empty remote candidates + EOC fails fast",
           "[integration][udp][failure]") {
 	stice_set_log_level(STICE_LOG_LEVEL_WARN);
 
@@ -1116,10 +1553,11 @@ TEST_CASE("UDP ICE: empty remote candidates does not cause FAILED",
 	REQUIRE(stice_gather_candidates(a) == STICE_ERR_SUCCESS);
 	REQUIRE(waitFor([&] { return sa.gatheringDone.load(); }, 3000));
 
-	// Set a remote SDP with ufrag/pwd but NO candidates. formPairs()
-	// creates zero pairs, so the allFailed check (!pairs_.empty()) is
-	// false — the Agent must NOT transition to FAILED. It stays in
-	// CONNECTING, waiting for trickled candidates.
+	// Remote SDP with ufrag/pwd, NO candidates, and end-of-candidates. Both
+	// sides are done gathering and no pair can ever form, so the agent takes
+	// the deliberate fast-failure path (stice product choice; RFC 8863 §4's
+	// patience is pointless once no further pair can appear) instead of
+	// sitting in CONNECTING for the 39.5 s PAC window.
 	const char *emptySdp =
 	    "a=ice-ufrag:remoteufrag\n"
 	    "a=ice-pwd:remotepwdremotepwdremotepwd\n"
@@ -1127,12 +1565,34 @@ TEST_CASE("UDP ICE: empty remote candidates does not cause FAILED",
 	REQUIRE(stice_set_remote_description(a, emptySdp) == STICE_ERR_SUCCESS);
 	REQUIRE(stice_set_remote_gathering_done(a) == STICE_ERR_SUCCESS);
 
-	// Agent should be in CONNECTING, not FAILED.
+	REQUIRE(waitFor([&] { return sa.state.load() == STICE_STATE_FAILED; }, 3000));
+
+	stice_destroy(a);
+}
+
+TEST_CASE("UDP ICE: empty remote candidates without EOC stays CONNECTING",
+          "[integration][udp][failure]") {
+	stice_set_log_level(STICE_LOG_LEVEL_WARN);
+
+	AgentState sa;
+	auto cfgA = makeConfig(sa);
+	stice_agent_t *a = stice_create(&cfgA);
+	REQUIRE(a != nullptr);
+
+	REQUIRE(stice_gather_candidates(a) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] { return sa.gatheringDone.load(); }, 3000));
+
+	// No remote candidates yet and the remote has NOT declared end-of-
+	// candidates: trickled candidates may still arrive, so the agent must
+	// stay in CONNECTING rather than fail.
+	const char *emptySdp =
+	    "a=ice-ufrag:remoteufrag\n"
+	    "a=ice-pwd:remotepwdremotepwdremotepwd\n";
+	REQUIRE(stice_set_remote_description(a, emptySdp) == STICE_ERR_SUCCESS);
+
 	REQUIRE(waitFor([&] { return sa.state.load() == STICE_STATE_CONNECTING; }, 2000));
 	REQUIRE(sa.state.load() == STICE_STATE_CONNECTING);
 
-	// Wait briefly to ensure it stays in CONNECTING (no spurious
-	// transition to FAILED).
 	std::this_thread::sleep_for(std::chrono::milliseconds(500));
 	REQUIRE(sa.state.load() == STICE_STATE_CONNECTING);
 
@@ -1698,7 +2158,7 @@ TEST_CASE("Multi-port candidate matching: selects reachable port among many",
 //
 // Sets up a TCP ICE connection between a passive agent (TCPMux) and an active
 // agent, exchanges data, then abruptly destroys the PASSIVE side. The ACTIVE
-// side must detect the TCP connection loss (EOF/RST) via its tcpTransport_
+// side must detect the TCP connection loss (EOF/RST) via its ICE-TCP connection
 // onTcpEvents() callback and transition to FAILED quickly.
 //
 // The active side has direct transport-state monitoring (POLLHUP/POLLERR/recv
@@ -1784,7 +2244,7 @@ TEST_CASE("ICE-TCP EOF/RST disconnect: active detects passive-side teardown",
 	stice_destroy_tcp_mux(mux);
 
 	// The active side (B) must detect the TCP connection loss via its
-	// tcpTransport_ EOF/RST path and transition to FAILED. This should
+	// per-pair TCP connection EOF/RST path and transition to FAILED. This should
 	// happen quickly (next poll cycle detects POLLHUP/recv==0).
 	REQUIRE(waitFor([&] {
 		auto bs = sb.state.load();
@@ -1792,6 +2252,480 @@ TEST_CASE("ICE-TCP EOF/RST disconnect: active detects passive-side teardown",
 	}, 10000));
 
 	stice_destroy(b);
+}
+
+TEST_CASE("ICE-TCP restart: new ufrag re-registers with the shared TCPMux",
+          "[integration][tcp][restart]") {
+	// 0.14.0 made restart() also drop the TCPMux registration of the old
+	// generation (mirroring UDPMux): the mux demuxes inbound dials by the
+	// USERNAME ufrag and closes connections whose ufrag has no agent entry,
+	// so without re-registration the passive endpoint is permanently deaf
+	// after a restart. The active side must be able to re-dial the SAME
+	// listener and reach the agent under its NEW ufrag.
+	stice_set_log_level(STICE_LOG_LEVEL_WARN);
+
+	stice_tcp_mux_t *mux = stice_create_tcp_mux("127.0.0.1", 0);
+	REQUIRE(mux != nullptr);
+
+	AgentState sa, sb;
+	auto cfgA = makeConfig(sa); // passive, mux-attached
+	auto cfgB = makeConfig(sb); // active
+	cfgA.concurrency_mode = STICE_CONCURRENCY_MODE_POLL;
+	cfgB.concurrency_mode = STICE_CONCURRENCY_MODE_POLL;
+
+	stice_agent_t *a = stice_create(&cfgA);
+	stice_agent_t *b = stice_create(&cfgB);
+	REQUIRE(a != nullptr);
+	REQUIRE(b != nullptr);
+
+	REQUIRE(stice_set_ice_tcp_mode(a, STICE_ICE_TCP_MODE_PASSIVE) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_agent_use_tcp_mux(a, mux) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_ice_tcp_mode(b, STICE_ICE_TCP_MODE_ACTIVE) == STICE_ERR_SUCCESS);
+
+	REQUIRE(stice_gather_candidates(b) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_gather_candidates(a) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] { return sa.gatheringDone.load(); }, 3000));
+	REQUIRE(waitFor([&] { return sb.gatheringDone.load(); }, 3000));
+
+	char sdpA1[4096], sdpB1[4096];
+	REQUIRE(stice_get_local_description(a, sdpA1, sizeof(sdpA1)) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_get_local_description(b, sdpB1, sizeof(sdpB1)) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_remote_description(a, sdpB1) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_remote_description(b, sdpA1) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_remote_gathering_done(a) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_remote_gathering_done(b) == STICE_ERR_SUCCESS);
+
+	REQUIRE(waitFor([&] {
+		auto as = sa.state.load();
+		auto bs = sb.state.load();
+		return (as == STICE_STATE_CONNECTED || as == STICE_STATE_COMPLETED) &&
+		       (bs == STICE_STATE_CONNECTED || bs == STICE_STATE_COMPLETED);
+	}, 8000));
+
+	const char *pre = "tcp pre-restart from B";
+	REQUIRE(stice_send(b, pre, std::strlen(pre)) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] { return recvCount(sa) >= 1; }, 2000));
+
+	// Restart the PASSIVE side (the mux-attached agent). restart() must drop
+	// the old generation's registration; gatherCandidates re-registers under
+	// the fresh ufrag.
+	std::string sdpA1Str(sdpA1);
+	auto ufragA1 = sdpA1Str.substr(sdpA1Str.find("a=ice-ufrag:") + 12, 4);
+
+	sa.gatheringDone.store(false);
+	REQUIRE(stice_agent_restart(a) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] { return sa.gatheringDone.load(); }, 3000));
+
+	char sdpA2[4096];
+	REQUIRE(stice_get_local_description(a, sdpA2, sizeof(sdpA2)) == STICE_ERR_SUCCESS);
+	std::string sdpA2Str(sdpA2);
+	auto ufragA2 = sdpA2Str.substr(sdpA2Str.find("a=ice-ufrag:") + 12, 4);
+	// A genuinely new generation: without changed credentials the re-register
+	// path would not be exercised at all.
+	REQUIRE(ufragA2 != ufragA1);
+
+	// B follows on A's new generation (RFC 8445 §9 peer-restart detection).
+	sb.gatheringDone.store(false);
+	REQUIRE(stice_set_remote_description(b, sdpA2) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] { return sb.gatheringDone.load(); }, 3000));
+	char sdpB2[4096];
+	REQUIRE(stice_get_local_description(b, sdpB2, sizeof(sdpB2)) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_remote_description(a, sdpB2) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_remote_gathering_done(a) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_remote_gathering_done(b) == STICE_ERR_SUCCESS);
+
+	// B re-dials the SAME passive listener; the mux must hand the fresh
+	// connection (USERNAME carries the NEW ufrag) to A's new registration.
+	REQUIRE(waitFor([&] {
+		auto as = sa.state.load();
+		auto bs = sb.state.load();
+		return (as == STICE_STATE_CONNECTED || as == STICE_STATE_COMPLETED) &&
+		       (bs == STICE_STATE_CONNECTED || bs == STICE_STATE_COMPLETED);
+	}, 15000));
+
+	// Data flows both ways in the new generation.
+	size_t seenA = recvCount(sa);
+	size_t seenB = recvCount(sb);
+	const char *post1 = "tcp after restart from B";
+	const char *post2 = "tcp after restart from A";
+	REQUIRE(stice_send(b, post1, std::strlen(post1)) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] { return recvCount(sa) > seenA; }, 3000));
+	REQUIRE(recvSnapshot(sa).back() == post1);
+	REQUIRE(stice_send(a, post2, std::strlen(post2)) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] { return recvCount(sb) > seenB; }, 3000));
+	REQUIRE(recvSnapshot(sb).back() == post2);
+
+	stice_destroy(a);
+	stice_destroy(b);
+	stice_destroy_tcp_mux(mux);
+}
+
+// ---------------------------------------------------------------------------
+// In-test TCP forwarding proxy. Sits between the ICE-TCP active agent and the
+// passive agent's TCPMux so a test can break the TCP link mid-path (both legs)
+// without destroying either agent — the precondition for the RFC 6544 §11.1
+// redial-revival scenario.
+// ---------------------------------------------------------------------------
+
+namespace {
+struct ProxySession {
+	socket_t front = STICE_INVALID_SOCKET;
+	socket_t back = STICE_INVALID_SOCKET;
+	std::atomic<bool> dead{false};
+	std::thread toBackend;
+	std::thread toFront;
+};
+using ProxySessionPtr = std::shared_ptr<ProxySession>;
+
+bool fdSendAll(socket_t fd, const char *buf, int len) {
+	int off = 0;
+	while (off < len) {
+		int n = ::send(fd, buf + off, len - off, 0);
+		if (n <= 0) return false;
+		off += n;
+	}
+	return true;
+}
+
+void pumpFd(socket_t in, socket_t out, std::atomic<bool> *dead) {
+	char buf[4096];
+	while (!dead->load()) {
+		int n = ::recv(in, buf, sizeof(buf), 0);
+		if (n == 0) break; // peer closed
+		if (n < 0) {
+			if (stice::net::wouldBlock()) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(2));
+				continue;
+			}
+			break;
+		}
+		if (!fdSendAll(out, buf, n)) break;
+	}
+	dead->store(true);
+	// Wake the sibling pump so it observes the break too.
+	::shutdown(in, 2);
+	::shutdown(out, 2);
+}
+
+// Rewrites the port in a candidate SDP line (element 5 in the
+// "candidate:<foundation> <comp> <transport> <prio> <ip> <port> ..." shape).
+std::string rewriteCandidatePort(const std::string &cand, uint16_t port) {
+	std::istringstream iss(cand);
+	std::vector<std::string> tok;
+	std::string w;
+	while (iss >> w) tok.push_back(w);
+	REQUIRE(tok.size() > 5);
+	tok[5] = std::to_string(port);
+	std::ostringstream oss;
+	for (size_t i = 0; i < tok.size(); ++i) {
+		if (i) oss << ' ';
+		oss << tok[i];
+	}
+	return oss.str();
+}
+
+uint16_t candidatePort(const std::string &cand) {
+	std::istringstream iss(cand);
+	std::vector<std::string> tok;
+	std::string w;
+	while (iss >> w) tok.push_back(w);
+	REQUIRE(tok.size() > 5);
+	return static_cast<uint16_t>(std::stoi(tok[5]));
+}
+} // namespace
+
+class TcpForwardProxy {
+public:
+	TcpForwardProxy(uint16_t backendPort) : backendPort_(backendPort) {
+		listenSock_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+		REQUIRE(listenSock_ != STICE_INVALID_SOCKET);
+		sockaddr_in addr{};
+		addr.sin_family = AF_INET;
+		addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		addr.sin_port = 0;
+		REQUIRE(::bind(listenSock_, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0);
+		REQUIRE(::listen(listenSock_, 4) == 0);
+		// A blocking accept() is not woken by close() on POSIX (unspecified
+		// behaviour, and in practice it keeps sleeping), which deadlocks the
+		// destructor's join() on Linux. Poll a non-blocking listener instead.
+		REQUIRE(stice::net::setNonBlocking(listenSock_));
+		sockaddr_in bound{};
+		socklen_t blen = sizeof(bound);
+		REQUIRE(getsockname(listenSock_, reinterpret_cast<sockaddr *>(&bound), &blen) == 0);
+		port_ = ntohs(bound.sin_port);
+		acceptor_ = std::thread([this] { acceptLoop(); });
+	}
+
+	~TcpForwardProxy() {
+		stopping_.store(true);
+		sticeClosesocket(listenSock_);
+		if (acceptor_.joinable()) acceptor_.join();
+		killSessions();
+		for (auto &s : sessions_) {
+			if (s->toBackend.joinable()) s->toBackend.join();
+			if (s->toFront.joinable()) s->toFront.join();
+		}
+	}
+
+	uint16_t port() const { return port_; }
+
+	// Break every established session (both legs), simulating a mid-path link
+	// loss. The listener stays up, so a redial forms a fresh session.
+	void killSessions() {
+		std::lock_guard<std::mutex> lk(mtx_);
+		for (auto &s : sessions_) {
+			if (!s->dead.load()) {
+				::shutdown(s->front, 2);
+				::shutdown(s->back, 2);
+				sticeClosesocket(s->front);
+				sticeClosesocket(s->back);
+				s->dead.store(true);
+			}
+		}
+	}
+
+private:
+	void acceptLoop() {
+		while (!stopping_.load()) {
+			socket_t c = ::accept(listenSock_, nullptr, nullptr);
+			if (c == STICE_INVALID_SOCKET) {
+				if (stice::net::wouldBlock()) {
+					std::this_thread::sleep_for(std::chrono::milliseconds(2));
+					continue;
+				}
+				break;
+			}
+			socket_t b = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+			if (b == STICE_INVALID_SOCKET) {
+				sticeClosesocket(c);
+				break;
+			}
+			sockaddr_in dst{};
+			dst.sin_family = AF_INET;
+			dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+			dst.sin_port = htons(backendPort_);
+			if (::connect(b, reinterpret_cast<sockaddr *>(&dst), sizeof(dst)) != 0) {
+				sticeClosesocket(c);
+				sticeClosesocket(b);
+				continue;
+			}
+			ProxySessionPtr s = std::make_shared<ProxySession>();
+			s->front = c;
+			s->back = b;
+			s->toBackend = std::thread([s] { pumpFd(s->front, s->back, &s->dead); });
+			s->toFront = std::thread([s] { pumpFd(s->back, s->front, &s->dead); });
+			std::lock_guard<std::mutex> lk(mtx_);
+			sessions_.push_back(std::move(s));
+		}
+	}
+
+	socket_t listenSock_ = STICE_INVALID_SOCKET;
+	uint16_t backendPort_ = 0;
+	uint16_t port_ = 0;
+	std::thread acceptor_;
+	std::atomic<bool> stopping_{false};
+	std::mutex mtx_;
+	std::vector<ProxySessionPtr> sessions_;
+};
+
+namespace {
+// AgentState + state history (needed to observe the revival path shape).
+struct HistState {
+	std::atomic<stice_state_t> state{STICE_STATE_DISCONNECTED};
+	std::vector<std::string> candidates;
+	std::atomic<bool> gatheringDone{false};
+	std::vector<std::string> received;
+	std::mutex candidatesMutex;
+	std::mutex receivedMutex;
+	std::mutex histMutex;
+	std::vector<stice_state_t> hist;
+
+	void record(stice_state_t s) {
+		std::lock_guard<std::mutex> lk(histMutex);
+		hist.push_back(s);
+	}
+	std::vector<stice_state_t> history() {
+		std::lock_guard<std::mutex> lk(histMutex);
+		return hist;
+	}
+};
+
+stice_config_t makeHistConfig(HistState &s) {
+	stice_config_t cfg{};
+	cfg.cb_state_changed = [](stice_agent_t *, stice_state_t state, void *user_ptr) {
+		auto *s = static_cast<HistState *>(user_ptr);
+		s->state.store(state);
+		s->record(state);
+	};
+	cfg.cb_candidate = [](stice_agent_t *, const char *cand, void *user_ptr) {
+		auto *s = static_cast<HistState *>(user_ptr);
+		std::lock_guard<std::mutex> lk(s->candidatesMutex);
+		s->candidates.emplace_back(cand);
+	};
+	cfg.cb_gathering_done = [](stice_agent_t *, void *user_ptr) {
+		static_cast<HistState *>(user_ptr)->gatheringDone.store(true);
+	};
+	cfg.cb_recv = [](stice_agent_t *, const char *data, size_t size, void *user_ptr) {
+		auto *s = static_cast<HistState *>(user_ptr);
+		std::lock_guard<std::mutex> lk(s->receivedMutex);
+		s->received.emplace_back(data, size);
+	};
+	cfg.user_ptr = &s;
+	cfg.concurrency_mode = STICE_CONCURRENCY_MODE_POLL;
+	return cfg;
+}
+} // namespace
+
+// ---------------------------------------------------------------------------
+// ICE-TCP redial revival: nomination state lifecycle (P1-N3)
+//
+// Completes a session through an in-test TCP proxy, then breaks both legs of
+// the proxied link. The active side must redial (RFC 6544 §11.1) and the
+// revived pair must come back un-nominated:
+//   - the DISCONNECTED -> COMPLETED transition must pass through CONNECTED
+//     (a revived pair re-runs checks first, and COMPLETED only returns after
+//     a fresh nomination cycle). With the P1-N3 bug — stale
+//     nominated/nominationRequested on the revived pair — the agent jumps
+//     DISCONNECTED -> COMPLETED directly, i.e. the controlled side reports
+//     COMPLETED without the peer re-sending USE-CANDIDATE.
+//   - the session must fully recover (both sides COMPLETED, active side can
+//     send data over the new connection).
+// ---------------------------------------------------------------------------
+TEST_CASE("ICE-TCP redial revival: revived pair must not inherit nomination (P1-N3)",
+          "[integration][tcp][redial][nomination]") {
+	stice_set_log_level(STICE_LOG_LEVEL_WARN);
+
+	HistState sa, sb; // sa = passive (mux behind proxy), sb = active (redialing)
+
+	stice_tcp_mux_t *mux = stice_create_tcp_mux("127.0.0.1", 0);
+	REQUIRE(mux != nullptr);
+
+	auto cfgA = makeHistConfig(sa);
+	auto cfgB = makeHistConfig(sb);
+	stice_agent_t *a = stice_create(&cfgA);
+	stice_agent_t *b = stice_create(&cfgB);
+	REQUIRE(a != nullptr);
+	REQUIRE(b != nullptr);
+
+	REQUIRE(stice_set_ice_tcp_mode(a, STICE_ICE_TCP_MODE_PASSIVE) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_agent_use_tcp_mux(a, mux) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_ice_tcp_mode(b, STICE_ICE_TCP_MODE_ACTIVE) == STICE_ERR_SUCCESS);
+
+	char sdpA[4096], sdpB[4096];
+	REQUIRE(stice_get_local_description(a, sdpA, sizeof(sdpA)) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_get_local_description(b, sdpB, sizeof(sdpB)) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_remote_description(a, sdpB) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_remote_description(b, sdpA) == STICE_ERR_SUCCESS);
+
+	REQUIRE(stice_gather_candidates(a) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_gather_candidates(b) == STICE_ERR_SUCCESS);
+
+	REQUIRE(waitFor([&] { return sa.gatheringDone.load(); }, 3000));
+	REQUIRE(waitFor([&] { return sb.gatheringDone.load(); }, 3000));
+
+	// Find the passive side's TCP candidate, put the proxy in front of it.
+	std::string muxCand;
+	{
+		std::lock_guard<std::mutex> lk(sa.candidatesMutex);
+		for (const auto &c : sa.candidates) {
+			if (c.find("tcp") != std::string::npos && c.find("passive") != std::string::npos) {
+				muxCand = c;
+				break;
+			}
+		}
+	}
+	REQUIRE(!muxCand.empty());
+	uint16_t muxPort = candidatePort(muxCand);
+
+	TcpForwardProxy proxy(muxPort);
+
+	{
+		std::string viaProxy = rewriteCandidatePort(muxCand, proxy.port());
+		stice_add_remote_candidate(b, viaProxy.c_str());
+	}
+	{
+		std::lock_guard<std::mutex> lk(sb.candidatesMutex);
+		for (const auto &c : sb.candidates) {
+			if (c.find("tcp") != std::string::npos)
+				stice_add_remote_candidate(a, c.c_str());
+		}
+	}
+	REQUIRE(stice_set_remote_gathering_done(a) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_set_remote_gathering_done(b) == STICE_ERR_SUCCESS);
+
+	// Baseline: complete the session and exchange data in both directions.
+	REQUIRE(waitFor([&] {
+		auto as = sa.state.load();
+		auto bs = sb.state.load();
+		return as == STICE_STATE_COMPLETED && bs == STICE_STATE_COMPLETED;
+	}, 10000));
+
+	const char *msg1 = "pre-break-b2a";
+	REQUIRE(stice_send(b, msg1, std::strlen(msg1)) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] {
+		std::lock_guard<std::mutex> lk(sa.receivedMutex);
+		return !sa.received.empty() && sa.received.back() == msg1;
+	}, 3000));
+	const char *msg2 = "pre-break-a2b";
+	REQUIRE(stice_send(a, msg2, std::strlen(msg2)) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] {
+		std::lock_guard<std::mutex> lk(sb.receivedMutex);
+		return !sb.received.empty() && sb.received.back() == msg2;
+	}, 3000));
+
+	// Break the link mid-path. Both legs die: the active side sees the loss
+	// immediately and redials; the passive side's mux connection also dies.
+	proxy.killSessions();
+
+	// 1. The active side must report the loss (grace window), not hang.
+	REQUIRE(waitFor([&] { return sb.state.load() == STICE_STATE_DISCONNECTED; }, 10000));
+
+	// 2. Full recovery: redial + fresh nomination cycle back to COMPLETED.
+	REQUIRE(waitFor([&] { return sb.state.load() == STICE_STATE_COMPLETED; }, 60000));
+
+	// 3. The revival path shape: between the post-break DISCONNECTED and the
+	// next COMPLETED there must be a CONNECTED. A direct jump means the
+	// revived pair came back nominated (P1-N3 bug).
+	{
+		auto hist = sb.history();
+		std::ptrdiff_t lastCompleted = -1;
+		for (std::ptrdiff_t i = static_cast<std::ptrdiff_t>(hist.size()) - 1; i >= 0; --i) {
+			if (hist[static_cast<size_t>(i)] == STICE_STATE_COMPLETED) {
+				lastCompleted = i;
+				break;
+			}
+		}
+		REQUIRE(lastCompleted > 0);
+		std::ptrdiff_t disconnected = -1;
+		for (std::ptrdiff_t i = lastCompleted - 1; i >= 0; --i) {
+			if (hist[static_cast<size_t>(i)] == STICE_STATE_DISCONNECTED) {
+				disconnected = i;
+				break;
+			}
+		}
+		REQUIRE(disconnected >= 0);
+		bool sawConnected = false;
+		for (std::ptrdiff_t i = disconnected + 1; i < lastCompleted; ++i) {
+			if (hist[static_cast<size_t>(i)] == STICE_STATE_CONNECTED) {
+				sawConnected = true;
+				break;
+			}
+		}
+		INFO("state history: " << hist.size() << " transitions");
+		REQUIRE(sawConnected);
+	}
+
+	// 4. Data flows over the new connection.
+	const char *msg3 = "post-recovery-b2a";
+	REQUIRE(stice_send(b, msg3, std::strlen(msg3)) == STICE_ERR_SUCCESS);
+	REQUIRE(waitFor([&] {
+		std::lock_guard<std::mutex> lk(sa.receivedMutex);
+		return !sa.received.empty() && sa.received.back() == msg3;
+	}, 5000));
+
+	stice_destroy(a);
+	stice_destroy(b);
+	stice_destroy_tcp_mux(mux);
 }
 
 // ---------------------------------------------------------------------------

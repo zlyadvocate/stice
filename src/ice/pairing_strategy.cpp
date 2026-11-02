@@ -27,8 +27,9 @@ IcePairingConfig makeIcePairingConfig(IcePairingProfile profile) {
 		c.tcp_relay_fallback = TcpRelayFallbackMode::ALWAYS_ENABLE;
 		c.reselect_policy = LinkReselectPolicy::RFC8445;
 		c.rto_initial = std::chrono::milliseconds(500);
-		c.max_check_retransmit = 6;
-		c.keepalive_udp = std::chrono::milliseconds(10000);
+		// Rc=7: RFC 5389 §7.2.1 default retransmission count (31.5 s budget).
+		c.max_check_retransmit = 7;
+		c.keepalive_udp = std::chrono::milliseconds(5000);
 		c.keepalive_tcp_relay = std::chrono::milliseconds(10000);
 		// Standard behavior: no early-phase boost, trickle enabled.
 		c.enable_trickle = true;
@@ -52,7 +53,7 @@ IcePairingConfig makeIcePairingConfig(IcePairingProfile profile) {
 		c.reselect_policy = LinkReselectPolicy::STICKY_SELECTED;
 		c.rto_initial = std::chrono::milliseconds(500);
 		c.max_check_retransmit = 3;
-		c.keepalive_udp = std::chrono::milliseconds(10000);
+		c.keepalive_udp = std::chrono::milliseconds(5000);
 		c.keepalive_tcp_relay = std::chrono::milliseconds(5000);
 		c.enable_trickle = true;
 		c.pre_allocate_tcp_relay = false; // lazy: conserve coturn TCP resources
@@ -73,7 +74,7 @@ IcePairingConfig makeIcePairingConfig(IcePairingProfile profile) {
 		c.reselect_policy = LinkReselectPolicy::RFC8445;
 		c.rto_initial = std::chrono::milliseconds(500); // >= RFC 5389 min RTO; 400ms too aggressive under load
 		c.max_check_retransmit = 3;
-		c.keepalive_udp = std::chrono::milliseconds(8000);
+		c.keepalive_udp = std::chrono::milliseconds(5000);
 		c.keepalive_tcp_relay = std::chrono::milliseconds(4000);
 		c.enable_trickle = true;
 		c.pre_allocate_tcp_relay = true; // speed priority
@@ -93,7 +94,7 @@ IcePairingConfig makeIcePairingConfig(IcePairingProfile profile) {
 		c.reselect_policy = LinkReselectPolicy::STICKY_SELECTED;
 		c.rto_initial = std::chrono::milliseconds(1000);
 		c.max_check_retransmit = 5;
-		c.keepalive_udp = std::chrono::milliseconds(15000);
+		c.keepalive_udp = std::chrono::milliseconds(5000);
 		c.keepalive_tcp_relay = std::chrono::milliseconds(8000);
 		c.enable_trickle = false; // minimize signaling traffic
 		c.pre_allocate_tcp_relay = false;

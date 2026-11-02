@@ -37,6 +37,11 @@ struct Description {
 	// invalidates references to existing elements.
 	std::deque<Candidate> candidates;
 	bool finished = false; // end-of-candidates seen
+    // Whether the local description advertises the "trickle" ice-option token.
+    // draft-ietf-ice-trickle §3: the token must only be emitted when the agent
+    // actually supports trickling; a non-trickle session that advertises it
+    // invites the peer to send candidates mid-session that we then reject.
+    bool trickleEnabled = true;
 
 	void sortCandidates();
 	std::string generateSdp() const;

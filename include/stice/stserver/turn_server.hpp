@@ -236,10 +236,12 @@ private:
 	void sendTcpRawLocked(TcpConn &conn, const unsigned char *data, std::size_t size);
 	bool flushTcpLocked(TcpConn &conn);
 	void sendErrorResponseUdp(const stice::net::AddrRecord &dst,
-	                           const stice::stun::Message &req, int code);
+	                           const stice::stun::Message &req, int code,
+	                           const std::vector<std::uint16_t> *unknown = nullptr);
 	void sendAuthErrorResponse(const stice::net::AddrRecord &dst,
 	                           const stice::stun::Message &req, int code);
-	void sendErrorResponseTcp(TcpConn &conn, const stice::stun::Message &req, int code);
+	void sendErrorResponseTcp(TcpConn &conn, const stice::stun::Message &req, int code,
+	                          const std::vector<std::uint16_t> *unknown = nullptr);
 	void sendAuthErrorResponseTcp(TcpConn &conn, const stice::stun::Message &req, int code);
 	void sendSuccessResponse(const stice::stun::Message &req, const std::string &username,
 	                         stice::stun::Message &resp);

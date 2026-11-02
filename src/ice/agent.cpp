@@ -29,11 +29,47 @@
 #endif
 namespace stice::ice {
 	namespace {
+		// draft-thatcher-ice-renomination is an opt-in escape hatch only: nothing
+		// negotiates it, so the default is RFC 8445 §8.1.1 strict — an agent
+		// nominates once and MUST NOT switch afterwards (only an ICE restart may).
+		bool renominationAllowed() {
+			static const bool allowed = []() {
+				const char* v = std::getenv("STICE_ICE_RENOMINATION");
+				return v && v[0] == '1';
+			}();
+			return allowed;
+		}
 		std::string tidKey(const std::array<unsigned char, 12>& tid) {
 			return std::string(reinterpret_cast<const char*>(tid.data()), 12);
 		}
+		// P1-N3: nomination state is part of the pair lifecycle and dies with the
+		// pair. A pair revived from Failed (ICE-TCP redial) must not inherit
+		// nomination flags — the controlled side would otherwise report COMPLETED
+		// without a fresh UseCandidate, and the controlling side's re-nomination
+		// block is gated on the same flags.
+		void resetNomination(CandidatePair& p) {
+			p.nominated = false;
+			p.nominationRequested = false;
+			p.nominationValue = 0;
+		}
 		int64_t toMs(std::chrono::steady_clock::time_point tp) {
 			return std::chrono::duration_cast<std::chrono::milliseconds>(tp.time_since_epoch()).count();
+		}
+		// RFC 8489 §14.5: discard messages whose FINGERPRINT is present but
+		// wrong. Missing FINGERPRINT is tolerated for legacy peers; STICE_FP_STRICT=0
+		// downgrades the drop to a log for grayscale rollout.
+		bool fingerprintAcceptable(const stun::Message& m, const char* where) {
+			static const bool strict = []() {
+				const char* v = std::getenv("STICE_FP_STRICT");
+				return !(v && v[0] == '0');
+			}();
+			if (m.checkFingerprint(true)) return true;
+			if (strict) {
+				STICE_LOG_WARN("%s: FINGERPRINT mismatch, dropping message", where);
+				return false;
+			}
+			STICE_LOG_DEBUG("%s: FINGERPRINT mismatch tolerated (STICE_FP_STRICT=0)", where);
+			return true;
 		}
 	} // namespace
 	Agent::Agent() {
@@ -123,7 +159,7 @@ namespace stice::ice {
 	}
 	void Agent::cancelAllEntries() {
 		// Acquire the mutex: the poll thread may be mid-callback (onBookkeeping)
-		// and we must not race on entries_/tcpTransport_ while cancelling.
+		// and we must not race on entries_/tcpConns_ while cancelling.
 		std::lock_guard<std::recursive_mutex> lock(mutex_);
 		// Cancel every STUN entry so the bookkeeping loop will never fire it
 		// again. StunEntryState::Cancelled entries are skipped by onBookkeeping.
@@ -142,7 +178,7 @@ namespace stice::ice {
 			}
 		}
 		// Close TCP transports so their poll registrations stop firing.
-		tcpTransport_.reset();
+		tcpConns_.clear();
 		for (auto& e : entries_)
 			if (e.type == StunEntryType::Relay && e.turnTcp)
 				e.turnTcp->close();
@@ -211,6 +247,11 @@ namespace stice::ice {
 		// Generate local ufrag/pwd unless caller overrides via set_local_ice_attributes.
 		local_.iceUfrag = generateUfrag();
 		local_.icePwd = generatePwd();
+		// draft-ietf-ice-trickle §3: only advertise the "trickle" ice-option when
+		// the session actually trickles. The token is part of the local
+		// description handed to the application, so it must reflect the
+		// configured mode at gather time.
+		local_.trickleEnabled = pairingCfg_.enable_trickle;
 		// candidates is std::deque (see Description): push_back never
 		// invalidates pointers into it, so CandidatePair's raw local/remote
 		// pointers stay valid as trickle candidates arrive after pairing.
@@ -297,19 +338,94 @@ namespace stice::ice {
 		return STICE_ERR_SUCCESS;
 	}
 	socket_t Agent::tcpSocket() const {
-	// Snapshot under the agent lock like nextTimestampMs()/onUdpReadable() do:
-	// these getters run on the poll thread and must not rely on the implicit
-	// happens-before of "write tcpTransport_ then pollReg_->add(this)", which any
-	// future writer that forgets the add() would silently break (data race).
-	std::lock_guard<std::recursive_mutex> lock(mutex_);
-	return tcpTransport_ ? tcpTransport_->handle() : STICE_INVALID_SOCKET;
+		// Snapshot under the agent lock like nextTimestampMs()/onUdpReadable() do:
+		// these getters run on the poll thread and must not rely on the implicit
+		// happens-before of "write tcpConns_ then pollReg_->add(this)", which any
+		// future writer that forgets the add() would silently break (data race).
+		// Prefer a connected connection so the legacy single slot is the one that
+		// actually carries data; fall back to the first entry.
+		std::lock_guard<std::recursive_mutex> lock(mutex_);
+		for (const auto &c : tcpConns_)
+			if (c.transport && c.transport->state() == net::TcpState::Connected)
+				return c.transport->handle();
+		for (const auto &c : tcpConns_)
+			if (c.transport) return c.transport->handle();
+		return STICE_INVALID_SOCKET;
 	}
 	short Agent::tcpDesiredEvents() const {
-	std::lock_guard<std::recursive_mutex> lock(mutex_);
-	if (!tcpTransport_) return 0;
-	short ev = POLLIN;
-	if (tcpTransport_->wantsWrite()) ev |= POLLOUT;
-	return ev;
+		std::lock_guard<std::recursive_mutex> lock(mutex_);
+		for (const auto &c : tcpConns_) {
+			if (!c.transport) continue;
+			short ev = POLLIN;
+			if (c.transport->wantsWrite()) ev |= POLLOUT;
+			return ev;
+		}
+		return 0;
+	}
+	int Agent::iceTcpSlotCount() const {
+		std::lock_guard<std::recursive_mutex> lock(mutex_);
+		return static_cast<int>(tcpConns_.size());
+	}
+	socket_t Agent::iceTcpSocketAt(int i) const {
+		std::lock_guard<std::recursive_mutex> lock(mutex_);
+		if (i < 0 || i >= static_cast<int>(tcpConns_.size())) return STICE_INVALID_SOCKET;
+		const auto &c = tcpConns_[static_cast<std::size_t>(i)];
+		return c.transport ? c.transport->handle() : STICE_INVALID_SOCKET;
+	}
+	short Agent::iceTcpDesiredEventsAt(int i) const {
+		std::lock_guard<std::recursive_mutex> lock(mutex_);
+		if (i < 0 || i >= static_cast<int>(tcpConns_.size())) return 0;
+		const auto &c = tcpConns_[static_cast<std::size_t>(i)];
+		if (!c.transport) return 0;
+		short ev = POLLIN;
+		if (c.transport->wantsWrite()) ev |= POLLOUT;
+		return ev;
+	}
+	void Agent::onIceTcpEventsSock(socket_t sock, short events) {
+		LifetimeScope ls(lifetime_);
+		if (!ls) return;
+		std::lock_guard<std::recursive_mutex> lock(mutex_);
+		// Re-find by fd: an earlier callback in this dispatch batch may have
+		// changed the connection list, so an index would be stale.
+		TcpConnection *conn = findTcpConnBySocket(sock);
+		if (!conn) return;
+		onTcpConnEvents(*conn, events);
+	}
+	Agent::TcpConnection *Agent::findTcpConnBySocket(socket_t sock) {
+		for (auto &c : tcpConns_)
+			if (c.transport && c.transport->handle() == sock) return &c;
+		return nullptr;
+	}
+	Agent::TcpConnection *Agent::tcpConnForPair(const CandidatePair *pair) {
+		if (!pair) return nullptr;
+		for (auto &c : tcpConns_)
+			if (c.pair == pair) return &c;
+		if (pair->remote) {
+			for (auto &c : tcpConns_) {
+				if (c.peerAddr.isEqual(pair->remote->resolved, true)) {
+					c.pair = const_cast<CandidatePair *>(pair);
+					return &c;
+				}
+			}
+		}
+		return nullptr;
+	}
+	Agent::TcpConnection *Agent::primaryTcpConn() {
+		for (auto &c : tcpConns_)
+			if (c.transport && c.transport->state() == net::TcpState::Connected) return &c;
+		for (auto &c : tcpConns_)
+			if (c.transport) return &c;
+		return nullptr;
+	}
+	bool Agent::hasConnectedTcpForPair(const CandidatePair *pair) const {
+		std::lock_guard<std::recursive_mutex> lock(mutex_);
+		for (const auto &c : tcpConns_) {
+			if (!c.transport || c.transport->state() != net::TcpState::Connected) continue;
+			if (!pair) return true;
+			if (c.pair == pair) return true;
+			if (pair->remote && c.peerAddr.isEqual(pair->remote->resolved, true)) return true;
+		}
+		return false;
 	}
 	int64_t Agent::nextTimestampMs() const {
 	// Called by the poll thread under the registry mutex_; snapshot agent state here to avoid a cross-thread data race (TSan)
@@ -351,19 +467,29 @@ namespace stice::ice {
 				t = t_nom;
 			}
 		}
-		// Account for in-progress TCP connects. A black-holed connect (e.g.
-		// unroutable TURN-over-TCP server) never fires a poll event, so without
-		// exposing the connect deadline here the poll loop would sleep until its
-		// 60 s clamp and the bookkeeping pass (which detects the timeout) would
-		// run far too late, hanging gathering. Wake exactly at the deadline.
-		if (tcpTransport_ && (tcpTransport_->state() == net::TcpState::Connecting ||
-			tcpTransport_->state() == net::TcpState::TlsHandshaking)) {
-			int64_t dl = tcpTransport_->connectDeadlineMs(); // -1 = none (atomic)
-			if (dl > 0) {
-				auto dlTp = std::chrono::steady_clock::time_point{ std::chrono::milliseconds(dl) };
-				if (!hasPending || dlTp < t) {
+		// Account for in-progress TCP connects and scheduled redials. A black-
+		// holed connect (e.g. unroutable TURN-over-TCP server) never fires a poll
+		// event, so without exposing the deadline here the poll loop would sleep
+		// until its 60 s clamp and the bookkeeping pass (which detects the
+		// timeout) would run far too late, hanging gathering.
+		for (const auto& c : tcpConns_) {
+			if (c.reconnectPending) {
+				if (!hasPending || c.nextReconnect < t) {
 					hasPending = true;
-					t = dlTp;
+					t = c.nextReconnect;
+				}
+				continue;
+			}
+			if (!c.transport) continue;
+			if (c.transport->state() == net::TcpState::Connecting ||
+				c.transport->state() == net::TcpState::TlsHandshaking) {
+				int64_t dl = c.transport->connectDeadlineMs(); // -1 = none (atomic)
+				if (dl > 0) {
+					auto dlTp = std::chrono::steady_clock::time_point{ std::chrono::milliseconds(dl) };
+					if (!hasPending || dlTp < t) {
+						hasPending = true;
+						t = dlTp;
+					}
 				}
 			}
 		}
@@ -415,6 +541,11 @@ namespace stice::ice {
 	void Agent::changeState(stice_state_t newState) {
 		if (state_ == newState) return;
 		state_ = newState;
+		// The new generation is established (or dead): a peer's next credential
+		// change is a new restart, not the completion of this one.
+		if (newState == STICE_STATE_CONNECTED || newState == STICE_STATE_COMPLETED ||
+			newState == STICE_STATE_FAILED)
+			restartingLocally_ = false;
 		// Record checking start time for acceptance min wait calculation.
 		// Aligned with pion-ice controllingSelector.Start() (selection.go L35-38).
 		if (newState == STICE_STATE_CONNECTING) {
@@ -483,14 +614,50 @@ namespace stice::ice {
 	}
 	void Agent::emitCandidate(const Candidate& c) {
 		if (!config_.cb_candidate) return;
+		// RFC 8838 §4: once the end-of-candidates indication has been sent the
+		// agent MUST NOT generate any more candidates. Late TCP-active
+		// candidates are the RFC 6544 §7.1 exception: they are created in
+		// response to a remote passive candidate after local gathering, and
+		// dropping them would silently lose the only usable TCP path.
+		if (pairingCfg_.enable_trickle && gatheringDone_ &&
+			c.transport != CandidateTransport::TCPActive) {
+			STICE_LOG_DEBUG("emitCandidate: gathering done (EOC sent), suppressing late %s candidate",
+				c.hostname.c_str());
+			return;
+		}
 		std::string sdp = c.toSdp();
+		// enable_trickle=false (non-trickle ICE): hold the candidate until
+		// gathering completes so the application receives the full candidate
+		// set in one batch. Candidates gathered after the batch (e.g. an active
+		// TCP candidate created from a trickled remote passive candidate) are
+		// still delivered immediately — dropping them would silently lose a
+		// usable path.
+		if (!pairingCfg_.enable_trickle && !gatheringDone_) {
+			deferredCandidates_.push_back(std::move(sdp));
+			return;
+		}
 		config_.cb_candidate(self_, sdp.c_str(), config_.user_ptr);
+	}
+	void Agent::flushDeferredCandidates() {
+		for (const auto& sdp : deferredCandidates_)
+			if (config_.cb_candidate) config_.cb_candidate(self_, sdp.c_str(), config_.user_ptr);
+		deferredCandidates_.clear();
 	}
 	void Agent::emitGatheringDone() {
 		if (config_.cb_gathering_done) config_.cb_gathering_done(self_, config_.user_ptr);
 	}
-	void Agent::emitRecv(const char* data, std::size_t size) {
-		lastAppDataAt_ = std::chrono::steady_clock::now();
+	void Agent::emitRecv(const char* data, std::size_t size, CandidatePair* onPair) {
+		const auto now = std::chrono::steady_clock::now();
+		lastAppDataAt_ = now;
+		// N-7: inbound application data is live traffic on the pair that carried
+		// it, yet only outbound sends used to refresh the consent window — a
+		// one-way media stream therefore let that pair expire at 30 s even though
+		// the peer was demonstrably reachable. Refresh the delivering pair (or the
+		// selected pair when the transport could not name one), and only when it
+		// has actually succeeded.
+		CandidatePair* p = onPair ? onPair : selectedPair_;
+		if (p && p->state == PairState::Succeeded)
+			p->consentExpiry = now + std::chrono::milliseconds(ConsentTimeoutMs);
 		if (config_.cb_recv) config_.cb_recv(self_, data, size, config_.user_ptr);
 	}
 	std::vector<net::AddrRecord> Agent::resolveServer(const std::string& host, std::uint16_t port,
@@ -509,13 +676,32 @@ namespace stice::ice {
 		return out;
 	}
 	void Agent::addLocalCandidate(Candidate c) {
-		if (local_.candidates.size() >= MaxCandidates) return;
+		// RFC 8445 §5.1.3: candidates that describe the same transport address
+		// are redundant and must not be added twice. Without this, two STUN
+		// servers behind the same NAT mapping produced two identical srflx
+		// candidates with the same priority, and multi-homed gathering could add
+		// the same host address more than once.
+		for (const auto& existing : local_.candidates) {
+			if (existing.type == c.type && existing.transport == c.transport &&
+				existing.component == c.component &&
+				existing.resolved.isEqual(c.resolved, true))
+				return;
+		}
+		if (local_.candidates.size() >= MaxCandidates) {
+			STICE_LOG_WARN("Agent: local candidate limit (%zu) reached, dropping %s:%s",
+				static_cast<std::size_t>(MaxCandidates), c.hostname.c_str(), c.service.c_str());
+			return;
+		}
 		local_.candidates.push_back(std::move(c));
 		// Sort only before any pair is formed: stable_sort permutes elements,
 		// which would silently change which candidate an existing pair's
 		// `local` pointer refers to. Pair priority is computed per-pair, so the
-		// list order is irrelevant once checking has started.
-		if (state_ == STICE_STATE_DISCONNECTED || state_ == STICE_STATE_GATHERING)
+		// list order is irrelevant once checking has started. `pairs_.empty()` is
+		// checked too because GATHERING can already have formed pairs (see the
+		// incremental pairing branch below), which would otherwise leave the
+		// sort running after Candidate* values were captured by a pair.
+		if ((state_ == STICE_STATE_DISCONNECTED || state_ == STICE_STATE_GATHERING) &&
+			pairs_.empty())
 			local_.sortCandidates();
 		// Late local candidate (e.g. a second TURN server's allocation succeeded
 		// while checks are already running, or local candidate gathered after the
@@ -525,6 +711,17 @@ namespace stice::ice {
 		if (state_ == STICE_STATE_CONNECTING || state_ == STICE_STATE_CONNECTED ||
 			state_ == STICE_STATE_COMPLETED) {
 			formPairs();
+		}
+		else if (state_ == STICE_STATE_GATHERING && !remote_.iceUfrag.empty() &&
+			!remote_.icePwd.empty() && !remote_.candidates.empty()) {
+			// Remote description is already available while we are still
+			// gathering (e.g. a slow/dead TURN server keeps the gathering phase
+			// open). Pair with what we have now instead of waiting for the
+			// gathering-done gate, which used to leave a pairing gap for the
+			// whole gathering window.
+			std::size_t before = pairs_.size();
+			formPairs();
+			if (pairs_.size() > before) changeState(STICE_STATE_CONNECTING);
 		}
 	}
 	// Semantic comparison of two IP literals, so a whitelist/blacklist entry
@@ -623,9 +820,27 @@ namespace stice::ice {
 			// Apply address rewrite (NAT 1:1 IP mapping).
 			auto candidates = applyAddressRewrite(c, c.hostname, "");
 			for (auto& cc : candidates) {
-				// In QueryAndGather mode, replace the hostname with the mDNS name.
-				if (mdnsMode_ == STICE_MDNS_MODE_QUERY_AND_GATHER && !mdnsHostname_.empty()) {
-					cc.hostname = mdnsHostname_;
+				// In QueryAndGather mode, advertise the candidate under an mDNS
+				// name instead of its IP. §3.1 requires a DISTINCT name per
+				// address: reusing one name for every interface would let a peer
+				// correlate all of them into a single device.
+				if (mdnsMode_ == STICE_MDNS_MODE_QUERY_AND_GATHER && mdns_) {
+					auto* msa = reinterpret_cast<const sockaddr*>(&cc.resolved.addr);
+					char ipStr[NI_MAXHOST];
+					if (getnameinfo(msa, net::addrLen(msa), ipStr, sizeof(ipStr), nullptr, 0,
+					                NI_NUMERICHOST) != 0) {
+						// Without a numeric host we cannot register a record, and
+						// emitting the candidate would advertise its real IP —
+						// exactly what QueryAndGather exists to avoid. Drop it.
+						STICE_LOG_WARN("mDNS: cannot name local address, skipping candidate to avoid leaking its IP");
+						continue;
+					}
+					std::string hn = net::MDnsClient::generateHostname();
+					if (!mdns_->addRecord(hn, ipStr)) {
+						STICE_LOG_WARN("mDNS: addRecord failed for local address, skipping candidate");
+						continue;
+					}
+					cc.hostname = hn;
 				}
 				addLocalCandidate(cc);
 				emitCandidate(cc);
@@ -635,6 +850,12 @@ namespace stice::ice {
 		// iceTcpMode_ includes PASSIVE. The candidate address is the TCPMux's
 		// listener address/port, enumerated over local interfaces (mirrors
 		// pion-ice's TCPMuxAddr).
+		//
+		// SO (experimental, "AUTO" semantics): stice only implements the
+		// symmetric-breakout *framework* (codec, priority table, pairing rules),
+		// so an SO agent gathers PASSIVE candidates and lets the peer's active
+		// side dial. Emitting `tcptype so` candidates and the dual-connect
+		// dedupe state machine are not implemented; see README's protocol table.
 		if (tcpMux_ && (iceTcpMode_ == STICE_ICE_TCP_MODE_PASSIVE ||
 			iceTcpMode_ == STICE_ICE_TCP_MODE_SO)) {
 			auto tcpAddrs = tcpMux_->localAddrs(AF_UNSPEC);
@@ -648,13 +869,28 @@ namespace stice::ice {
 				auto* sa = reinterpret_cast<const sockaddr*>(&a.addr);
 				char host[NI_MAXHOST];
 				char serv[NI_MAXSERV];
-				if (getnameinfo(sa, net::addrLen(sa), host, sizeof(host), serv, sizeof(serv),
-					NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
+				bool numeric = getnameinfo(sa, net::addrLen(sa), host, sizeof(host), serv, sizeof(serv),
+					NI_NUMERICHOST | NI_NUMERICSERV) == 0;
+				if (numeric) {
 					c.hostname = host;
 					c.service = serv;
 				}
 				else {
 					c.hostname = a.toString();
+				}
+				// QueryAndGather must advertise the listener under an mDNS name
+				// like every other host candidate, not its real address.
+				if (mdnsMode_ == STICE_MDNS_MODE_QUERY_AND_GATHER && mdns_) {
+					if (!numeric) {
+						STICE_LOG_WARN("mDNS: cannot name TCP listener address, skipping candidate");
+						continue;
+					}
+					std::string hn = net::MDnsClient::generateHostname();
+					if (!mdns_->addRecord(hn, host)) {
+						STICE_LOG_WARN("mDNS: addRecord failed for TCP listener, skipping candidate");
+						continue;
+					}
+					c.hostname = hn;
 				}
 				c.priority = c.computePriority(tcpIdx++);
 				c.foundation = Candidate::computeFoundation(c.type, c.hostname, c.transport);
@@ -768,7 +1004,9 @@ namespace stice::ice {
 			}
 		}
 		turn::TurnSink sink;
-		net::AddrRecord turnServerAddr = resolved;
+		// Shared so a 300 Try Alternate redirect (RFC 8489 §14.11) can retarget
+		// the send path before the client retries the Allocate.
+		auto turnServerAddr = std::make_shared<net::AddrRecord>(resolved);
 		auto lifetime = lifetime_;
 		// Per-entry TURN-over-TCP/TLS control transport (RFC 8656 control-over-TCP
 		// and RFC 6062). Created here so the sendRaw closure shares it; the transport
@@ -816,13 +1054,13 @@ namespace stice::ice {
 				// STUN control frames (Allocate/Refresh/CreatePermission/ChannelBind)
 				// get UDP control-frame priority; ChannelData bulk keeps FIFO behind.
 				bool isControl = stun::Message::isMessage(data, size);
-				ret = sendUdp(reinterpret_cast<const char*>(data), size, turnServerAddr,
+				ret = sendUdp(reinterpret_cast<const char*>(data), size, *turnServerAddr,
 					isControl);
 				// Propagate the platform errno (negated) so data-path callers can
 				// surface EAGAIN/ENOBUFS backpressure instead of silent drops.
 				if (ret < 0) ret = -sticeSockerrno;
 			}
-			STICE_LOG_DEBUG("TURN sendRaw: %zu bytes to %s ret=%d", size, turnServerAddr.toString().c_str(), ret);
+			STICE_LOG_DEBUG("TURN sendRaw: %zu bytes to %s ret=%d", size, turnServerAddr->toString().c_str(), ret);
 			return ret;
 			};
 		// Shared allocation start time for RTT measurement. For UDP TURN, it is
@@ -901,12 +1139,20 @@ namespace stice::ice {
 				checkGatheringComplete();
 			}
 			};
-		sink.onData = [lifetime, this](const net::AddrRecord& peer, const unsigned char* data, std::size_t size) {
+		sink.onData = [lifetime, this, turnSelf = e.turn.get()](
+			const net::AddrRecord& peer, const unsigned char* data, std::size_t size) {
 			LifetimeScope ls(lifetime);
 			if (!ls) return;
 			// Incoming data from a peer via the TURN relay. Deliver as if
-			// received directly from that peer.
+			// received directly from that peer, but remember which allocation
+			// carried it: binding responses must be sent back out the same
+			// allocation (RFC 8445 §7.2.5.2.1), otherwise the peer sees a
+			// source address different from the one it targeted and fails the
+			// pair as non-symmetric.
+			turn::Client* prevTurn = inboundTurn_;
+			inboundTurn_ = turnSelf;
 			handleInboundUdp(reinterpret_cast<const char*>(data), static_cast<int>(size), peer);
+			inboundTurn_ = prevTurn;
 			};
 		sink.onLog = [this](int level, const char* msg) {
 			STICE_LOG(static_cast<stice_log_level_t>(level), "[local=%u] %s", diagLocalPort_, msg);
@@ -942,12 +1188,23 @@ namespace stice::ice {
 			STICE_LOG_WARN("RFC 6062: CONNECT failed code=%d reason=%s peer=%s (retries=%d/%d)",
 				code, reason.c_str(), peer.toString().c_str(),
 				connectRetries_, MaxConnectRetries);
-			if (code == 447 && connectRetries_ < MaxConnectRetries) {
+			// 447 (Connection Timeout or Failure) and 446 (Connection Already
+			// Exists) are the RFC 6062 recoverable CONNECT errors: the peer may
+			// become reachable once the server's dial window / the existing
+			// connection settles.
+			if ((code == stun::StunErrorConnectionTimeoutOrFailure ||
+			     code == stun::StunErrorConnectionAlreadyExists) &&
+			    connectRetries_ < MaxConnectRetries) {
 				++connectRetries_;
 				pendingConnectPeer_ = peer;
 				pendingConnectRetry_ = true;
+				// P2-N3: a fixed 10 s CONNECT retry makes every client retry in
+				// lockstep after a server-wide dial storm. Spread it by ±20%.
+				const int retrySpan = std::max(1, ConnectRetryDelayMs / 5);
+				const int retryJitter =
+					static_cast<int>(crypto::randomU32() % (2 * retrySpan + 1)) - retrySpan;
 				nextConnectRetry_ = std::chrono::steady_clock::now() +
-					std::chrono::milliseconds(ConnectRetryDelayMs);
+					std::chrono::milliseconds(ConnectRetryDelayMs + retryJitter);
 				wakePoll();
 				return;
 			}
@@ -956,6 +1213,7 @@ namespace stice::ice {
 				if (p->remote && p->remote->type == CandidateType::Relayed &&
 					p->remote->resolved == peer) {
 					p->state = PairState::Failed;
+					resetNomination(*p);
 				}
 			}
 			// Remove STUN check entries for the failed pairs.
@@ -970,6 +1228,30 @@ namespace stice::ice {
 			wakePoll();
 			updateState();
 			};
+		// Stable index into entries_ (std::deque, reserved in init): the redirect
+		// callback may fire long after this function returns.
+		auto entryIndex = std::make_shared<std::size_t>(entries_.size());
+		sink.onAlternateServer = [lifetime, this, turnServerAddr, useTcp, entryIndex](
+			const net::AddrRecord& alt) {
+			LifetimeScope ls(lifetime);
+			if (!ls) return;
+			if (useTcp) {
+				// The TCP/TLS control connection is pinned to the original
+				// server; following a redirect would require opening a new
+				// connection, which this client does not do.
+				STICE_LOG_WARN("TURN 300 Try Alternate over TCP/TLS unsupported, "
+					"staying with %s", alt.toString().c_str());
+				return;
+			}
+			std::lock_guard<std::recursive_mutex> lock(mutex_);
+			*turnServerAddr = alt;
+			if (*entryIndex < entries_.size()) {
+				auto& re = entries_[*entryIndex];
+				if (re.type == StunEntryType::Relay) re.record = alt;
+			}
+			STICE_LOG_INFO("TURN: retargeting allocation to alternate server %s",
+				alt.toString().c_str());
+		};
 		e.turn->init(tc, std::move(sink));
 		e.tcpTurn = useTcp;
 		e.relayCounted = relayCounted;
@@ -1019,9 +1301,141 @@ namespace stice::ice {
 		}
 		wakePoll();
 	}
+	// Pairs hold raw pointers into remote_.candidates, so every path that swaps
+	// the remote description to a new generation MUST drop the checklist BEFORE
+	// the swap — otherwise nomination/selection keep pointing into freed deque
+	// storage. Used by Agent::restart and by setRemoteDescription when a peer's
+	// fresh generation completes our own restart handshake.
+	void Agent::resetChecklist() {
+		cancelAllEntries();
+		// Check entries point into pairs_, which is cleared below; Relay entries
+		// hold deallocated TURN clients and can never fire again. Their async
+		// callbacks capture the lifetime barrier and serverIndex, not the entry
+		// address, so clearing the table is safe here.
+		entries_.clear();
+		pairs_.clear();
+		orderedPairs_.clear();
+		selectedPair_ = nullptr;
+		nominatedPair_ = nullptr;
+		nominationValue_ = 0;
+		nominationTimestamp_ = {};
+		pacTimestamp_ = {};
+		pacDeadline_ = {};
+		checkingStartTime_ = {};
+		deferredCandidates_.clear();
+		// N-2: the mDNS de-duplication keys are per-generation. Keeping them
+		// across a restart meant a `.local` candidate re-signalled in the new
+		// generation (same hostname|port|transport|component key) was suppressed
+		// as a "duplicate" while the old query was still unanswered, so the pair
+		// was never formed. The in-flight counter is deliberately NOT zeroed:
+		// those callbacks still decrement it, and forcing it to 0 first would
+		// underflow it below zero.
+		mdnsQueryKeys_.clear();
+	}
+	// N-11: remember the remote credentials currently in `remote_` as superseded,
+	// so a later delivery of that generation can be recognised as stale.
+	void Agent::noteRemoteGeneration(const Description& d) {
+		if (d.iceUfrag.empty() || d.icePwd.empty()) return;
+		// Same credentials as the generation already recorded: nothing changed
+		// (e.g. a peer that accepts our restart without restarting itself).
+		if (remoteGenUfrag_ == d.iceUfrag && remoteGenPwd_ == d.icePwd) return;
+		if (!remoteGenUfrag_.empty() || !remoteGenPwd_.empty()) {
+			retiredRemoteCreds_.emplace_back(remoteGenUfrag_, remoteGenPwd_);
+			// Bounded: only recently superseded generations can still be in flight
+			// in the signalling channel; an unbounded list would grow per restart.
+			if (retiredRemoteCreds_.size() > 8) retiredRemoteCreds_.erase(retiredRemoteCreds_.begin());
+		}
+		remoteGenUfrag_ = d.iceUfrag;
+		remoteGenPwd_ = d.icePwd;
+	}
+	bool Agent::isRetiredRemoteGeneration(const Description& d) const {
+		if (d.iceUfrag.empty() || d.icePwd.empty()) return false;
+		// The generation last applied is still current — accept it. This is the
+		// "peer accepted our restart but did not restart itself" case.
+		if (d.iceUfrag == remoteGenUfrag_ && d.icePwd == remoteGenPwd_) return false;
+		for (const auto& g : retiredRemoteCreds_)
+			if (g.first == d.iceUfrag && g.second == d.icePwd) return true;
+		return false;
+	}
+	int Agent::restart() {
+		std::lock_guard<std::recursive_mutex> lock(mutex_);
+		STICE_LOG_INFO("Agent: ICE restart (previous state=%d)", static_cast<int>(state_));
+		// RFC 8445 §9.1.1: an ICE restart starts a new generation — new
+		// ufrag/pwd, fresh candidate gathering, and a clean checklist. The old
+		// generation's checks, pairs and selected/nominated pointers must not
+		// survive, otherwise a stale pair could be nominated in the new
+		// generation (the ufrag no longer matches the peer's credentials either).
+		cancelAllEntries();
+		for (auto& c : tcpConns_)
+			if (c.transport) c.transport->close();
+		tcpConns_.clear();
+		turnDataConn_.reset();
+		resetChecklist();
+		nextTick_ = {};
+		relayOnlyMode_ = false;
+		local_.candidates.clear();
+		local_.finished = false;
+		remote_.candidates.clear();
+		remote_.finished = false;
+		mdnsQueryKeys_.clear();
+		pendingMdnsResolutions_.store(0);
+		pendingServerReflexive_ = 0;
+		// #7: an allocation still in flight belongs to the dead generation —
+		// its turn::Client is destroyed with entries_ (silencing the late
+		// decrement), so zero the counter here or the new generation's gathering
+		// would wait out the soft timeout before completing.
+		pendingRelayAllocations_ = 0;
+		disconnectedAt_ = {};
+		// Our own restart is pending until the peer's fresh generation arrives;
+		// setRemoteDescription relies on this to not restart again on it.
+		restartingLocally_ = true;
+		pendingTurnDataRetry_ = false;
+		gatheringDone_ = false;
+		gatherStartedAt_ = {};
+		remoteGatheringDone_ = false;
+		// The muxes demux inbound traffic by ufrag: drop the old generation's
+		// registration so gatherCandidates() re-registers under the new ufrag.
+		// Without this, a passive TCP dial (or UDPMux-routed packet) addressed
+		// to the new ufrag finds no agent entry and is rejected — after an ICE
+		// restart the endpoint would be permanently deaf to new inbound.
+		if (mux_ || tcpMux_) {
+			const std::string oldUfrag = local_.iceUfrag;
+			if (mux_) {
+				mux_->removeAgent(oldUfrag);
+				muxRegistered_ = false;
+			}
+			if (tcpMux_) {
+				tcpMux_->removeAgent(oldUfrag);
+				tcpMuxRegistered_ = false;
+			}
+		}
+		// In-flight RFC 6062 data-connection rebinds belong to the old
+		// generation's turnDataConn_, which was reset above.
+		pendingTurnDataRebind_ = false;
+		turnDataRebindAttempts_ = 0;
+		// New generation = new credentials on BOTH sides: stale remote ufrag/pwd
+		// would let checks from the old generation authenticate against the old
+		// key and let formPairs build pairs against credentials the peer has
+		// already retired. The peer re-signals its fresh description (pion
+		// agent.go:1929 requires explicit credentials for the same reason).
+		remote_.iceUfrag.clear();
+		remote_.icePwd.clear();
+		local_.iceUfrag = generateUfrag();
+		local_.icePwd = generatePwd();
+		// gatherCandidates() only accepts DISCONNECTED/FAILED as a starting
+		// state; present the new generation as freshly initialised.
+		state_ = STICE_STATE_DISCONNECTED;
+		return gatherCandidates();
+	}
 	int Agent::gatherCandidates() {
 		std::lock_guard<std::recursive_mutex> lock(mutex_);
 		if (state_ != STICE_STATE_DISCONNECTED && state_ != STICE_STATE_FAILED) return STICE_ERR_FAILED;
+		// draft-ietf-ice-trickle §3: re-sync the advertised ice-option on every
+		// gather, including the gather a restart() triggers. init() set it once
+		// from the construction-time config, so a later change of the trickle
+		// mode would otherwise keep describing the old generation's local
+		// description as (non-)trickling.
+		local_.trickleEnabled = pairingCfg_.enable_trickle;
 		changeState(STICE_STATE_GATHERING);
 		if (gatherStartedAt_.time_since_epoch().count() == 0)
 			STICE_LOG_DEBUG("GATHER-START: gatherCandidates executing, setting gatherStartedAt_ (agent=%p)", (void*)this);
@@ -1327,7 +1741,52 @@ namespace stice::ice {
 		std::lock_guard<std::recursive_mutex> lock(mutex_);
 		Description d;
 		if (!d.parse(sdp)) return STICE_ERR_INVALID;
+		// N-11: monotonic generation guard. Signalling can deliver a peer's
+		// description out of order (or a peer may re-send a pre-restart copy):
+		// applying an older generation after a newer one has been accepted
+		// would look like another credential change and trigger a second
+		// restart, tearing down a checklist that is already converging. Drop
+		// anything that belongs to a superseded generation.
+		if (isRetiredRemoteGeneration(d)) {
+			STICE_LOG_WARN("setRemoteDescription: ignoring description from a retired ICE generation (ufrag=%s)",
+				d.iceUfrag.c_str());
+			return STICE_ERR_SUCCESS;
+		}
+		// RFC 8445 §9: a changed peer ufrag/pwd mid-session signals an ICE
+		// restart initiated by the peer — this side MUST restart too, or the
+		// surviving generation limps on with a half-dead checklist (its pairs
+		// reference credentials and sockets the peer has already retired).
+		// When the change completes OUR OWN pending restart
+		// (restartingLocally_), rebuilding the checklist suffices: the local
+		// credentials are already fresh, and pairs formed against the peer's
+		// retired pre-restart description must go. Both paths reset the
+		// checklist BEFORE remote_ is replaced (pairs point into it).
+		const bool hadRemoteCreds = !remote_.iceUfrag.empty() || !remote_.icePwd.empty();
+		const bool peerCredsChanged =
+			hadRemoteCreds && (remote_.iceUfrag != d.iceUfrag || remote_.icePwd != d.icePwd);
+		bool checklistRebuilt = false;
+		if (peerCredsChanged) {
+			if (restartingLocally_) {
+				STICE_LOG_INFO("setRemoteDescription: peer's new generation accepted — rebuilding checklist");
+				resetChecklist();
+			} else {
+				STICE_LOG_INFO("setRemoteDescription: peer ufrag/pwd changed (RFC 8445 §9) — restarting local side");
+				restart();
+			}
+			checklistRebuilt = true;
+		}
+		// N-11: record the generation being replaced (or first applied) before the
+		// move consumes `d`.
+		noteRemoteGeneration(d);
 		remote_ = std::move(d);
+		// RFC 8839 §5.1: `a=end-of-candidates` in the remote description means
+		// the peer will not trickle anything further. Consume it instead of
+		// letting it sit as a dead parse flag: it gates the "no pair can ever
+		// form" fast failure below and tells the checker not to wait for more.
+		if (remote_.finished) {
+			remoteGatheringDone_ = true;
+			STICE_LOG_DEBUG("setRemoteDescription: a=end-of-candidates present (remote gathering done)");
+		}
 		// candidates is std::deque: pointers into remote_.candidates stay valid
 		// across later addRemoteCandidate (trickle) push_back calls — no reserve
 		// needed. (Move-assigning a deque also moves its storage, but pairs are
@@ -1336,13 +1795,24 @@ namespace stice::ice {
 			// We are the controlled agent if we set the remote description first.
 			mode_ = AgentMode::Controlled;
 		}
+		// mDNS: `.local` remote candidates cannot be resolved by getaddrinfo in
+		// the common no-nss-mdns setup (they used to be silently dropped there).
+		// Hand every one of them to the mDNS resolver; the resolved copy is
+		// appended asynchronously (remote_.candidates is a deque, so existing
+		// pointers stay valid) and paired from the callback.
+		for (const auto& rc : remote_.candidates) resolveRemoteMDnsCandidate(rc);
 		// Process remote passive TCP candidates: create local active TCP
 		// candidates and initiate connections. This was previously only done
 		// in addRemoteCandidate (trickle path), leaving non-trickle ICE-TCP
 		// without any TCP connection attempt.
 		// Aligned with pion-ice: skip when DisableActiveTCP is set.
 		for (const auto& rc : remote_.candidates) {
-			if (rc.transport == CandidateTransport::TCPPassive &&
+			// `.local` candidates have no address until the mDNS resolver
+			// finishes; dialing one now would reset the existing TCP transport
+			// and then fail the DNS fallback. The resolver callback runs the
+			// passive-TCP dial once the address is known.
+			if (!rc.fromMdns &&
+				rc.transport == CandidateTransport::TCPPassive &&
 				iceTcpMode_ != STICE_ICE_TCP_MODE_NONE &&
 				!config_.disable_active_tcp) {
 				addRemotePassiveTcpCandidate(rc);
@@ -1361,30 +1831,55 @@ namespace stice::ice {
 			if (gatheringDone_ || pairs_.size() > pairsBefore) {
 				changeState(STICE_STATE_CONNECTING);
 			}
+		} else if (checklistRebuilt) {
+			// Restart-generation accepted while not gathering (gather already
+			// completed): re-form pairs against the fresh description; the
+			// bookkeeping tick arms the new connectivity checks (same mechanism
+			// the trickle path uses). The state machine takes it from there —
+			// including the DISCONNECTED grace revival when the pre-restart
+			// generation had already been reported lost.
+			formPairs();
 		}
 		return STICE_ERR_SUCCESS;
 	}
 	int Agent::addRemoteCandidate(const char* sdp) {
 		std::lock_guard<std::recursive_mutex> lock(mutex_);
+		// draft-ietf-ice-trickle §2.2: candidates that arrive after the remote
+		// end-of-candidates indication MUST be ignored. Accepting them would
+		// form pairs against a candidate set the peer has already declared
+		// final.
+		if (remote_.finished) {
+			STICE_LOG_DEBUG("addRemoteCandidate: remote EOC already received, ignoring late candidate");
+			return STICE_ERR_SUCCESS;
+		}
 		if (!remote_.addCandidateFromSdp(sdp)) return STICE_ERR_INVALID;
 		// Get the just-added remote candidate (last one in the list).
 		if (!remote_.candidates.empty()) {
 			const auto& rc = remote_.candidates.back();
-			// pion-ice: remote TCP active candidates are ignored because the
-			// remote active side will probe our passive listener. We only
-			// process passive (and SO) remote TCP candidates.
-			if (rc.transport == CandidateTransport::TCPActive) {
+			if (rc.fromMdns) {
+				// Async mDNS resolution replaces the getaddrinfo path; pairing
+				// (and the passive-TCP dial) happens from the resolver callback.
+				resolveRemoteMDnsCandidate(rc);
+			} else if (rc.transport == CandidateTransport::TCPActive) {
+				// pion-ice: remote TCP active candidates are ignored because the
+				// remote active side will probe our passive listener. Only remote
+				// passive TCP candidates are dialed here; remote `tcptype so`
+				// candidates are not yet supported (SO is experimental and our own
+				// gatherer never emits them).
 				STICE_LOG_DEBUG("addRemoteCandidate: ignoring remote TCP active candidate");
 				// Remove it from the list since we won't use it.
 				remote_.candidates.pop_back();
 				return STICE_ERR_SUCCESS;
-			}
-			// If remote is TCP passive and we have active TCP enabled, create
-			// a local active TCP candidate by dialing the remote address.
-			// Aligned with pion-ice: skip when DisableActiveTCP is set.
-			if (rc.transport == CandidateTransport::TCPPassive &&
+			} else if (rc.transport == CandidateTransport::TCPSimultaneousOpen) {
+				STICE_LOG_DEBUG("addRemoteCandidate: remote tcptype so not supported yet, ignoring");
+				remote_.candidates.pop_back();
+				return STICE_ERR_SUCCESS;
+			} else if (rc.transport == CandidateTransport::TCPPassive &&
 				iceTcpMode_ != STICE_ICE_TCP_MODE_NONE &&
 				!config_.disable_active_tcp) {
+				// If remote is TCP passive and we have active TCP enabled, create
+				// a local active TCP candidate by dialing the remote address.
+				// Aligned with pion-ice: skip when DisableActiveTCP is set.
 				addRemotePassiveTcpCandidate(rc);
 			}
 		}
@@ -1639,10 +2134,6 @@ namespace stice::ice {
 			return STICE_ERR_FAILED;
 		}
 		mdnsMode_ = mode;
-		// Use the config's hostname if provided, otherwise generate one in initMDns.
-		if (config_.multicast_dns_hostname) {
-			mdnsHostname_ = config_.multicast_dns_hostname;
-		}
 		return STICE_ERR_SUCCESS;
 	}
 	void Agent::initMDns() {
@@ -1653,10 +2144,11 @@ namespace stice::ice {
 			mdnsMode_ = config_.multicast_dns_mode;
 		}
 		if (mdnsMode_ == STICE_MDNS_MODE_DISABLED) return;
-		// Generate hostname if not set.
-		if (mdnsHostname_.empty()) {
-			mdnsHostname_ = net::MDnsClient::generateHostname();
-		}
+		// Client identity label only: each gathered address is registered under
+		// its own generated name (draft §3.1) and only those reach SDP.
+		std::string hostname = config_.multicast_dns_hostname
+			? config_.multicast_dns_hostname
+			: net::MDnsClient::generateHostname();
 		// Determine the local address to advertise (for QueryAndGather mode).
 		std::string localAddr;
 		if (mdnsMode_ == STICE_MDNS_MODE_QUERY_AND_GATHER) {
@@ -1678,9 +2170,17 @@ namespace stice::ice {
 		default: return;
 		}
 		mdns_ = std::make_unique<net::MDnsClient>();
-		if (!mdns_->init(mode, mdnsHostname_, localAddr)) {
+		if (!mdns_->init(mode, hostname, localAddr)) {
 			STICE_LOG_WARN("Agent: mDNS init failed, continuing without mDNS");
 			mdns_.reset();
+		}
+		else if (mdns_->degraded()) {
+			// Port 5353 was taken, so the client dropped to QueryOnly and local
+			// candidates are NOT advertised under an mDNS name. Surface it: a
+			// silently degraded QueryAndGather session looks healthy while the
+			// privacy promise (and .local pairing) is no longer delivered.
+			STICE_LOG_WARN("Agent: mDNS degraded to QueryOnly (port %d unavailable); "
+			               "local candidates will not be advertised via mDNS", 5353);
 		}
 	}
 	std::vector<Candidate> Agent::applyAddressRewrite(const Candidate& c,
@@ -1714,6 +2214,17 @@ namespace stice::ice {
 	bool Agent::resolveRemoteMDnsCandidate(const Candidate& c) {
 		if (!mdns_ || mdnsMode_ == STICE_MDNS_MODE_DISABLED) return false;
 		if (!net::MDnsClient::isMDnsName(c.hostname)) return false;
+		// One query per distinct candidate identity. A duplicate arrival (batch
+		// description + trickle, or a repeated trickle line) must not start a
+		// second query: it would append a second resolved copy of the same
+		// address and form duplicate pairs.
+		const std::string key = c.hostname + "|" + c.service + "|" +
+			std::to_string(static_cast<int>(c.transport)) + "|" +
+			std::to_string(c.component);
+		if (!mdnsQueryKeys_.insert(key).second) {
+			STICE_LOG_DEBUG("mDNS: %s already queried, ignoring duplicate candidate", c.hostname.c_str());
+			return false;
+		}
 		// Copy the candidate so we can fill in the resolved address later.
 		auto hostname = c.hostname;
 		// Capture the needed fields by value since the callback runs async.
@@ -1723,12 +2234,19 @@ namespace stice::ice {
 		auto component = c.component;
 		auto priority = c.priority;
 		auto foundation = c.foundation;
-		mdns_->query(hostname, [this, lifetime = lifetime_, hostname, port, type, transport, component,
-			priority, foundation](const std::string& address) {
+		++pendingMdnsResolutions_;
+		bool started = mdns_->query(hostname, [this, lifetime = lifetime_, hostname, port, type, transport, component,
+			priority, foundation, key](const std::string& address) {
+				// Balance the counter before the teardown guard: a query that is
+				// still in flight when the Agent is destroyed must not leave the
+				// count elevated (the poll thread may already be gone).
+				pendingMdnsResolutions_.fetch_sub(1);
 				LifetimeScope ls(lifetime);
 				if (!ls) return;
 				std::lock_guard<std::recursive_mutex> lock(mutex_);
 				if (address.empty()) {
+					// Allow a later duplicate to retry the resolution.
+					mdnsQueryKeys_.erase(key);
 					STICE_LOG_DEBUG("mDNS: resolution failed for %s", hostname.c_str());
 					return;
 				}
@@ -1741,18 +2259,30 @@ namespace stice::ice {
 				resolved.foundation = foundation;
 				resolved.hostname = address;
 				resolved.service = port;
+				resolved.fromMdns = true;
 				std::uint16_t portNum = static_cast<std::uint16_t>(std::atoi(port.c_str()));
 				if (net::parseAddr(address, portNum, resolved.resolved.addr, resolved.resolved.len)) {
 					resolved.resolved.socktype = (transport == CandidateTransport::UDP) ? SOCK_DGRAM : SOCK_STREAM;
 				}
 				remote_.candidates.push_back(std::move(resolved));
+				const auto& added = remote_.candidates.back();
+				// A resolved mDNS passive TCP candidate still needs the same
+				// active-dial treatment as one that arrived with a numeric IP.
+				if (added.transport == CandidateTransport::TCPPassive &&
+					iceTcpMode_ != STICE_ICE_TCP_MODE_NONE && !config_.disable_active_tcp) {
+					addRemotePassiveTcpCandidate(added);
+				}
 				if (state_ == STICE_STATE_CONNECTING || state_ == STICE_STATE_CONNECTED ||
 					state_ == STICE_STATE_COMPLETED) {
 					formPairs();
 				}
 				STICE_LOG_DEBUG("mDNS: resolved %s to %s", hostname.c_str(), address.c_str());
 			});
-		return true;
+		if (!started) {
+			--pendingMdnsResolutions_;
+			mdnsQueryKeys_.erase(key);
+		}
+		return started;
 	}
 	void Agent::wakePoll() {
 		// Wake the poll thread so it re-evaluates timers immediately. Called
@@ -1796,6 +2326,16 @@ namespace stice::ice {
 						remote.hostname.c_str());
 					continue;
 				}
+				// draft-ietf-rtcweb-mdns-ice-candidates §3.3.2 (MUST NOT): a
+				// relayed local candidate must never be paired with an mDNS
+				// remote candidate. The TURN server cannot resolve `.local`
+				// names, and the address a resolver returns here is private to
+				// the peer's link, so relaying to it can only blackhole.
+				if (local.type == CandidateType::Relayed && remote.fromMdns) {
+					STICE_LOG_DEBUG("formPairs: skipping relay x mDNS pair (local relay, remote %s)",
+						remote.hostname.c_str());
+					continue;
+				}
 				// RFC 6544 §5.2: TCP candidate pair filtering.
 				// - active-active: illegal (neither side connects)
 				// - passive-passive: illegal (neither side connects)
@@ -1810,6 +2350,13 @@ namespace stice::ice {
 					bool remoteActive = (remote.transport == CandidateTransport::TCPActive);
 					bool localPassive = (local.transport == CandidateTransport::TCPPassive);
 					bool remotePassive = (remote.transport == CandidateTransport::TCPPassive);
+					bool localSo = (local.transport == CandidateTransport::TCPSimultaneousOpen);
+					bool remoteSo = (remote.transport == CandidateTransport::TCPSimultaneousOpen);
+					// RFC 6544 §6.2 pair table: active pairs only with passive
+					// (and vice versa); simultaneous-open pairs only with another
+					// simultaneous-open candidate. Mixed SO/active or SO/passive
+					// combinations are outside the table and must not be formed.
+					if (localSo != remoteSo) continue;
 					if (localActive && remoteActive) continue; // active-active illegal
 					// RFC 6062: two TCP-relayed (passive) candidates CAN pair — the
 					// controlling side sends CONNECT, the controlled side receives
@@ -1823,7 +2370,12 @@ namespace stice::ice {
 					if (p->local == &local && p->remote == &remote) { exists = true; break; }
 				}
 				if (exists) continue;
-				if (pairs_.size() >= MaxCandidatePairs) break;
+				if (pairs_.size() >= MaxCandidatePairs) pruneFailedPairs();
+				if (pairs_.size() >= MaxCandidatePairs) {
+					STICE_LOG_WARN("Agent: candidate pair limit (%zu) reached, truncating pair list",
+						static_cast<std::size_t>(MaxCandidatePairs));
+					break;
+				}
 				auto p = std::make_unique<CandidatePair>();
 				p->local = &local;
 				p->remote = &remote;
@@ -1901,10 +2453,92 @@ namespace stice::ice {
 		std::stable_sort(orderedPairs_.begin(), orderedPairs_.end(),
 			[](const CandidatePair* a, const CandidatePair* b) { return a->priority > b->priority; });
 	}
+	void Agent::updateAllPairPriorities() {
+		// RFC 8445 §7.3.1.1: after a role switch the G/D assignment changes, so
+		// every existing pair's priority MUST be recomputed and the checklist
+		// re-ordered. updatePriority() was previously only called when a pair was
+		// created, leaving stale priorities (and thus a stale checklist order)
+		// after any 487-driven role flip.
+		for (auto& p : pairs_) p->updatePriority(mode_ == AgentMode::Controlling);
+		updateOrderedPairs();
+	}
+	void Agent::applyRoleSwitch() {
+		// RFC 8445 §7.2.5.1: the tiebreaker MUST be regenerated when the role
+		// switches, so a second 487 is broken by a fresh random value instead of
+		// repeating the same comparison forever. Enabled by default; set
+		// STICE_ICE_ROLE_TB_REGEN=0 to preserve the old tiebreaker (interop
+		// debugging only).
+		static const bool regenTiebreaker = []() {
+			const char* v = std::getenv("STICE_ICE_ROLE_TB_REGEN");
+			return !(v && v[0] == '0');
+		}();
+		if (regenTiebreaker) tiebreaker_ = crypto::randomU64();
+		updateAllPairPriorities();
+	}
 	StunEntry* Agent::findEntry(CandidatePair* pair) {
 		for (auto& e : entries_)
 			if (e.pair == pair) return &e;
 		return nullptr;
+	}
+	bool Agent::reclaimDeadEntries() {
+		// RFC 8445 §8.1.2: after nomination the remaining checks are cancelled;
+		// those entries can never fire again. Without reclamation the table only
+		// grows and a long-lived session eventually hits MaxStunEntries, at which
+		// point a newly learned valid pair gets no entry and therefore no
+		// consent keepalive. Reclaim only entries that are terminal AND belong to
+		// a failed pair that is not selected/nominated, so no live path is lost.
+		for (auto it = entries_.begin(); it != entries_.end();) {
+			const bool dead = it->type == StunEntryType::Check &&
+				(it->state == StunEntryState::Cancelled || it->state == StunEntryState::Failed) &&
+				it->pair && it->pair != selectedPair_ && it->pair != nominatedPair_ &&
+				it->pair->state == PairState::Failed;
+			// N-5: Relay entries were never reclaimed, so a long session only grew
+			// the table until MaxStunEntries and a newly learned valid pair got no
+			// entry (and therefore no consent keepalive). A terminal allocation
+			// (Failed / Deallocated) can never fire again — unless a transaction
+			// is still awaiting its response, which vetoes the reclaim so a late
+			// reply still finds its handler.
+			const bool deadRelay = it->type == StunEntryType::Relay && it->turn &&
+				(it->turn->state() == turn::AllocState::Failed ||
+				 it->turn->state() == turn::AllocState::Deallocated) &&
+				!it->turn->hasPendingTransaction();
+			if (dead || deadRelay) it = entries_.erase(it);
+			else ++it;
+		}
+		return entries_.size() < MaxStunEntries;
+	}
+	bool Agent::pruneFailedPairs() {
+		// RFC 8445 §6.1.2.4: the check list can be pruned of pairs that can never
+		// succeed. Remove their terminal entries first, then drop the pairs that
+		// nothing references any more, so a full table cannot permanently reject
+		// a newly learned pair.
+		for (auto it = entries_.begin(); it != entries_.end();) {
+			const bool dead = it->type == StunEntryType::Check && it->pair &&
+				it->pair != selectedPair_ && it->pair != nominatedPair_ &&
+				it->pair->state == PairState::Failed &&
+				(it->state == StunEntryState::Cancelled || it->state == StunEntryState::Failed);
+			if (dead) it = entries_.erase(it);
+			else ++it;
+		}
+		auto referenced = [&](const CandidatePair* p) {
+			for (const auto& e : entries_)
+				if (e.pair == p) return true;
+			for (const auto& c : tcpConns_)
+				if (c.pair == p) return true;
+			return false;
+		};
+		const std::size_t before = pairs_.size();
+		pairs_.erase(std::remove_if(pairs_.begin(), pairs_.end(),
+			[&](const std::unique_ptr<CandidatePair>& p) {
+				if (p->state != PairState::Failed) return false;
+				if (p.get() == selectedPair_ || p.get() == nominatedPair_) return false;
+				return !referenced(p.get());
+			}), pairs_.end());
+		if (pairs_.size() == before) return false;
+		updateOrderedPairs();
+		STICE_LOG_DEBUG("Agent: pruned %zu failed candidate pair(s), %zu remain",
+			before - pairs_.size(), pairs_.size());
+		return true;
 	}
 	void Agent::armTransmission(StunEntry& e, int delayMs) {
 		e.nextTransmission = std::chrono::steady_clock::now() + std::chrono::milliseconds(delayMs);
@@ -1973,6 +2607,10 @@ namespace stice::ice {
 			int span = std::max(1, base / 5); // 20 %
 			int jitter = static_cast<int>(crypto::randomU32() % (2 * span + 1)) - span;
 			period = std::max(MinConsentCheckPeriodMs, base + jitter);
+			// RFC 7675 §5.1 upper bound applies to the UDP consent freshness the
+			// RFC governs; a TCP-relay keepalive configured above 6 s (e.g. the
+			// STRICT profile's 10 s) is a deliberate product deviation and stays.
+			if (!is_relay) period = std::min(MaxConsentCheckPeriodMs, period);
 		}
 		e.nextTransmission = now + std::chrono::milliseconds(period);
 	}
@@ -1995,10 +2633,14 @@ namespace stice::ice {
 			std::string username = remote_.iceUfrag + ":" + local_.iceUfrag;
 			stun::addString(m, stun::AttrType::Username, username);
 			// PRIORITY (peer-reflexive type preference, for learning prflx).
+			// RFC 6544 §5.1: a check over TCP must advertise the priority of the
+			// TCP peer-reflexive candidate it would create, so the transport type
+			// (and its TCP preference penalty) comes from the local candidate
+			// rather than being hardcoded to UDP.
 			if (e.pair && e.pair->local) {
 				int fam = e.pair->local->resolved.addr.ss_family;
 				std::uint32_t pri = Candidate::computePriority(CandidateType::PeerReflexive,
-					fam, 1, 0, CandidateTransport::UDP);
+					fam, e.pair->local->component, 0, e.pair->local->transport);
 				stun::addPriority(m, pri);
 			}
 			// ICE-CONTROLLING / ICE-CONTROLLED.
@@ -2018,11 +2660,15 @@ namespace stice::ice {
 					stun::addNomination(m, nominationValue_);
 				}
 			}
-			// RFC 6544 §8.1: include TCP-TYPE on connectivity checks over TCP so
-			// the peer can verify the pair's TCP direction matches. Maps the
-			// local candidate transport to the wire enum value.
-			if (e.pair && e.pair->local &&
-				e.pair->local->transport != CandidateTransport::UDP) {
+			// TCP-TYPE is carried at 0xC004 (comprehension-optional; 0x0026 is
+			// IANA PADDING per RFC 5780), so a peer that does not know it ignores
+			// the attribute instead of rejecting the check with 420. Still send it
+			// only when BOTH sides of the pair are TCP — cross-transport pairs are
+			// never formed, so the attribute would be dead weight. Maps the local
+			// candidate transport to the wire enum value.
+			if (e.pair && e.pair->local && e.pair->remote &&
+				e.pair->local->transport != CandidateTransport::UDP &&
+				e.pair->remote->transport != CandidateTransport::UDP) {
 				std::uint32_t tcpTypeVal = stun::TcpTypeActive;
 				switch (e.pair->local->transport) {
 				case CandidateTransport::TCPActive: tcpTypeVal = stun::TcpTypeActive; break;
@@ -2068,7 +2714,7 @@ namespace stice::ice {
 		// fall through to UDP — the check is deferred until the connection
 		// completes (handled in onTcpEvents).
 		if (pairIsTcp(e.pair)) {
-			if ((tcpTransport_ && tcpTransport_->state() == net::TcpState::Connected) ||
+			if (hasConnectedTcpForPair(e.pair) ||
 				(tcpMux_ && e.pair && e.pair->local &&
 					e.pair->local->transport == CandidateTransport::TCPPassive)) {
 				sendTcp(reinterpret_cast<const char*>(m.raw.data()), m.raw.size(), e.pair,
@@ -2123,7 +2769,10 @@ namespace stice::ice {
 						STICE_LOG_DEBUG("BINDING-OUT BLOCKED: self-loop local=%u to=%s tid=%02x%02x%02x%02x",
 							diagLocalPort_, e.record.toString().c_str(),
 							m.transactionID[0], m.transactionID[1], m.transactionID[2], m.transactionID[3]);
-						if (e.pair) e.pair->state = PairState::Failed;
+						if (e.pair) {
+							e.pair->state = PairState::Failed;
+							resetNomination(*e.pair);
+						}
 						return;
 					}
 					STICE_LOG_DEBUG("BINDING-OUT local=%u to=%s via_relay=1 raw_len=%zu tid=%02x%02x%02x%02x SELF_LOOP=%d",
@@ -2147,7 +2796,8 @@ namespace stice::ice {
 		// Consent freshness: Binding request (the response refreshes consent_expiry).
 		sendStunBinding(e, stun::Class::Request, 0);
 	}
-	void Agent::sendBindingResponse(const stun::Message& req, const net::AddrRecord& dst, int errorCode) {
+	void Agent::sendBindingResponse(const stun::Message& req, const net::AddrRecord& dst, int errorCode,
+			const std::vector<std::uint16_t>* unknown) {
 		// Find or create a transient entry for the response. We don't track it
 		// as a real STUN entry; we just send the response and discard.
 		stun::Message m;
@@ -2160,6 +2810,9 @@ namespace stice::ice {
 		}
 		else {
 			stun::addErrorCode(m, errorCode);
+			// RFC 8489 §14.9: 420 responses list the offending attribute types.
+			if (errorCode == stun::StunErrorUnknownAttribute && unknown && !unknown->empty())
+				stun::addUnknownAttributes(m, *unknown);
 		}
 		m.encode(local_.icePwd.c_str(), nullptr, "stice");
 		// RFC 6062: if the request arrived via the TURN TCP data connection,
@@ -2171,7 +2824,8 @@ namespace stice::ice {
 			return;
 		}
 		// If the request came over TCP, send the response over the same TCP
-		// transport. Check TCPMux first (passive side), then tcpTransport_ (active).
+		// transport. Check TCPMux first (passive side), then the per-pair
+		// connections (active side).
 		// Binding responses are signalling: use the control queue so a bulk-data
 		// backlog on the shared connection cannot delay them.
 		if (tcpMux_) {
@@ -2179,10 +2833,24 @@ namespace stice::ice {
 				m.raw.size(), dst, /*control=*/true);
 			if (ret > 0) return;
 		}
-		if (tcpTransport_ && tcpTransport_->state() == net::TcpState::Connected &&
-			dst.isEqual(tcpPeerAddr_, true)) {
-			sendTcp(reinterpret_cast<const char*>(m.raw.data()), m.raw.size(), nullptr,
-				/*control=*/true);
+		// If the request came over one of the direct ICE-TCP connections, answer
+		// on that same connection (each pair owns its own socket now).
+		for (auto& c : tcpConns_) {
+			if (c.transport && c.transport->state() == net::TcpState::Connected &&
+				dst.isEqual(c.peerAddr, true)) {
+				sendTcp(reinterpret_cast<const char*>(m.raw.data()), m.raw.size(), c.pair,
+					/*control=*/true);
+				return;
+			}
+		}
+		// RFC 8445 §7.2.5.2.1 (Symmetric Transport Addresses): the response must
+		// originate from the address the request was sent to. When the request
+		// arrived through a TURN relay, answer through that same allocation even
+		// if the peer's address is a direct host candidate we could reach
+		// ourselves. Sending it directly would expose our host address instead
+		// of the relayed address, and the peer would (correctly) fail the pair.
+		if (inboundTurn_ && inboundTurn_->state() == turn::AllocState::Allocated) {
+			inboundTurn_->sendData(dst, m.raw.data(), m.raw.size());
 			return;
 		}
 		// If the destination is a remote relayed candidate, route the response
@@ -2256,7 +2924,11 @@ namespace stice::ice {
 		}
 		if (!remote) {
 			// Create a peer-reflexive remote candidate.
-			if (remote_.candidates.size() >= MaxCandidates) return nullptr;
+			if (remote_.candidates.size() >= MaxCandidates) {
+				STICE_LOG_WARN("Agent: remote candidate limit (%zu) reached, dropping prflx %s",
+					static_cast<std::size_t>(MaxCandidates), src.toString().c_str());
+				return nullptr;
+			}
 			Candidate c;
 			c.type = CandidateType::PeerReflexive;
 			c.transport = transport;
@@ -2278,14 +2950,32 @@ namespace stice::ice {
 		// transport class (TCP with TCP, UDP with UDP). For TCP, the local
 		// candidate may be TCPPassive/TCPActive/TCPSO while the incoming
 		// transport is TCPActive — both are "TCP class" and should match.
+		//
+		// RFC 8445 §7.2.5.2.1: when the datagram arrived through a TURN
+		// allocation, the pair's local candidate is the relayed candidate of
+		// that allocation — the transport address the peer actually targeted.
+		// Falling back to the first same-family UDP candidate (usually the host
+		// one) would make the triggered check leave from the host address, and
+		// the peer would fail the relay pair as non-symmetric.
 		bool transportIsTcp = (transport != CandidateTransport::UDP);
 		const Candidate* local = nullptr;
-		for (const auto& l : local_.candidates) {
-			bool localIsTcp = (l.transport != CandidateTransport::UDP);
-			if (l.resolved.addr.ss_family == remote->resolved.addr.ss_family &&
-				localIsTcp == transportIsTcp) {
-				local = &l;
-				break;
+		if (inboundTurn_ && inboundTurn_->state() == turn::AllocState::Allocated) {
+			for (const auto& l : local_.candidates) {
+				if (l.type == CandidateType::Relayed &&
+					l.resolved.isEqual(inboundTurn_->relayedAddr(), true)) {
+					local = &l;
+					break;
+				}
+			}
+		}
+		if (!local) {
+			for (const auto& l : local_.candidates) {
+				bool localIsTcp = (l.transport != CandidateTransport::UDP);
+				if (l.resolved.addr.ss_family == remote->resolved.addr.ss_family &&
+					localIsTcp == transportIsTcp) {
+					local = &l;
+					break;
+				}
 			}
 		}
 		if (!local) {
@@ -2300,7 +2990,13 @@ namespace stice::ice {
 		for (auto& p : pairs_) {
 			if (p->local == local && p->remote == remote) return p.get();
 		}
-		if (pairs_.size() >= MaxCandidatePairs) return nullptr;
+		if (pairs_.size() >= MaxCandidatePairs) pruneFailedPairs();
+		if (pairs_.size() >= MaxCandidatePairs) {
+			STICE_LOG_WARN("Agent: candidate pair limit (%zu) reached, dropping pair local=%s remote=%s",
+				static_cast<std::size_t>(MaxCandidatePairs), local->hostname.c_str(),
+				remote->hostname.c_str());
+			return nullptr;
+		}
 		auto p = std::make_unique<CandidatePair>();
 		p->local = local;
 		p->remote = remote;
@@ -2333,17 +3029,49 @@ namespace stice::ice {
 			src.toString().c_str(), transportString(transport),
 			msg.transactionID[0], msg.transactionID[1], msg.transactionID[2], msg.transactionID[3],
 			static_cast<int>(stun::hasUseCandidate(msg)));
+		// RFC 8489 §6.3.4/§9.3: a request carrying comprehension-required
+		// attributes we do not understand MUST be rejected with 420 listing them
+		// (400/420 are exempt from MESSAGE-INTEGRITY per §9.2.2).
+		if (!msg.unknownComprehensionRequired.empty()) {
+			STICE_LOG_WARN("handleBindingRequest: 420 Unknown-Attribute (%zu type(s)) from %s",
+				msg.unknownComprehensionRequired.size(), src.toString().c_str());
+			sendBindingResponse(msg, src, stun::StunErrorUnknownAttribute,
+				&msg.unknownComprehensionRequired);
+			return;
+		}
 		// Verify integrity (unless this is an indication).
 		if (!verifyBindingRequest(msg)) {
 			STICE_LOG_DEBUG("handleBindingRequest: verification FAILED");
-			STICE_LOG_DEBUG("HBR local=%u VERIFY-FAIL from=%s code=%d", diagLocalPort_, src.toString().c_str(),
-				(msg.find(stun::AttrType::MessageIntegrity) == nullptr) ? 401 : 400);
-			// Send 401 if no integrity, else 400.
-			int code = (msg.find(stun::AttrType::MessageIntegrity) == nullptr) ? 401 : 400;
-			sendBindingResponse(msg, src, code);
+			STICE_LOG_DEBUG("HBR local=%u VERIFY-FAIL from=%s mi=%d", diagLocalPort_, src.toString().c_str(),
+				(msg.find(stun::AttrType::MessageIntegrity) == nullptr) ? 0 : 1);
+			// RFC 8489 §9.2.2: a request whose MESSAGE-INTEGRITY is missing or
+			// whose HMAC does not verify is answered with 401 (Unauthorized) -
+			// the same code in both cases, so a peer that sent the wrong key and
+			// one that sent none get an identical, unambiguous rejection.
+			sendBindingResponse(msg, src, stun::StunErrorUnauthenticated);
 			return;
 		}
 		STICE_LOG_DEBUG("handleBindingRequest: verification OK");
+		// RFC 7675 §5.1 (pion agent.go:1726/1840 wide criterion): a validated
+		// inbound Binding Request is itself proof the peer considers this path
+		// alive. Refresh the matching pair's consent freshness on our side too —
+		// relying only on our own keepalive responses misses peers that send
+		// requests/media but answer our checks slowly, and then expires their
+		// pair at 30 s while traffic is still flowing.
+		{
+			CandidatePair* inboundPair = nullptr;
+			for (auto& p : pairs_) {
+				if (p->remote && p->remote->resolved.isEqual(src, true) &&
+					p->state == PairState::Succeeded) {
+					inboundPair = p.get();
+					break;
+				}
+			}
+			if (inboundPair) {
+				inboundPair->consentExpiry = std::chrono::steady_clock::now() +
+					std::chrono::milliseconds(ConsentTimeoutMs);
+			}
+		}
 		// Role conflict handling (RFC 8445 §7.3.1.1).
 		std::uint64_t peerTb = 0;
 		if (msg.find(stun::AttrType::IceControlling)) {
@@ -2355,7 +3083,7 @@ namespace stice::ice {
 					return;
 				}
 				mode_ = AgentMode::Controlled;
-				updateOrderedPairs();
+				applyRoleSwitch();
 			}
 		}
 		else if (msg.find(stun::AttrType::IceControlled)) {
@@ -2363,7 +3091,7 @@ namespace stice::ice {
 			if (mode_ == AgentMode::Controlled) {
 				if (tiebreaker_ >= peerTb) {
 					mode_ = AgentMode::Controlling;
-					updateOrderedPairs();
+					applyRoleSwitch();
 				}
 				else {
 					sendBindingResponse(msg, src, 487);
@@ -2382,8 +3110,28 @@ namespace stice::ice {
 		// controlling side switch the selected pair mid-session.
 		std::uint32_t nominationValue = 0;
 		bool hasNomination = stun::readNomination(msg, nominationValue);
+		// RFC 6544 §6.2.1: TCP-TYPE used to be write-only on our side. Read it
+		// back and use it as the peer's own candidate direction when the check
+		// arrived over TCP — the inbound channel only says "TCP", not whether
+		// the peer is active or passive, so this is what lets a peer-reflexive
+		// remote candidate be classified correctly.
+		CandidateTransport peerTcpTransport = transport;
+		if (transport != CandidateTransport::UDP) {
+			std::uint32_t tcpType = 0;
+			if (stun::readTcpType(msg, tcpType)) {
+				switch (tcpType) {
+				case stun::TcpTypeActive: peerTcpTransport = CandidateTransport::TCPActive; break;
+				case stun::TcpTypePassive: peerTcpTransport = CandidateTransport::TCPPassive; break;
+				case stun::TcpTypeSo: peerTcpTransport = CandidateTransport::TCPSimultaneousOpen; break;
+				default:
+					STICE_LOG_WARN("handleBindingRequest: unknown TCP-TYPE 0x%x from %s, ignoring",
+						static_cast<unsigned>(tcpType), src.toString().c_str());
+					break;
+				}
+			}
+		}
 		// Find or create the candidate pair.
-		CandidatePair* pair = findOrCreatePair(src, priority, transport);
+		CandidatePair* pair = findOrCreatePair(src, priority, peerTcpTransport);
 		if (!pair) {
 			sendBindingResponse(msg, src, 500);
 			return;
@@ -2411,30 +3159,61 @@ namespace stice::ice {
 			static_cast<int>(useCandidate), static_cast<int>(mode_));
 		// Send success response.
 		sendBindingResponse(msg, src, 0);
-		// Triggered check: if pair not SUCCEEDED, queue a check.
+		// Triggered check (RFC 8445 §7.3.1.4): a pair that is not yet Succeeded
+		// must be (re-)queued so both agents validate it.
 		if (pair->state != PairState::Succeeded && !remote_.iceUfrag.empty()) {
-			pair->state = PairState::Pending;
+			// Do not resurrect a Cancelled entry. After another pair was
+			// nominated, the remaining pairs were frozen and their checks
+			// cancelled (RFC 8445 §8.1.2); a late/duplicate binding request on
+			// one of them must not restart checks on the abandoned path (nor
+			// move its pair out of Frozen without an armed entry).
 			StunEntry* e = findEntry(pair);
-			if (!e && entries_.size() < MaxStunEntries) {
-				StunEntry ne;
-				ne.type = StunEntryType::Check;
-				ne.state = StunEntryState::Pending;
-				ne.pair = pair;
-				ne.record = pair->remote->resolved;
-				ne.mode = mode_;
-				entries_.push_back(std::move(ne));
-				e = &entries_.back();
+			if (e && e->state == StunEntryState::Cancelled) {
+				STICE_LOG_DEBUG("HBR: pair entry Cancelled, not scheduling triggered check");
 			}
-			if (e) {
-				armTransmission(*e, StunPacingTimeMs);
-				// Wake the agent's own PollRegistry so it picks up the new
-				// entry immediately. Without this, the poll thread may sleep
-				// for up to 60s (default timeout) and the triggered check
-				// won't fire until then. This is critical when the binding
-				// request arrived via TCPMux (on the TCPMux's poll thread)
-				// — the agent's own poll thread is a separate thread that
-				// has no idea a new entry was just armed.
-				wakePoll();
+			else {
+				if (!e && (entries_.size() < MaxStunEntries || reclaimDeadEntries())) {
+					StunEntry ne;
+					ne.type = StunEntryType::Check;
+					ne.state = StunEntryState::Pending;
+					ne.pair = pair;
+					ne.record = pair->remote->resolved;
+					ne.mode = mode_;
+					entries_.push_back(std::move(ne));
+					e = &entries_.back();
+				}
+				if (e) {
+					// armTransmission issues a NEW transaction ID and resets the
+					// retransmission counter. For an In-Progress pair that is
+					// exactly RFC 8445 §7.3.1.4's cancellation: the in-flight
+					// transaction is no longer retransmitted and its missing
+					// response is not counted as a failure; the fresh check
+					// validates the pair immediately instead of waiting for the
+					// old transaction to time out. For a Waiting/Frozen/Failed
+					// pair it re-queues the check (a Failed pair moves back to
+					// Pending, which may in turn revive the checklist).
+					// The pair state only flips once an entry is actually armed:
+					// leaving it untouched when the table is full keeps a Failed
+					// pair Failed instead of parking it in Pending forever with
+					// nothing scheduled.
+					const bool revivedFailedPair = pair->state == PairState::Failed;
+					pair->state = PairState::Pending;
+					// P1-N3: a plain check reviving a previously nominated pair
+					// must not inherit stale nomination flags — the controlled
+					// side would auto-report COMPLETED without a fresh
+					// UseCandidate. A request that carries UseCandidate just set
+					// them above, so keep those.
+					if (revivedFailedPair && !useCandidate) resetNomination(*pair);
+					armTransmission(*e, StunPacingTimeMs);
+					// Wake the agent's own PollRegistry so it picks up the new
+					// entry immediately. Without this, the poll thread may sleep
+					// for up to 60s (default timeout) and the triggered check
+					// won't fire until then. This is critical when the binding
+					// request arrived via TCPMux (on the TCPMux's poll thread)
+					// — the agent's own poll thread is a separate thread that
+					// has no idea a new entry was just armed.
+					wakePoll();
+				}
 			}
 		}
 	}
@@ -2442,32 +3221,85 @@ namespace stice::ice {
 		StunEntry& e) {
 		STICE_LOG_DEBUG("handleBindingResponse: from=%s cls=%d",
 			src.toString().c_str(), static_cast<int>(msg.cls));
-		// Symmetric response check (RFC 8445 §7.2.5.2.1): response source must
-		// match the request's destination. If mismatched, DISCARD the response
-		// (do not mark the pair as Failed — the pair can still be retried).
+		// RFC 8445 §7.2.5.2.1 (Non-Symmetric Transport Addresses): if the
+		// response source does not equal the destination the request was sent
+		// to, the agent MUST set the candidate pair state to Failed. It is not
+		// merely discarded: a reply arriving from a different 5-tuple means the
+		// pair cannot work, so retrying it would just burn the check budget.
 		if (!e.record.isEqual(src, true)) {
-			STICE_LOG_DEBUG("handleBindingResponse: src mismatch (expected %s got %s), discarding",
+			STICE_LOG_DEBUG("handleBindingResponse: non-symmetric response (expected %s got %s), pair failed",
 				e.record.toString().c_str(), src.toString().c_str());
+			e.state = StunEntryState::Failed;
+			if (e.pair) {
+				e.pair->state = PairState::Failed;
+				resetNomination(*e.pair);
+			}
+			if (e.type == StunEntryType::Check) {
+				armNextFrozenPair();
+				wakePoll();
+			}
+			updateState();
+			return;
+		}
+		// A Cancelled entry belongs to a pair whose checks were cancelled when
+		// another pair was nominated (RFC 8445 §8.1.2). A late/duplicate response
+		// must not resurrect it: flipping the pair back to Succeeded re-arms its
+		// keepalive and can re-select the path we deliberately abandoned. This
+		// guard covers both success and error responses, so a stale 487 cannot
+		// also re-arm the entry via applyRoleSwitch.
+		if (e.state == StunEntryState::Cancelled) {
+			STICE_LOG_DEBUG("handleBindingResponse: entry Cancelled, ignoring response");
 			return;
 		}
 		if (msg.cls == stun::Class::ErrorResponse) {
 			int code = 0;
 			std::string reason;
 			stun::readErrorCode(msg, code, reason);
+			if (code == stun::StunErrorUnknownAttribute) {
+				// RFC 8489 §6.3.4: our check carried an attribute the peer does not
+				// understand. Log the rejected types so the wire mismatch is visible,
+				// then fail the pair like any other terminal error.
+				std::vector<std::uint16_t> rejected;
+				stun::readUnknownAttributes(msg, rejected);
+				STICE_LOG_WARN("handleBindingResponse: 420 Unknown-Attribute from %s (%zu type(s))",
+					src.toString().c_str(), rejected.size());
+			}
 			if (code == 487) {
 				// Role conflict: switch role. RFC 8445 §7.3.1.1 does not
 				// require regenerating the tiebreaker — pion-ice preserves it.
 				if (e.mode == mode_) {
 					mode_ = (mode_ == AgentMode::Controlling) ? AgentMode::Controlled : AgentMode::Controlling;
-					updateOrderedPairs();
+					applyRoleSwitch();
 					if (e.state != StunEntryState::Idle) {
 						armTransmission(e, 0);
 					}
 				}
 				return;
 			}
+			// Transient error responses get a bounded retry buffer before the
+			// pair is failed: a 401 can race the credential exchange across an
+			// ICE restart and 500 can be momentary overload. 400 stays terminal
+			// on purpose — a ufrag/pwd mismatch never heals within a generation,
+			// and the fast-failure product choice (integration test: wrong-ufrag
+			// must fail in seconds) outweighs a retry that cannot succeed. Each
+			// retry is a fresh transaction (armTransmission regenerates the TID);
+			// persistent errors exhaust the budget and fail the pair below.
+			if ((code == 401 || code == 500) &&
+				e.errorRetries < MaxStunErrorResponseRetries) {
+				++e.errorRetries;
+				STICE_LOG_WARN("handleBindingResponse: %d from %s, retrying (%d/%d)",
+					code, src.toString().c_str(), e.errorRetries, MaxStunErrorResponseRetries);
+				if (e.state != StunEntryState::Idle) {
+					armTransmission(e, 0);
+					wakePoll();
+				}
+				return;
+			}
 			e.state = StunEntryState::Failed;
-			if (e.pair) e.pair->state = PairState::Failed;
+			if (e.pair) {
+				e.pair->state = PairState::Failed;
+				resetNomination(*e.pair);
+			}
 			// Arm the next frozen pair so connectivity checks continue,
 			// and re-evaluate state (may transition to FAILED if all pairs
 			// have failed). Without this, a 400 error response would leave
@@ -2488,7 +3320,26 @@ namespace stice::ice {
 			return;
 		}
 		// Success.
+		// Fresh retry budget: keepalives reuse this entry, so a later transient
+		// consent error must not inherit the check phase's exhausted budget.
+		e.errorRetries = 0;
 		if (e.pair) {
+			// RFC 8445 §7.2.5.3.2: the valid pair is built from the mapped address
+			// in the response (our transport address as seen by the peer) and the
+			// destination the check was sent to — not blindly from the pair that
+			// generated the check. Only meaningful for UDP (the mapped address over
+			// TCP is the local socket address, which the active-TCP candidate does
+			// not track) and only when the mapped address is a real address.
+			net::AddrRecord mapped{};
+			bool haveMapped = stun::readXorAddress(msg, stun::AttrType::XorMappedAddress,
+				mapped, msg.transactionID);
+			if (!haveMapped) haveMapped = stun::readMappedAddress(msg, mapped);
+			if (haveMapped && e.pair->local && e.pair->remote &&
+				e.pair->local->transport == CandidateTransport::UDP &&
+				!net::addrIsAny(reinterpret_cast<const sockaddr*>(&mapped.addr)) &&
+				!e.pair->local->resolved.isEqual(mapped, true)) {
+				classifyValidPair(*e.pair, mapped);
+			}
 			e.pair->state = PairState::Succeeded;
 			e.pair->consentExpiry = std::chrono::steady_clock::now() +
 				std::chrono::milliseconds(ConsentTimeoutMs);
@@ -2503,6 +3354,13 @@ namespace stice::ice {
 						(!best || p->priority > best->priority))
 						best = p.get();
 				if (best) {
+					// RFC 8445 §8.1.1: regular nomination picks the highest-
+					// priority valid pair once and MUST NOT switch afterwards
+					// (only an ICE restart may). Re-nomination is a
+					// draft-thatcher-ice-renomination extension that requires
+					// negotiation; nothing here negotiates it, so it stays an
+					// opt-in escape hatch.
+					const bool allowRenomination = renominationAllowed();
 					bool shouldNominate = false;
 					if (!selectedPair_) {
 						shouldNominate = true;
@@ -2510,12 +3368,19 @@ namespace stice::ice {
 						++nominationValue_;
 					}
 					else if (best != selectedPair_ && best->priority > selectedPair_->priority) {
-						// Re-nomination: a better pair succeeded after the current
-						// selected pair. Switch and re-nominate (draft-thatcher).
-						shouldNominate = true;
-						++nominationValue_;
-						STICE_LOG_DEBUG("renomination: switching to higher-priority pair (value=%u)",
-							nominationValue_);
+						if (allowRenomination) {
+							// Re-nomination: a better pair succeeded after the
+							// current selected pair. Switch and re-nominate
+							// (draft-thatcher).
+							shouldNominate = true;
+							++nominationValue_;
+							STICE_LOG_DEBUG("renomination: switching to higher-priority pair (value=%u)",
+								nominationValue_);
+						}
+						else {
+							STICE_LOG_DEBUG("nomination locked: ignoring higher-priority pair "
+								"(RFC 8445 §8.1.1; set STICE_ICE_RENOMINATION=1 to allow)");
+						}
 					}
 					if (shouldNominate) {
 						selectedPair_ = best;
@@ -2534,6 +3399,101 @@ namespace stice::ice {
 			// updateState() via onBookkeeping to transition to CONNECTED.
 			wakePoll();
 		}
+	}
+	void Agent::classifyValidPair(CandidatePair& generating, const net::AddrRecord& mapped) {
+		const Candidate* remote = generating.remote;
+		// Case 2: the mapped address already belongs to one of our local
+		// candidates (e.g. the srflx candidate the NAT actually exposes). The
+		// pair (that local candidate, same remote) is the RFC-valid pair.
+		const Candidate* local = nullptr;
+		for (const auto& l : local_.candidates) {
+			if (l.transport == CandidateTransport::UDP && l.resolved.isEqual(mapped, true)) {
+				local = &l;
+				break;
+			}
+		}
+		bool learnedPrflx = false;
+		if (!local) {
+			// Case 3: no local candidate covers the mapped address — learn a local
+			// peer-reflexive candidate. RFC 8445 §7.2.5.3.2: its priority is the
+			// PRIORITY attribute carried by the check that just completed, which is
+			// what the local candidate of this pair was checked with.
+			std::size_t before = local_.candidates.size();
+			Candidate c;
+			c.type = CandidateType::PeerReflexive;
+			c.transport = CandidateTransport::UDP;
+			c.component = generating.local->component;
+			c.resolved = mapped;
+			auto* sa = reinterpret_cast<const sockaddr*>(&mapped.addr);
+			char host[NI_MAXHOST];
+			char serv[NI_MAXSERV];
+			if (getnameinfo(sa, net::addrLen(sa), host, sizeof(host), serv, sizeof(serv),
+				NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
+				c.hostname = host;
+				c.service = serv;
+			}
+			// RFC 8445 §7.2.5.3.2: the priority of a learned peer-reflexive
+			// candidate is the PRIORITY attribute of the check, i.e. the value the
+			// sending side computed for the peer-reflexive candidate it would learn
+			// (see sendStunBinding: computePriority(PeerReflexive, ...)). Copying the
+			// checking candidate's own priority here instead inflated prflx pairs in
+			// the checklist ordering relative to what the peer advertised.
+			c.priority = c.computePriority(0);
+			c.foundation = Candidate::computeFoundation(c.type, c.hostname, c.transport);
+			addLocalCandidate(std::move(c));
+			if (local_.candidates.size() <= before) {
+				STICE_LOG_WARN("valid pair: could not learn peer-reflexive %s (candidate limit reached)",
+					mapped.toString().c_str());
+				return;
+			}
+			local = &local_.candidates.back();
+			learnedPrflx = true;
+		}
+		// Find or create the pair (mapped local candidate × the check's remote).
+		// addLocalCandidate() already ran formPairs(), so the pair usually exists.
+		CandidatePair* validPair = nullptr;
+		for (auto& p : pairs_) {
+			if (p->local == local && p->remote == remote) {
+				validPair = p.get();
+				break;
+			}
+		}
+		if (!validPair && pairs_.size() < MaxCandidatePairs) {
+			auto np = std::make_unique<CandidatePair>();
+			np->local = local;
+			np->remote = remote;
+			np->state = PairState::Frozen;
+			np->updatePriority(mode_ == AgentMode::Controlling);
+			validPair = np.get();
+			pairs_.push_back(std::move(np));
+			updateOrderedPairs();
+		}
+		if (!validPair) {
+			STICE_LOG_WARN("valid pair: no pair for mapped %s (pair limit reached)", mapped.toString().c_str());
+			return;
+		}
+		validPair->state = PairState::Succeeded;
+		validPair->consentExpiry = std::chrono::steady_clock::now() +
+			std::chrono::milliseconds(ConsentTimeoutMs);
+		// Give the valid pair an entry so nomination / consent keepalive can
+		// address it (a succeeded pair without an entry can never be nominated).
+		StunEntry* ve = findEntry(validPair);
+		if (!ve && (entries_.size() < MaxStunEntries || reclaimDeadEntries())) {
+			StunEntry ne;
+			ne.type = StunEntryType::Check;
+			ne.state = StunEntryState::Pending;
+			ne.pair = validPair;
+			ne.record = validPair->remote->resolved;
+			ne.mode = mode_;
+			entries_.push_back(std::move(ne));
+			ve = &entries_.back();
+		}
+		if (ve) armKeepalive(*ve);
+		STICE_LOG_INFO("valid pair: mapped=%s remote=%s local=%s%s (generating pair priority=%llu)",
+			mapped.toString().c_str(), remote->resolved.toString().c_str(),
+			local->resolved.toString().c_str(), learnedPrflx ? " (peer-reflexive)" : "",
+			static_cast<unsigned long long>(generating.priority));
+		wakePoll();
 	}
 	void Agent::handleServerReflexiveResponse(const stun::Message& msg,
 		const net::AddrRecord& src, StunEntry& e) {
@@ -2592,7 +3552,13 @@ namespace stice::ice {
 		c.hostname = host;
 		c.service = serv;
 		if (boundAddrUdp(c.related)) c.hasRelated = true;
-		c.priority = c.computePriority(0);
+		// RFC 8445 §5.1.2.1: distinct candidate addresses should not share the
+		// same local preference. With several STUN servers each reflexive address
+		// gets its own index; duplicate mappings are dropped by addLocalCandidate.
+		int srflxIndex = 0;
+		for (const auto& lc : local_.candidates)
+			if (lc.type == CandidateType::ServerReflexive) ++srflxIndex;
+		c.priority = c.computePriority(srflxIndex);
 		c.foundation = Candidate::computeFoundation(c.type, c.hostname, c.transport);
 		addLocalCandidate(c);
 		emitCandidate(c);
@@ -2643,6 +3609,7 @@ namespace stice::ice {
 		if (stun::Message::isMessage(data, static_cast<std::size_t>(len))) {
 			stun::Message m;
 			if (!m.decode(data, static_cast<std::size_t>(len))) return;
+			if (!fingerprintAcceptable(m, "ICE-UDP")) return;
 			STICE_LOG_DEBUG("ICE-STUN-IN method=%d cls=%d(%s) tid=%02x%02x%02x%02x src=%s len=%d",
 				static_cast<int>(m.method), static_cast<int>(m.cls),
 				(m.cls == stun::Class::Request) ? "REQ" : "RESP",
@@ -2696,6 +3663,7 @@ namespace stice::ice {
 		// pairs have succeeded (e.g. after role conflict resolution), the
 		// response could be sent to a different remote address than the one that
 		// sent the data, causing the peer to never receive it.
+		CandidatePair* dataPair = nullptr;
 		for (auto& p : pairs_) {
 			if (p->state == PairState::Succeeded && p->remote &&
 				p->remote->resolved.isEqual(src, true)) {
@@ -2704,10 +3672,11 @@ namespace stice::ice {
 						src.toString().c_str());
 					selectedPair_ = p.get();
 				}
+				dataPair = p.get();
 				break;
 			}
 		}
-		emitRecv(buf, static_cast<std::size_t>(len));
+		emitRecv(buf, static_cast<std::size_t>(len), dataPair);
 	}
 	int Agent::sendUdp(const char* data, std::size_t size, const net::AddrRecord& dst,
 		bool control) {
@@ -2756,15 +3725,18 @@ namespace stice::ice {
 				p->remote->resolved.toString().c_str(), ret);
 			return STICE_ERR_FAILED;
 		}
-		if (!tcpTransport_ || tcpTransport_->state() != net::TcpState::Connected) {
+		// RFC 6544 §7.1: each active pair owns its own connection, so route the
+		// frame to the connection backing this pair instead of a single transport.
+		TcpConnection* conn = tcpConnForPair(p);
+		if (!conn || !conn->transport || conn->transport->state() != net::TcpState::Connected) {
 			STICE_LOG_DEBUG("sendTcp: direct transport not connected (state=%d), dropping %zu bytes",
-				tcpTransport_ ? static_cast<int>(tcpTransport_->state()) : -1, size);
+				conn && conn->transport ? static_cast<int>(conn->transport->state()) : -1, size);
 			return STICE_ERR_FAILED;
 		}
 		// Control frames (STUN checks/responses) jump the bulk-data backlog so a
 		// saturated application stream cannot starve connectivity signalling.
-		bool ok = control ? tcpTransport_->sendControl(data, size)
-			: tcpTransport_->send(data, size);
+		bool ok = control ? conn->transport->sendControl(data, size)
+			: conn->transport->send(data, size);
 		if (!ok) {
 			STICE_LOG_WARN("sendTcp: direct transport send failed (%zu bytes)", size);
 			return STICE_ERR_FAILED;
@@ -2781,18 +3753,21 @@ namespace stice::ice {
 		return p->local->type == CandidateType::Relayed &&
 			p->local->transport == CandidateTransport::TCPPassive;
 	}
-	void Agent::handleInboundTcp() {
-		if (!tcpTransport_) return;
+	void Agent::handleInboundTcp(TcpConnection& conn) {
 		// Drain all complete RFC 4571-framed messages from the receive buffer.
+		// Re-check the transport every iteration: dispatch can reach updateState()
+		// and closeUnselectedTcpConns(), which resets the transport of a losing
+		// connection while this loop is still reading from it.
 		char buf[65536];
 		net::AddrRecord peer;
-		while (true) {
-			int n = tcpTransport_->recv(buf, sizeof(buf), peer);
+		while (conn.transport) {
+			int n = conn.transport->recv(buf, sizeof(buf), peer);
 			if (n <= 0) break;
-			handleInboundTcpPacket(buf, n, tcpPeerAddr_);
+			handleInboundTcpPacket(buf, n, conn.peerAddr, &conn);
 		}
 	}
-	void Agent::handleInboundTcpPacket(const char* data, int len, const net::AddrRecord& src) {
+	void Agent::handleInboundTcpPacket(const char* data, int len, const net::AddrRecord& src,
+		TcpConnection* conn) {
 		const auto* udata = reinterpret_cast<const unsigned char*>(data);
 		STICE_LOG_DEBUG("ICE-TCP: inbound packet %d bytes from %s", len, src.toString().c_str());
 		// Demultiplex: STUN / app data (no ChannelData over ICE-TCP).
@@ -2802,6 +3777,7 @@ namespace stice::ice {
 				STICE_LOG_WARN("ICE-TCP: STUN decode failed (%d bytes from %s)", len, src.toString().c_str());
 				return;
 			}
+			if (!fingerprintAcceptable(m, "ICE-TCP")) return;
 			STICE_LOG_DEBUG("ICE-TCP: STUN %s message (method=%d, class=%d) from %s",
 				m.method == stun::Method::Binding ? "Binding" : "Unknown",
 				static_cast<int>(m.method), static_cast<int>(m.cls),
@@ -2815,27 +3791,77 @@ namespace stice::ice {
 			return;
 		}
 		// Application data: deliver to the user.
+		// RFC 6544 §7.1: on a direct TCP connection, if the peer's first
+		// connectivity check is not a STUN message, the remote candidate's
+		// address apparently is not one of the peer's addresses. The agent
+		// SHOULD close the connection and consider all pairs with that remote
+		// candidate Failed, instead of accepting unvalidated application data.
+		if (conn && conn->pair && conn->pair->state != PairState::Succeeded) {
+			const Candidate* remote = conn->pair->remote;
+			STICE_LOG_WARN("ICE-TCP: first frame from %s is not STUN before validation, "
+			               "closing connection and failing the remote candidate",
+			               src.toString().c_str());
+			for (auto& p : pairs_)
+				if (p->remote == remote && p->state != PairState::Failed) {
+					p->state = PairState::Failed;
+					resetNomination(*p);
+				}
+			if (conn->transport) conn->transport->close();
+			updateState();
+			return;
+		}
 		STICE_LOG_DEBUG("ICE-TCP: application data %d bytes from %s", len, src.toString().c_str());
-		emitRecv(data, static_cast<std::size_t>(len));
+		emitRecv(data, static_cast<std::size_t>(len), conn ? conn->pair : nullptr);
+	}
+	bool Agent::startTcpConn(TcpConnection& conn, const net::AddrRecord& remoteAddr,
+		const std::string& sni) {
+		conn.transport = std::make_unique<net::TcpTransport>();
+		conn.peerAddr = remoteAddr;
+		// SNI is kept for a potential TLS upgrade; plain ICE-TCP ignores it.
+		conn.sni = sni;
+		// P1-C6: bind the outgoing connection to a gathered host address so the
+		// resulting local candidate is an address we actually know about instead
+		// of an OS routing choice. Only when exactly one non-loopback host
+		// candidate of the remote's family exists — multi-homed hosts keep the
+		// OS default route rather than guessing an interface.
+		net::AddrRecord bindAddr{};
+		const net::AddrRecord* bindPtr = nullptr;
+		// A loopback/link-local destination must be reached from a source of the
+		// same scope: binding a non-loopback host address and then connecting to
+		// 127.0.0.1 fails with EADDRNOTAVAIL/WSAEADDRNOTAVAIL. Leave such dials
+		// to the OS routing choice (which picks the matching local address).
+		if (!net::addrIsLocal(reinterpret_cast<const sockaddr*>(&remoteAddr.addr))) {
+			int count = 0;
+			const net::AddrRecord* only = nullptr;
+			for (const auto& lc : local_.candidates) {
+				if (lc.type != CandidateType::Host) continue;
+				if (lc.resolved.addr.ss_family != remoteAddr.addr.ss_family) continue;
+				if (net::addrIsLocal(reinterpret_cast<const sockaddr*>(&lc.resolved.addr))) continue;
+				++count;
+				only = &lc.resolved;
+			}
+			if (count == 1) {
+				bindAddr = *only;
+				net::addrSetPort(reinterpret_cast<sockaddr*>(&bindAddr.addr), 0);
+				bindPtr = &bindAddr;
+			}
+		}
+		if (!conn.transport->beginConnect(remoteAddr, "", false, false, std::string(), bindPtr)) {
+			conn.transport.reset();
+			return false;
+		}
+		// Arm an application-layer connect timeout so a black-holed remote
+		// (no SYN-ACK) does not leave the transport stuck in Connecting forever.
+		conn.transport->setConnectTimeoutMs(TcpConnectTimeoutMs);
+		return true;
 	}
 	void Agent::addRemotePassiveTcpCandidate(const Candidate& remote) {
 		// Aligned with pion-ice addRemotePassiveTCPCandidate: create a local
 		// active TCP candidate by dialing the remote passive candidate's address.
-		// We use a single tcpTransport_ per agent (limitation: only one TCP pair
-		// at a time). If a transport already exists and is connected, skip.
+		// One connection per active pair (RFC 6544 §7.1): a second remote passive
+		// candidate gets its own socket instead of resetting the first.
 		STICE_LOG_INFO("ICE-TCP: addRemotePassiveTcpCandidate host=%s:%s",
 			remote.hostname.c_str(), remote.service.c_str());
-		if (tcpTransport_ && tcpTransport_->state() == net::TcpState::Connected) {
-			STICE_LOG_DEBUG("ICE-TCP: TCP transport already connected, skipping new connect");
-			return;
-		}
-		// If a previous (failed/disconnected) transport exists, clean it up first
-		// to avoid fd leakage and duplicate PollRegistry registration.
-		if (tcpTransport_) {
-			STICE_LOG_DEBUG("ICE-TCP: resetting previous transport (state=%d) before new connect",
-				static_cast<int>(tcpTransport_->state()));
-			tcpTransport_.reset();
-		}
 		// Resolve the remote candidate address if not already resolved.
 		net::AddrRecord remoteAddr = remote.resolved;
 		if (remoteAddr.len == 0) {
@@ -2849,22 +3875,52 @@ namespace stice::ice {
 			}
 			remoteAddr = records[0];
 		}
-		STICE_LOG_INFO("ICE-TCP: beginning active TCP connect to %s", remoteAddr.toString().c_str());
-		// Begin the non-blocking connect. The TcpTransport will complete the
-		// connection asynchronously via onWritable callbacks from the PollRegistry.
-		tcpTransport_ = std::make_unique<net::TcpTransport>();
-		tcpPeerAddr_ = remoteAddr;
-		// Store SNI for potential TLS upgrade (not used for plain ICE-TCP).
-		tcpSni_ = remote.hostname;
-		if (!tcpTransport_->beginConnect(remoteAddr, "", false)) {
-			STICE_LOG_WARN("ICE-TCP: failed to begin TCP connect to %s (errno=%d)",
-				remoteAddr.toString().c_str(), sticeSockerrno);
-			tcpTransport_.reset();
+		// Reuse an existing connection to this exact endpoint when it is still
+		// live; otherwise recreate it. Its local candidate already exists, so a
+		// redial must not add a duplicate candidate.
+		for (auto& c : tcpConns_) {
+			if (!c.peerAddr.isEqual(remoteAddr, true)) continue;
+			if (c.transport &&
+				(c.transport->state() == net::TcpState::Connected ||
+				 c.transport->state() == net::TcpState::Connecting ||
+				 c.transport->state() == net::TcpState::TlsHandshaking)) {
+				STICE_LOG_DEBUG("ICE-TCP: connection to %s already in progress/connected, skipping",
+					remoteAddr.toString().c_str());
+				return;
+			}
+			STICE_LOG_DEBUG("ICE-TCP: redialing dead connection to %s", remoteAddr.toString().c_str());
+			if (!startTcpConn(c, remoteAddr, remote.hostname)) {
+				STICE_LOG_WARN("ICE-TCP: failed to redial %s", remoteAddr.toString().c_str());
+				return;
+			}
+			if (pollReg_) pollReg_->add(this);
 			return;
 		}
-		// Arm an application-layer connect timeout so a black-holed remote
-		// (no SYN-ACK) does not leave the transport stuck in Connecting forever.
-		tcpTransport_->setConnectTimeoutMs(TcpConnectTimeoutMs);
+		// RFC 6544 §12: cap the number of simultaneous connections to one IP.
+		int sameIp = 0;
+		for (const auto& c : tcpConns_) {
+			if (net::addrEqual(reinterpret_cast<const sockaddr*>(&c.peerAddr.addr),
+				reinterpret_cast<const sockaddr*>(&remoteAddr.addr), false))
+				++sameIp;
+		}
+		if (sameIp >= 5) {
+			STICE_LOG_WARN("ICE-TCP: refusing %s: already %d connections to this IP (RFC 6544 §12)",
+				remoteAddr.toString().c_str(), sameIp);
+			return;
+		}
+		STICE_LOG_INFO("ICE-TCP: beginning active TCP connect to %s", remoteAddr.toString().c_str());
+		tcpConns_.emplace_back();
+		TcpConnection& conn = tcpConns_.back();
+		// Begin the non-blocking connect. The TcpTransport completes it
+		// asynchronously via writable callbacks from the PollRegistry.
+		if (!startTcpConn(conn, remoteAddr, remote.hostname)) {
+			STICE_LOG_WARN("ICE-TCP: failed to begin TCP connect to %s (errno=%d)",
+				remoteAddr.toString().c_str(), sticeSockerrno);
+			tcpConns_.pop_back();
+			return;
+		}
+		// P1-C6 bind logic + connect start live in startTcpConn() so the
+		// reconnect path reuses exactly the same setup.
 		// Create a local active TCP host candidate. The local address/port is
 		// determined by the socket's local address after connect begins.
 		net::AddrRecord localAddr{};
@@ -2877,7 +3933,7 @@ namespace stice::ice {
 		c.component = 1;
 		c.resolved = remoteAddr; // placeholder; will be updated on connect
 		// Get the local address from the socket (may be INADDR_ANY:ephemeral).
-		auto localSock = tcpTransport_->handle();
+		auto localSock = conn.transport->handle();
 		if (localSock != STICE_INVALID_SOCKET) {
 			sockaddr_storage la{};
 			socklen_t laLen = sizeof(la);
@@ -2896,14 +3952,19 @@ namespace stice::ice {
 				}
 			}
 		}
+		// If getsockname failed we have no usable local address. Emitting a
+		// synthetic 0.0.0.0:0 candidate would advertise an unroutable path to
+		// the peer, so keep the connection but skip the candidate (RFC 6544
+		// §4.1: a candidate MUST carry a reachable transport address).
 		if (c.hostname.empty()) {
-			c.hostname = "0.0.0.0";
-			c.service = "0";
+			STICE_LOG_WARN("ICE-TCP: active connect to %s has no local address, not emitting candidate",
+				remoteAddr.toString().c_str());
+		} else {
+			c.priority = c.computePriority(0);
+			c.foundation = Candidate::computeFoundation(c.type, c.hostname, c.transport);
+			addLocalCandidate(c);
+			emitCandidate(c);
 		}
-		c.priority = c.computePriority(0);
-		c.foundation = Candidate::computeFoundation(c.type, c.hostname, c.transport);
-		addLocalCandidate(c);
-		emitCandidate(c);
 		// Register with the PollRegistry so we get onTcpEvents callbacks.
 		// Register this Agent (with its TCP socket) on its own PollRegistry.
 		// add() is idempotent (deduplicates by pointer), so this is safe if the
@@ -2911,7 +3972,7 @@ namespace stice::ice {
 		if (pollReg_) pollReg_->add(this);
 		STICE_LOG_INFO("ICE-TCP: began active TCP connect to %s (local=%s:%s, fd=%d)",
 			remoteAddr.toString().c_str(), c.hostname.c_str(), c.service.c_str(),
-			static_cast<int>(tcpTransport_->handle()));
+			static_cast<int>(conn.transport->handle()));
 	}
 	std::vector<net::AddrRecord> Agent::localAddrsUdp(int family) const {
 		if (mux_) return mux_->localAddrs(family);
@@ -2956,7 +4017,7 @@ namespace stice::ice {
 				LifetimeScope ls(lifetime);
 				if (!ls) return;
 				std::lock_guard<std::recursive_mutex> lock(mutex_);
-				handleInboundTcpPacket(data, len, src);
+				handleInboundTcpPacket(data, len, src, nullptr);
 			},
 			// TCPMux calls onBookkeeping for timer-driven agents. Since the
 			// agent is already registered with UDPMux (or its own socket) for
@@ -2977,6 +4038,9 @@ namespace stice::ice {
 				c.resolved.toString().c_str(), c.priority);
 		gatheringDone_ = true;
 		local_.finished = true;
+		// Non-trickle mode: the complete candidate set is delivered now, so the
+		// application sees every candidate before gathering_done.
+		flushDeferredCandidates();
 		emitGatheringDone();
 		// If remote description was set before gathering finished and early pair
 		// formation (setRemoteDescription/addRemoteCandidate) has not already
@@ -3016,86 +4080,229 @@ namespace stice::ice {
 		LifetimeScope ls(lifetime_);
 		if (!ls) return;
 		std::lock_guard<std::recursive_mutex> lock(mutex_);
-		if (!tcpTransport_) return;
+		// Legacy single-slot entry: drive the primary connection. Every other
+		// connection arrives through onIceTcpEventsSock().
+		TcpConnection* conn = primaryTcpConn();
+		if (!conn) return;
+		onTcpConnEvents(*conn, events);
+	}
+	void Agent::onTcpConnEvents(TcpConnection& conn, short events) {
+		if (!conn.transport) return;
 		// Application-layer connect timeout: if the non-blocking connect has not
 		// completed by the deadline, transition to Failed so the pair is failed
 		// and the next frozen pair is armed. Without this, a black-holed remote
 		// (no SYN-ACK) leaves the transport stuck in Connecting forever.
-		if (tcpTransport_->connectTimedOut()) {
+		if (conn.transport->connectTimedOut()) {
 			STICE_LOG_WARN("ICE-TCP: connect timeout (peer=%s), failing transport",
-				tcpPeerAddr_.toString().c_str());
-			tcpTransport_->close();
+				conn.peerAddr.toString().c_str());
+			conn.transport->close();
 		}
-		auto prevState = tcpTransport_->state();
+		auto prevState = conn.transport->state();
 		STICE_LOG_DEBUG("ICE-TCP: events=0x%x state=%d peer=%s",
 			static_cast<unsigned>(events),
 			static_cast<int>(prevState),
-			tcpPeerAddr_.toString().c_str());
+			conn.peerAddr.toString().c_str());
 		// Handle POLLERR/POLLHUP: some platforms report these without POLLIN/POLLOUT.
 		// Trigger both readable/writable to let the transport detect the error via
 		// recv() == 0 or send() < 0 or SO_ERROR, then transition to Failed/Disconnected.
 		if (events & (POLLERR | POLLHUP)) {
 			STICE_LOG_DEBUG("ICE-TCP: POLLERR/POLLHUP (0x%x), draining transport",
 				static_cast<unsigned>(events & (POLLERR | POLLHUP)));
-			if (!(events & POLLIN)) tcpTransport_->onReadable();
-			if (!(events & POLLOUT)) tcpTransport_->onWritable();
+			if (!(events & POLLIN)) conn.transport->onReadable();
+			if (!(events & POLLOUT)) conn.transport->onWritable();
 		}
-		if (events & POLLOUT) tcpTransport_->onWritable();
+		if (events & POLLOUT) conn.transport->onWritable();
 		if (events & POLLIN) {
-			tcpTransport_->onReadable();
+			conn.transport->onReadable();
 			// Drain all complete RFC 4571-framed messages from the transport.
-			handleInboundTcp();
+			handleInboundTcp(conn);
+			// closeUnselectedTcpConns() may have dropped this losing connection
+			// from inside the dispatch above.
+			if (!conn.transport) return;
 		}
-		// If the transport just transitioned to Connected, flush any pending
-		// STUN checks that were queued for this pair.
-		if (tcpTransport_->state() == net::TcpState::Connected) {
-			if (prevState != net::TcpState::Connected) {
-				STICE_LOG_INFO("ICE-TCP: transport Connected (peer=%s), arming pending CHECK entries",
-					tcpPeerAddr_.toString().c_str());
-			}
-			// Find any pending CHECK entries for TCP pairs and arm them.
-			for (auto& e : entries_) {
-				if (e.type == StunEntryType::Check && e.state == StunEntryState::Pending &&
-					e.pair && pairIsTcp(e.pair)) {
-					// The entry may have been waiting for the TCP connection.
-					// Reset its transmission timer to fire immediately, and apply
-					// the TCP fixed timeout (StunTcpTimeoutMs, no backoff).
-					if (e.retransmissions == 0) {
-						e.nextTransmission = std::chrono::steady_clock::now();
-						e.retransmissionTimeout = std::chrono::milliseconds(StunTcpTimeoutMs);
-						STICE_LOG_DEBUG("ICE-TCP: armed CHECK entry for pair (local=%s remote=%s)",
-							e.pair->local ? e.pair->local->hostname.c_str() : "?",
-							e.pair->remote ? e.pair->remote->hostname.c_str() : "?");
-						wakePoll();
-					}
-				}
-			}
-		}
-		else if (tcpTransport_->state() == net::TcpState::Failed ||
-			tcpTransport_->state() == net::TcpState::Disconnected) {
-			STICE_LOG_WARN("ICE-TCP: transport %s (peer=%s, prevState=%d), failing TCP pairs",
-				tcpTransport_->state() == net::TcpState::Failed ? "Failed" : "Disconnected",
-				tcpPeerAddr_.toString().c_str(),
-				static_cast<int>(prevState));
-			// TCP connection failed or remote closed: mark TCP pairs as failed and
-			// cancel their pending STUN entries so the bookkeeping loop doesn't
-			// keep retrying on a dead transport.
+		// Resolve the pair this connection backs (lazily, once the pair exists).
+		if (!conn.pair) {
 			for (auto& p : pairs_) {
-				if (pairIsTcp(p.get()) && p->state != PairState::Failed) {
+				if (pairIsTcp(p.get()) && p->remote &&
+					conn.peerAddr.isEqual(p->remote->resolved, true)) {
+					conn.pair = p.get();
+					break;
+				}
+			}
+		}
+		if (conn.transport->state() == net::TcpState::Connected) {
+			const bool justConnected = prevState != net::TcpState::Connected;
+			if (justConnected) {
+				STICE_LOG_INFO("ICE-TCP: transport Connected (peer=%s), arming CHECK entries",
+					conn.peerAddr.toString().c_str());
+				// A successful (re)dial clears the RFC 6544 §11.1 retry budget.
+				conn.everConnected = true;
+				conn.reconnectAttempts = 0;
+				conn.reconnectPending = false;
+				conn.redialStart = {};
+			}
+			// (Re)arm pending CHECK entries for this connection's pair so the
+			// check fires as soon as the socket is up. On a reconnect the entry
+			// was marked Failed, so revive it as Pending too.
+			for (auto& e : entries_) {
+				if (e.type != StunEntryType::Check || !e.pair || !pairIsTcp(e.pair)) continue;
+				if (!conn.pair || e.pair != conn.pair) continue;
+				if (e.state == StunEntryState::Failed) e.state = StunEntryState::Pending;
+				if (e.state != StunEntryState::Pending) continue;
+				if (e.retransmissions == 0) {
+					e.nextTransmission = std::chrono::steady_clock::now();
+					e.retransmissionTimeout = std::chrono::milliseconds(StunTcpTimeoutMs);
+					STICE_LOG_DEBUG("ICE-TCP: armed CHECK entry for pair (local=%s remote=%s)",
+						e.pair->local ? e.pair->local->hostname.c_str() : "?",
+						e.pair->remote ? e.pair->remote->hostname.c_str() : "?");
+					wakePoll();
+				}
+			}
+			// A reconnected pair goes back to Pending so the check above can
+			// re-establish it (RFC 6544 §11.1 recovery). Belt and braces with the
+			// resetNomination at the failure site: a revived pair must come back
+			// un-nominated, so the controlling side re-nominates and the
+			// controlled side waits for a fresh UseCandidate (P1-N3).
+			if (justConnected && conn.everConnected && conn.pair &&
+				conn.pair->state == PairState::Failed) {
+				conn.pair->state = PairState::Pending;
+				resetNomination(*conn.pair);
+			}
+		}
+		else if (conn.transport->state() == net::TcpState::Failed ||
+			conn.transport->state() == net::TcpState::Disconnected) {
+			STICE_LOG_WARN("ICE-TCP: transport %s (peer=%s, prevState=%d), failing its pair",
+				conn.transport->state() == net::TcpState::Failed ? "Failed" : "Disconnected",
+				conn.peerAddr.toString().c_str(),
+				static_cast<int>(prevState));
+			// Decide recovery BEFORE mutating pair state: a connection that ever
+			// carried the selected/succeeded pair must be redialed (RFC 6544 §11.1).
+			const bool backsSelected = conn.everConnected && conn.pair &&
+				(conn.pair == selectedPair_ || conn.pair->state == PairState::Succeeded);
+			const bool matchesSelectedAddr = conn.everConnected && selectedPair_ &&
+				pairIsTcp(selectedPair_) && selectedPair_->remote &&
+				conn.peerAddr.isEqual(selectedPair_->remote->resolved, true);
+			const bool mustReconnect = backsSelected || matchesSelectedAddr;
+			// Fail only the pair backed by this connection (other connections are
+			// independent now), and cancel its pending STUN entries so the
+			// bookkeeping loop does not keep retrying on a dead transport.
+			for (auto& p : pairs_) {
+				if (!pairIsTcp(p.get())) continue;
+				const bool mine = conn.pair ? p.get() == conn.pair
+					: (p->remote && conn.peerAddr.isEqual(p->remote->resolved, true));
+				if (mine && p->state != PairState::Failed) {
 					p->state = PairState::Failed;
+					resetNomination(*p);
 				}
 			}
 			for (auto& e : entries_) {
-				if (e.type == StunEntryType::Check && e.pair && pairIsTcp(e.pair) &&
-					e.state == StunEntryState::Pending) {
-					e.state = StunEntryState::Failed;
+				if (e.type != StunEntryType::Check || !e.pair || !pairIsTcp(e.pair)) continue;
+				const bool mine = conn.pair ? e.pair == conn.pair
+					: (e.pair->remote && conn.peerAddr.isEqual(e.pair->remote->resolved, true));
+				if (mine && e.state == StunEntryState::Pending) e.state = StunEntryState::Failed;
+			}
+			if (mustReconnect) {
+				// Keep the session state: the redial below revives the pair, so
+				// declaring failure now would tear down a recoverable link.
+				scheduleTcpReconnect(conn);
+			}
+			else {
+				// Close the fd; keep the (empty) entry so a later re-dial reuses
+				// its identity and local candidate.
+				conn.transport.reset();
+				updateState();
+			}
+		}
+	}
+	// RFC 6544 §8: after ICE completes, close every direct TCP connection that
+	// does not carry the selected/nominated pair. Losing dials stay open
+	// otherwise, wasting descriptors and answering checks on a connection that
+	// will never carry media.
+	void Agent::closeUnselectedTcpConns() {
+		const CandidatePair* keep = nominatedPair_ ? nominatedPair_ : selectedPair_;
+		if (!keep) return;
+		for (auto& c : tcpConns_) {
+			if (!c.transport) continue;
+			bool carried = c.pair == keep;
+			// `pair` is resolved lazily after the first inbound frame, and
+			// updateState() can run from that same frame, so the selected pair may
+			// not be bound yet. Match by endpoint in that case.
+			if (!carried && !c.pair && pairIsTcp(keep) && keep->remote &&
+				c.peerAddr.isEqual(keep->remote->resolved, true))
+				carried = true;
+			if (carried) continue;
+			STICE_LOG_DEBUG("ICE-TCP: closing unselected connection to %s (RFC 6544 §8)",
+				c.peerAddr.toString().c_str());
+			c.transport->close();
+			c.transport.reset();
+			c.reconnectPending = false;
+			// Fail the pair it backed: the connection is gone, so it must not be
+			// reselected later on a transport that no longer exists.
+			for (auto& p : pairs_) {
+				if (!pairIsTcp(p.get()) || p.get() == keep) continue;
+				const bool mine = c.pair ? p.get() == c.pair
+					: (p->remote && c.peerAddr.isEqual(p->remote->resolved, true));
+				if (mine && p->state != PairState::Failed) {
+					p->state = PairState::Failed;
+					resetNomination(*p);
 				}
 			}
-			// Destroy the transport and close the fd to prevent fd leakage.
-			// Aligns with onTurnTcpEvents which resets turnTcpTransport_ on failure.
-			tcpTransport_.reset();
-			updateState();
 		}
+	}
+	void Agent::scheduleTcpReconnect(TcpConnection& conn) {
+		if (conn.reconnectPending) return;
+		const auto now = std::chrono::steady_clock::now();
+		// Fail every pair this connection backs and drop its nomination state,
+		// matching closeUnselectedTcpConns(): a connection that is gone must not
+		// leave a pair that later nomination/selection can pick up.
+		auto failPairsForConn = [this, &conn]() {
+			for (auto& p : pairs_) {
+				if (!pairIsTcp(p.get())) continue;
+				const bool mine = conn.pair ? p.get() == conn.pair
+					: (p->remote && conn.peerAddr.isEqual(p->remote->resolved, true));
+				if (mine && p->state != PairState::Failed) {
+					p->state = PairState::Failed;
+					resetNomination(*p);
+				}
+			}
+		};
+		// Total wall-clock budget for the redial campaign: reconnectAttempts
+		// resets on every transient success, so a flapping link could redial
+		// forever. 60 s from the first loss ends the campaign.
+		if (conn.redialStart.time_since_epoch().count() == 0)
+			conn.redialStart = now;
+		if (now - conn.redialStart >= std::chrono::milliseconds(TcpRedialWallBudgetMs)) {
+			STICE_LOG_WARN("ICE-TCP: giving up redial to %s (wall-clock budget exhausted)",
+				conn.peerAddr.toString().c_str());
+			// The campaign is over, so the pairs this connection backed can never be
+			// revived. Leaving them in their previous state let a later nomination or
+			// selection resurrect a link with no transport behind it.
+			failPairsForConn();
+			conn.transport.reset();
+			updateState();
+			return;
+		}
+		if (conn.reconnectAttempts >= 5) {
+			STICE_LOG_WARN("ICE-TCP: giving up redial to %s after %d attempts",
+				conn.peerAddr.toString().c_str(), conn.reconnectAttempts);
+			failPairsForConn();
+			conn.transport.reset();
+			updateState();
+			return;
+		}
+		// Exponential backoff capped at 8 s: 1 s, 2 s, 4 s, 8 s, 8 s,
+		// jittered +/-20% so simultaneous losses don't re-sync their dials.
+		const int shift = conn.reconnectAttempts < 3 ? conn.reconnectAttempts : 3;
+		auto delay = std::chrono::milliseconds(1000 << shift);
+		const int span = std::max(1, static_cast<int>(delay.count() / 5));
+		const int jitter = static_cast<int>(crypto::randomU32() % (2 * span + 1)) - span;
+		delay += std::chrono::milliseconds(jitter);
+		conn.reconnectPending = true;
+		conn.nextReconnect = now + delay;
+		conn.transport.reset();
+		STICE_LOG_WARN("ICE-TCP: selected connection to %s lost; redialing in %lldms (RFC 6544 §11.1)",
+			conn.peerAddr.toString().c_str(), static_cast<long long>(delay.count()));
+		wakePoll();
 	}
 	void Agent::onTurnTcpEventsSock(socket_t sock, short events) {
 		LifetimeScope ls(lifetime_);
@@ -3445,6 +4652,27 @@ namespace stice::ice {
 				wakePoll();
 				return;
 			}
+			// RFC 6062 §3.2: a data connection that drops after CONNECTION-BIND
+			// must not silently abandon the relayed pair (P1-TD1). The server
+			// keeps the connection binding, so rebuild the data connection with
+			// the SAME connection-id; if the server has already dropped the
+			// binding the bind fails and the pre-bind CONNECT retry path above
+			// establishes a fresh one. Bounded retries: once exhausted the pair
+			// dies through consent expiry like any other broken link.
+			if (turnDataConn_->bound && turnDataRebindAttempts_ < MaxTurnDataRebindRetries) {
+				turnDataRebindConnId_ = turnDataConn_->connectionId;
+				turnDataRebindPeer_ = turnDataConn_->peer;
+				++turnDataRebindAttempts_;
+				pendingTurnDataRebind_ = true;
+				nextTurnDataRebind_ = std::chrono::steady_clock::now() +
+					std::chrono::milliseconds(TurnDataRebindDelayMs * turnDataRebindAttempts_);
+				STICE_LOG_WARN("TURN data: bound connection lost (state=%d), scheduling rebind of connId=%u (attempt %d/%d)",
+					static_cast<int>(turnDataConn_->transport->state()),
+					turnDataRebindConnId_, turnDataRebindAttempts_, MaxTurnDataRebindRetries);
+				turnDataConn_.reset();
+				wakePoll();
+				return;
+			}
 			STICE_LOG_WARN("TURN data: connection lost (state=%d)",
 				static_cast<int>(turnDataConn_->transport->state()));
 			turnDataConn_.reset();
@@ -3488,6 +4716,18 @@ namespace stice::ice {
 				if (!m.decode(frame, frameSize)) continue;
 				if (stun::isResponseType(m.cls) && m.cls != stun::Class::ErrorResponse &&
 					m.method == stun::Method::ConnectionBind) {
+					// P2-N4: the CONNECTION-BIND success response is the credential
+					// handshake for this side channel (RFC 6062 §6.3). Without MI/FP
+					// verification an off-path peer could flip the connection into
+					// "bound" and inject data, so a verification failure closes it.
+					StunEntry* ctrlEntry = findTcpTurnEntry();
+					if (ctrlEntry && ctrlEntry->turn &&
+						!ctrlEntry->turn->verifySideChannelResponse(m)) {
+						STICE_LOG_WARN("TURN data: CONNECTION-BIND response failed MI/FP "
+						               "verification, closing data connection");
+						turnDataConn_->transport->close();
+						return;
+					}
 					turnDataConn_->bound = true;
 					turnDataConn_->connecting = false;
 					turnDataRetryCount_ = 0; // bind succeeded, reset retry budget
@@ -3596,13 +4836,30 @@ namespace stice::ice {
 				pendingRelayAllocations_, ageMs, entries_.size(),
 				gatheringDone_ ? 1 : 0, local_.candidates.size(), static_cast<int>(state_));
 		}
-		// Enforce application-layer TCP connect timeouts. The poll loop may not
-		// deliver onTcpEvents/onTurnTcpEvents for a black-holed connect (no
-		// writable event ever fires), so the bookkeeping pass is the safety net.
-		if (tcpTransport_ && tcpTransport_->connectTimedOut()) {
-			STICE_LOG_WARN("ICE-TCP: connect timeout in bookkeeping (peer=%s)",
-				tcpPeerAddr_.toString().c_str());
-			tcpTransport_->close();
+		// Enforce application-layer TCP connect timeouts and drive the RFC 6544
+		// §11.1 redial. The poll loop may not deliver onTcpEvents for a black-
+		// holed connect (no writable event ever fires), so this pass is the
+		// safety net for both.
+		{
+			const auto tcpNow = std::chrono::steady_clock::now();
+			for (auto& c : tcpConns_) {
+				if (c.transport && c.transport->connectTimedOut()) {
+					STICE_LOG_WARN("ICE-TCP: connect timeout in bookkeeping (peer=%s)",
+						c.peerAddr.toString().c_str());
+					c.transport->close();
+				}
+				if (!c.reconnectPending || tcpNow < c.nextReconnect) continue;
+				c.reconnectPending = false;
+				++c.reconnectAttempts;
+				STICE_LOG_WARN("ICE-TCP: redialing %s (attempt %d, RFC 6544 §11.1)",
+					c.peerAddr.toString().c_str(), c.reconnectAttempts);
+				if (startTcpConn(c, c.peerAddr, c.sni)) {
+					if (pollReg_) pollReg_->add(this);
+				}
+				else {
+					scheduleTcpReconnect(c);
+				}
+			}
 		}
 		for (auto& e : entries_) {
 			if (e.type == StunEntryType::Relay && e.tcpTurn && e.turnTcp &&
@@ -3645,6 +4902,21 @@ namespace stice::ice {
 					turnDataRetryCount_, MaxTurnDataConnectRetries);
 				te->turn->sendConnect(turnDataRetryPeer_);
 				tcpConnectSent_ = true;
+			}
+		}
+		// RFC 6062: rebuild a data connection that dropped after CONNECTION-BIND
+		// (P1-TD1). beginTurnDataConnect re-issues CONNECTION-BIND with the same
+		// connection-id; a server that already dropped the binding rejects it
+		// and the pre-bind CONNECT retry above takes over with a fresh id.
+		if (pendingTurnDataRebind_ && now >= nextTurnDataRebind_) {
+			pendingTurnDataRebind_ = false;
+			StunEntry* te = findTcpTurnEntry();
+			if (!turnDataConn_ && te && te->turn &&
+				te->turn->state() == turn::AllocState::Allocated) {
+				STICE_LOG_INFO("RFC 6062: rebinding data connection connId=%u peer=%s (attempt %d/%d)",
+					turnDataRebindConnId_, turnDataRebindPeer_.toString().c_str(),
+					turnDataRebindAttempts_, MaxTurnDataRebindRetries);
+				beginTurnDataConnect(turnDataRebindConnId_, turnDataRebindPeer_);
 			}
 		}
 		// RFC 6062: if the TCP allocation was still pending when formPairs()
@@ -3746,7 +5018,10 @@ namespace stice::ice {
 						--pendingServerReflexive_;
 						checkGatheringComplete();
 					}
-					if (e.pair) e.pair->state = PairState::Failed;
+					if (e.pair) {
+						e.pair->state = PairState::Failed;
+						resetNomination(*e.pair);
+					}
 					// Arm the next frozen pair so connectivity checks continue.
 					if (e.type == StunEntryType::Check) {
 						armNextFrozenPair();
@@ -3778,6 +5053,7 @@ namespace stice::ice {
 				if (e.pair && e.pair->consentExpiry <= now) {
 					// Consent expired.
 					e.pair->state = PairState::Failed;
+					resetNomination(*e.pair);
 					e.state = StunEntryState::Failed;
 					continue;
 				}
@@ -3819,8 +5095,14 @@ namespace stice::ice {
 		// Controlling-side nomination. Only arm once — after arming, the entry
 		// loop handles retransmissions. Re-arming every cycle would reset the
 		// transaction ID, causing the peer's response to never match.
+		// RFC 8445 §8.1.1: while a nomination is active (nominatedPair_ set) no
+		// second nomination may be triggered, even if updateState drifted
+		// selectedPair_ to a fresher higher-priority succeeded pair — selecting
+		// a data path is not nominating it. Only the opt-in renomination draft
+		// may switch.
 		if (mode_ == AgentMode::Controlling && selectedPair_ &&
-			!selectedPair_->nominated && !selectedPair_->nominationRequested) {
+			!selectedPair_->nominated && !selectedPair_->nominationRequested &&
+			(!nominatedPair_ || renominationAllowed())) {
 			// Aligned with pion-ice ContactCandidates (selection.go L74-84):
 			// nominate when the best valid pair is nominatable (both local and
 			// remote have exceeded their acceptance min wait since checking
@@ -3828,12 +5110,27 @@ namespace stice::ice {
 			// == 0) AND the pair is nominatable, to avoid waiting indefinitely
 			// if no better pairs can appear.
 			bool should_nominate = false;
-			if (pairingCfg_.nomination_mode == IceNominationMode::AGGRESSIVE) {
+			// RFC 6544 §8: regular nomination is required when TCP candidates are
+			// present; aggressive nomination is not defined for them. The decision
+			// must key on the LOCAL candidate set, not on pairs_: during trickle
+			// there is a window where a local TCP candidate exists but the remote
+			// candidate (and therefore the pair) has not arrived yet, and an
+			// aggressive nomination in that window would violate the MUST.
+			IceNominationMode nomMode = pairingCfg_.nomination_mode;
+			if (nomMode == IceNominationMode::AGGRESSIVE) {
+				for (const auto& c : local_.candidates) {
+					if (c.transport != CandidateTransport::UDP) {
+						nomMode = IceNominationMode::REGULAR;
+						break;
+					}
+				}
+			}
+			if (nomMode == IceNominationMode::AGGRESSIVE) {
 				// Aggressive: nominate as soon as the pair is nominatable,
 				// without waiting for better pairs. Matches pion-ice default.
 				should_nominate = isNominatable(selectedPair_);
 			}
-			else if (pairingCfg_.nomination_mode == IceNominationMode::REGULAR_STABLE_CHECK &&
+			else if (nomMode == IceNominationMode::REGULAR_STABLE_CHECK &&
 				pairIsTcpRelay(selectedPair_)) {
 				// Regular-stable-check: for TCP-relay pairs, require a
 				// stability precheck window to elapse since the pair became
@@ -3874,7 +5171,7 @@ namespace stice::ice {
 			// succeeds later (e.g. candidates arriving via trickle), so early
 			// locking never sticks to a suboptimal link.
 			bool tcp_relay_precheck_path =
-				pairingCfg_.nomination_mode == IceNominationMode::REGULAR_STABLE_CHECK &&
+				nomMode == IceNominationMode::REGULAR_STABLE_CHECK &&
 				pairIsTcpRelay(selectedPair_);
 			if (!should_nominate && !tcp_relay_precheck_path) {
 				StunEntry* sel = findEntry(selectedPair_);
@@ -3895,11 +5192,21 @@ namespace stice::ice {
 				if (e) armTransmission(*e, 0);
 			}
 		}
-		// Once a pair is nominated, freeze all other pending pairs.
+		// Once a pair is nominated, freeze all other pending pairs and cancel
+		// their in-flight checks (RFC 8445 §8.1.2: once a pair is nominated,
+		// connectivity checks are no longer needed). Leaving the entries Pending
+		// kept retransmitting for the whole STUN timeout window (~31.5 s) after
+		// nomination — a pointless check storm during the handshake tail.
 		if (nominatedPair_) {
 			for (auto& p : pairs_) {
 				if (p.get() != nominatedPair_ && p->state == PairState::Pending)
 					p->state = PairState::Frozen;
+			}
+			for (auto& e : entries_) {
+				if (e.type == StunEntryType::Check && e.pair != nominatedPair_ &&
+					e.state == StunEntryState::Pending) {
+					e.state = StunEntryState::Cancelled;
+				}
 			}
 		}
 		updateState();
@@ -3976,6 +5283,14 @@ namespace stice::ice {
 		}
 	}
 	void Agent::armNextFrozenPair() {
+		// RFC 8445 §8.1.2: once a pair has been nominated the controlling agent
+		// MUST cancel the remaining checks. A failure callback still reaches
+		// this function, and without the guard it would re-arm a Frozen pair
+		// that survived cancelAllEntries and restart checks after nomination.
+		if (nominatedPair_) {
+			STICE_LOG_DEBUG("armNextFrozenPair: pair already nominated, not arming further checks");
+			return;
+		}
 		// PHASED_UDP_FIRST: gate TCP-relay pairs until the UDP phase ends.
 		maybeEnterTcpPhase();
 		// Refresh early-phase window state. The window opens on transition
@@ -4047,14 +5362,18 @@ namespace stice::ice {
 			bool found = false;
 			for (auto& ce : entries_)
 				if (ce.pair == np) { found = true; break; }
-			if (!found && entries_.size() < MaxStunEntries) {
+			if (!found && (entries_.size() < MaxStunEntries || reclaimDeadEntries())) {
 				StunEntry ne;
 				ne.type = StunEntryType::Check;
 				ne.state = StunEntryState::Pending;
 				ne.pair = np;
 				ne.record = np->remote->resolved;
 				ne.mode = mode_;
-				armTransmission(ne, StunPacingTimeMs);
+				// RFC 8445 §6.1.4: consecutive checks are paced by Ta. When a
+				// mode arms several pairs in one pass (strict / limited-concurrent
+				// / phased), stagger them by Ta so they do not all fire on the
+				// same tick and flood the peer with a simultaneous check burst.
+				armTransmission(ne, StunPacingTimeMs * static_cast<int>(armed + 1));
 				entries_.push_back(std::move(ne));
 				++armed;
 				if (armed >= budget) break;
@@ -4065,6 +5384,53 @@ namespace stice::ice {
 		}
 	}
 	void Agent::updateState() {
+		// Agent-level Checking ceiling (pion agent.go:696): while CONNECTING and
+		// no pair has succeeded, cap the whole phase at 30 s regardless of PAC.
+		// A peer that never answers and never signals end-of-candidates would
+		// otherwise hold the session in CONNECTING for the full 31.5 s PAC window
+		// before FAILED. Checking starts when CONNECTING is entered
+		// (checkingStartTime_), so this only bounds the check phase itself.
+		if (state_ == STICE_STATE_CONNECTING &&
+			checkingStartTime_.time_since_epoch().count() != 0) {
+			auto checkingElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now() - checkingStartTime_);
+			if (checkingElapsed.count() >= MaxCheckingWallMs) {
+				bool anySucceeded = false;
+				for (const auto& p : pairs_)
+					if (p->state == PairState::Succeeded) { anySucceeded = true; break; }
+				if (!anySucceeded) {
+					STICE_LOG_WARN("updateState: checking phase exceeded %dms with no succeeded pair; failing",
+						MaxCheckingWallMs);
+					pacDeadline_ = {};
+					changeState(STICE_STATE_FAILED);
+					return;
+				}
+			}
+		}
+		// RFC 8445 §8.1.1/§8.1.2: the nominated pair is the single active path.
+		// A nomination whose pair is no longer Succeeded must be released:
+		// keeping the pointer would keep the §8.1.2 freeze active forever (every
+		// other pair stays Frozen, every other check entry stays Cancelled),
+		// block armNextFrozenPair via its nominatedPair_ guard and block
+		// pruneFailedPairs from recycling the dead pair — a consent-expiry or
+		// check-failure redial could then never recover.
+		if (nominatedPair_ && nominatedPair_->state != PairState::Succeeded) {
+			CandidatePair* dead = nominatedPair_;
+			STICE_LOG_WARN("Agent: nominated pair no longer succeeded (%s), releasing nomination",
+				dead->remote ? dead->remote->resolved.toString().c_str() : "?");
+			nominatedPair_ = nullptr;
+			if (selectedPair_ == dead) selectedPair_ = nullptr;
+			// Cancelled check entries (frozen by §8.1.2 when the nomination was
+			// made) can never fire again; drop them so armNextFrozenPair re-arms
+			// the frozen pairs with fresh entries.
+			for (auto it = entries_.begin(); it != entries_.end();) {
+				if (it->type == StunEntryType::Check && it->state == StunEntryState::Cancelled)
+					it = entries_.erase(it);
+				else
+					++it;
+			}
+			armNextFrozenPair();
+		}
 		// Find best succeeded pair. Under STICKY_SELECTED, if the previously
 		// selected pair was a TCP-relay link, prefer remaining TCP-relay
 		// valid pairs over higher-priority UDP pairs — this keeps the link
@@ -4099,9 +5465,18 @@ namespace stice::ice {
 				: best_udp;
 		}
 		if (best) {
-			selectedPair_ = best;
-			if (best->nominated) {
-				nominatedPair_ = best;
+			// RFC 8445 §8.1.1: while a nomination is active the data path stays
+			// on it. Unconditionally drifting selectedPair_ to a fresher
+			// higher-priority succeeded pair moves media onto a path the peer
+			// never accepted — and, together with the periodic nomination
+			// block, used to trigger an illegal second nomination.
+			if (nominatedPair_ && nominatedPair_->state == PairState::Succeeded &&
+				!renominationAllowed())
+				selectedPair_ = nominatedPair_;
+			else
+				selectedPair_ = best;
+			if (selectedPair_->nominated) {
+				nominatedPair_ = selectedPair_;
 				if (state_ == STICE_STATE_CONNECTING) {
 					changeState(STICE_STATE_CONNECTED);
 					changeState(STICE_STATE_COMPLETED);
@@ -4109,10 +5484,73 @@ namespace stice::ice {
 				else if (state_ == STICE_STATE_CONNECTED) {
 					changeState(STICE_STATE_COMPLETED);
 				}
+				else if (state_ == STICE_STATE_DISCONNECTED &&
+					disconnectedAt_.time_since_epoch().count() != 0) {
+					// Revival inside the disconnect grace window (#10): a TCP
+					// redial or a late check brought a nominated pair back.
+					disconnectedAt_ = {};
+					changeState(STICE_STATE_COMPLETED);
+				}
+				closeUnselectedTcpConns();
 			}
 			else {
 				if (state_ == STICE_STATE_CONNECTING) changeState(STICE_STATE_CONNECTED);
+				else if (state_ == STICE_STATE_DISCONNECTED &&
+					disconnectedAt_.time_since_epoch().count() != 0) {
+					disconnectedAt_ = {};
+					changeState(STICE_STATE_CONNECTED);
+				}
 			}
+			return;
+		}
+		// A TCP dial in flight means a pair can still materialise: ICE-TCP only
+		// creates the pair once the TCP connection is up and the first STUN check
+		// arrives, so pairs_ is legitimately empty right after both sides finish
+		// gathering. Failing fast here aborted a connect that completed
+		// milliseconds later (observed as tcp-ice never connecting).
+		bool tcpDialPending = false;
+		for (const auto& c : tcpConns_) {
+			if (!c.transport) {
+				if (c.reconnectPending) { tcpDialPending = true; break; }
+				continue;
+			}
+			const auto st = c.transport->state();
+			if (st == net::TcpState::Connecting || st == net::TcpState::TlsHandshaking ||
+				st == net::TcpState::Connected) {
+				tcpDialPending = true;
+				break;
+			}
+		}
+		// The passive side of ICE-TCP owns no direct connection: the TCPMux holds
+		// the accepted connection. While this agent's passive candidate is
+		// registered with the mux, the peer can still dial in and create a pair,
+		// so an empty checklist is not terminal here either.
+		const bool tcpInboundPossible = tcpMux_ != nullptr && tcpMuxRegistered_;
+		// Both sides have declared end-of-candidates and no pair exists at all:
+		// no further candidate can appear (an in-flight mDNS resolution or a TCP
+		// dial is the only exception), so waiting out the PAC window would just
+		// delay a certain failure by 31.5 s.
+		if (pairs_.empty() && gatheringDone_ && remoteGatheringDone_ &&
+			pendingMdnsResolutions_ == 0 && !tcpDialPending) {
+			if (!tcpInboundPossible) {
+				pacDeadline_ = {};
+				STICE_LOG_WARN("updateState: no pairs and both sides finished gathering; failing fast");
+				if (state_ == STICE_STATE_CONNECTING) changeState(STICE_STATE_FAILED);
+				return;
+			}
+			// Passive ICE-TCP: the peer may still dial our listener, so give the
+			// inbound connection one PAC window before declaring failure.
+			auto now = std::chrono::steady_clock::now();
+			if (pacDeadline_.time_since_epoch().count() == 0) {
+				pacDeadline_ = now + std::chrono::milliseconds(IcePacTimeoutMs);
+				STICE_LOG_DEBUG("updateState: ICE-TCP passive listener waiting %dms for inbound connection",
+					IcePacTimeoutMs);
+				return;
+			}
+			if (now < pacDeadline_) return;
+			pacDeadline_ = {};
+			STICE_LOG_WARN("updateState: ICE-TCP passive listener saw no inbound connection; failing");
+			if (state_ == STICE_STATE_CONNECTING) changeState(STICE_STATE_FAILED);
 			return;
 		}
 		// No succeeded pair. Check if all pairs failed.
@@ -4130,10 +5568,17 @@ namespace stice::ice {
 		// Running, a checklist with no pairs left to check MUST NOT be moved to
 		// Failed immediately - a peer-reflexive pair can still be discovered from
 		// inbound traffic (and trickled remote candidates may still arrive). Wait
-		// for one connectivity-check transaction timeout (39.5 s, the RFC's
+		// for one connectivity-check transaction timeout (31.5 s, the RFC's
 		// RECOMMENDED duration) instead. This is what IcePacTimeoutMs - declared
 		// but never used - was for.
-		if (state_ == STICE_STATE_CONNECTING) {
+		//
+		// The patience only makes sense while new pairs are still possible. Once
+		// the remote has declared end-of-candidates (and no local mDNS resolution
+		// or TCP dial is outstanding) no further pair can appear, so failing
+		// immediately is both correct and avoids a pointless 31.5 s wait.
+		const bool morePairsPossible = !remoteGatheringDone_ ||
+			pendingMdnsResolutions_ > 0 || tcpDialPending;
+		if (state_ == STICE_STATE_CONNECTING && morePairsPossible) {
 			auto now = std::chrono::steady_clock::now();
 			if (pacDeadline_.time_since_epoch().count() == 0) {
 				pacDeadline_ = now + std::chrono::milliseconds(IcePacTimeoutMs);
@@ -4147,13 +5592,35 @@ namespace stice::ice {
 		}
 		// Transition to FAILED from CONNECTING, CONNECTED, or COMPLETED.
 		// Consent expiry can cause all pairs to fail even after connection
-		// was established — aligned with pion-ice (Connected→Disconnected→Failed).
-		// Post-connection failures are deliberately NOT patient: RFC 8863's PAC
-		// timer governs the Running state, and a nominated pair that has lost
-		// consent must fail promptly (RFC 8445 §11 / RFC 7675 §6).
-		if (state_ == STICE_STATE_CONNECTING ||
-			state_ == STICE_STATE_CONNECTED ||
-			state_ == STICE_STATE_COMPLETED) {
+		// was established. CONNECTING stays immediate: RFC 8863's PAC timer
+		// governs the Running state, and a connect that never formed must fail
+		// promptly. Post-connection loss reports DISCONNECTED first (#10,
+		// pion-aligned lifecycle) and holds a short grace window before the
+		// terminal FAILED, so the application can observe the loss and an
+		// in-flight TCP redial can revive the session (recovery branch above).
+		if (state_ == STICE_STATE_CONNECTING) {
+			changeState(STICE_STATE_FAILED);
+			return;
+		}
+		// Grace re-entry: after the first report state_ is DISCONNECTED, so the
+		// pre-loss states alone would never re-arm this branch. Gate on the
+		// timestamp — it is only non-zero for a post-connection loss (initial
+		// and post-restart DISCONNECTED both carry pairs_ empty and exit above).
+		const bool postConnectLoss =
+			state_ == STICE_STATE_CONNECTED || state_ == STICE_STATE_COMPLETED ||
+			(state_ == STICE_STATE_DISCONNECTED &&
+			 disconnectedAt_.time_since_epoch().count() != 0);
+		if (postConnectLoss) {
+			const auto now = std::chrono::steady_clock::now();
+			if (disconnectedAt_.time_since_epoch().count() == 0) {
+				disconnectedAt_ = now;
+				STICE_LOG_WARN("updateState: all pairs lost after connect; reporting DISCONNECTED (grace %dms)",
+					DisconnectedGraceMs);
+				changeState(STICE_STATE_DISCONNECTED);
+				return;
+			}
+			if (now - disconnectedAt_ < std::chrono::milliseconds(DisconnectedGraceMs)) return;
+			disconnectedAt_ = {};
 			changeState(STICE_STATE_FAILED);
 		}
 	}
@@ -4300,7 +5767,8 @@ int Agent::sendViaSelectedPair(const char* data, std::size_t size, int ds) {
 			// UDPMux interleave their marks (and the trailing reset clobbers a
 			// concurrent set).
 			int n = mux_
-				? mux_->sendtoWithDiffserv(data, size, selectedPair_->remote->resolved, ds)
+				? mux_->sendtoWithDiffserv(data, size, selectedPair_->remote->resolved, ds,
+				                           local_.iceUfrag)
 				: sock_.sendtoWithDiffserv(data, size, selectedPair_->remote->resolved, ds);
 			if (n < 0) return -sticeSockerrno;
 			return n;

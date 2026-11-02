@@ -407,10 +407,69 @@ std::string randomStr64(std::size_t len) {
 	return s;
 }
 
+namespace {
+// RFC 8265 §4.2 OpaqueString preparation (the subset that does not require a
+// Unicode NFC table): map every non-ASCII space to SP, drop control characters,
+// then trim leading/trailing spaces. Usernames and passwords in STUN are
+// opaque UTF-8 strings; preparing them keeps key derivation consistent for
+// non-ASCII credentials. Full NFC normalization still requires an ICU-class
+// library, so a credential that is not already NFC is not folded here.
+std::string opaqueStringPrepare(const std::string &in) {
+	std::string out;
+	out.reserve(in.size());
+	for (std::size_t i = 0; i < in.size();) {
+		unsigned char c = static_cast<unsigned char>(in[i]);
+		if (c < 0x80) {
+			// C0 controls (including NUL) are prohibited by RFC 8265 §4.2.
+			if (c < 0x20 || c == 0x7F) { ++i; continue; }
+			out.push_back(static_cast<char>(c));
+			++i;
+			continue;
+		}
+		// Decode one UTF-8 code point.
+		std::size_t len = 0;
+		std::uint32_t cp = 0;
+		if ((c & 0xE0) == 0xC0) { len = 2; cp = c & 0x1F; }
+		else if ((c & 0xF0) == 0xE0) { len = 3; cp = c & 0x0F; }
+		else if ((c & 0xF8) == 0xF0) { len = 4; cp = c & 0x07; }
+		bool valid = len != 0 && i + len <= in.size();
+		for (std::size_t k = 1; valid && k < len; ++k) {
+			unsigned char cc = static_cast<unsigned char>(in[i + k]);
+			if ((cc & 0xC0) != 0x80) valid = false;
+			else cp = (cp << 6) | (cc & 0x3F);
+		}
+		if (!valid) { ++i; continue; }
+		// Unicode White_Space code points outside ASCII.
+		const bool unicodeSpace =
+			cp == 0x00A0 || (cp >= 0x2000 && cp <= 0x200A) || cp == 0x2028 ||
+			cp == 0x2029 || cp == 0x202F || cp == 0x205F || cp == 0x3000;
+		// C1 controls are also prohibited.
+		const bool c1Control = cp >= 0x0080 && cp <= 0x009F;
+		if (unicodeSpace) out.push_back(' ');
+		else if (!c1Control) out.append(in, i, len);
+		i += len;
+	}
+	// Trim.
+	std::size_t begin = 0, end = out.size();
+	while (begin < end && out[begin] == ' ') ++begin;
+	while (end > begin && out[end - 1] == ' ') --end;
+	return out.substr(begin, end - begin);
+}
+} // namespace
+
 std::array<unsigned char, MD5_SIZE> longTermKey(const std::string &username, const std::string &realm,
                                                 const std::string &password) {
-	std::string combined = username + ":" + realm + ":" + password;
+	std::string combined = opaqueStringPrepare(username) + ":" + realm + ":" +
+	                       opaqueStringPrepare(password);
 	return md5(reinterpret_cast<const unsigned char *>(combined.data()), combined.size());
+}
+
+std::array<unsigned char, SHA256_SIZE> longTermKeySha256(const std::string &username,
+                                                         const std::string &realm,
+                                                         const std::string &password) {
+	std::string combined = opaqueStringPrepare(username) + ":" + realm + ":" +
+	                       opaqueStringPrepare(password);
+	return sha256(reinterpret_cast<const unsigned char *>(combined.data()), combined.size());
 }
 
 } // namespace stice::crypto

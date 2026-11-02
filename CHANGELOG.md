@@ -1,3 +1,203 @@
+## [0.14.1] - 2026-11-02
+
+The post-0.14.0 hardening pass: the remaining pion reconnect-audit items land,
+ICE restart gets the test coverage it was missing, and UDPMux learns to
+attribute loopback traffic per packet instead of by a "last sender" guess.
+
+### Fixed
+
+- **CONNECTION-BIND is a full citizen.** The request now carries 0x001D
+  PASSWORD-ALGORITHM like every other authenticated transaction, and the
+  success response is verified — MESSAGE-INTEGRITY (dual-algorithm) and
+  FINGERPRINT — with the data connection closed on a mismatch. The client used
+  to accept any success response on the data connection.
+- **Nomination flags do not survive a failed pair.** A pair that reached
+  Failed and was later revived (TCP redial, a plain peer check) kept
+  `nominated` / `nominationRequested` / `nominationValue`, so the controlled
+  side could return to COMPLETED without a fresh USE-CANDIDATE. Every Failed
+  exit and both revival paths now clear them.
+- **A description from a retired ICE generation is ignored.** Signalling can
+  deliver a peer's SDP out of order; applying the older generation after a
+  newer one had been accepted looked like another credential change and
+  restarted the agent a second time, tearing down a converging checklist. The
+  last applied generation and the superseded ones are remembered, and a
+  retired generation is dropped (the most recent one is still accepted, so a
+  peer that takes our restart without restarting itself keeps working).
+- **Relay entries are reclaimed from the STUN table.** Only Check entries were
+  ever erased, so a long session's table only grew until `MaxStunEntries` and
+  a newly learned valid pair got no entry (and therefore no consent keepalive).
+  Relay entries whose allocation is terminal (Failed / Deallocated) and has no
+  transaction in flight are now reclaimed as well.
+- **Inbound application data refreshes consent** on the pair that carried it —
+  a one-way media stream is live traffic as well (extends the RFC 7675
+  mutual-liveness fix from 0.14.0).
+- **mDNS de-duplication is per generation.** `resetChecklist()` clears the
+  query keys, so a `.local` candidate re-signalled in the new generation is
+  resolved instead of being suppressed as a duplicate of the old generation's
+  still-unanswered query.
+- **stserver emits 446 (Connection Already Exists).** A CONNECT for a peer
+  that already has an established data connection is answered with 446
+  (RFC 6062 §5.3.5) instead of stacking a second pending connect.
+- **The ALLOCATE 486/508/300 backoff is a real 1 s → 2 s ±20 % exponential
+  deferral** (`nextAllocateRetryAt_`, driven by `tick()`, capped by
+  `MaxAllocateRetries`) — 0.14.0 claimed a backoff the code did not actually
+  implement; the immediate re-send is gone and 300 without a redirect handler
+  no longer loops against the same server.
+- **A rejected TCPMux connection is no longer bound to an agent.** The agent
+  was attached before the capacity check, so an over-limit connection stayed
+  associated with this agent while its ufrag still resolved here — a window in
+  which the poll thread could hand it another agent's packets. The agent is
+  attached only after the connection is accepted.
+- **UDPMux no longer holds its lock across agent callbacks.** `nextTimestampMs`
+  invoked the agents' timer queries while holding the mux mutex; the mux poll
+  thread runs that path every iteration, and an agent thread holding its own
+  mutex while re-entering the mux (restart's deregister/re-register, sends)
+  completed the cycle — an AB-BA deadlock that wedged ICE restart behind a
+  shared UDPMux. Like `onBookkeeping`/`routePacket`, it now snapshots the
+  entries and calls out only after the lock is released.
+- **UDPMux attributes loopback app data per packet.** The address map doubled
+  as the "last loopback sender" table, and a STUN fast-path registration could
+  write the *destination* agent under the mux's own address key — after a
+  restart, loopback broadcasts then excluded the wrong agent indefinitely.
+  Worse, even a correct single "last sender" misattributes under concurrent
+  senders: the first agent's packet is still in flight when the second agent's
+  send overwrites the attribution, so the first packet broadcasts as if the
+  second agent sent it. Loopback sends now enqueue a (send-time, sender)
+  record and the matching recvfrom pairs FIFO — a shared socket delivers
+  loopback datagrams in send order — with a 50 ms expiry valve; the address
+  map only ever holds remote addresses again.
+- **Peer-reflexive candidates take the advertised priority.** A locally learned
+  prflx candidate copied the checking candidate's priority instead of the
+  PRIORITY attribute the check carried (RFC 8445 §7.2.5.3.2), which ordered
+  those pairs differently from what the peer computed.
+- **A failed redial campaign fails the pairs it backed.** Giving up on a TCP
+  redial (attempt or wall-clock budget exhausted) closed the transport but left
+  the pairs in their previous state, so a later nomination or selection could
+  pick a link with no transport behind it.
+- **Restart re-syncs the advertised trickle option.** `local_.trickleEnabled`
+  was set once at init, so a restart after a config change kept describing the
+  new generation with the old trickle mode.
+
+### Changed
+
+- README registers the documented deviations that were previously only in code
+  comments: the 5 s UDP consent cadence (the low-power profile's 15 s had too
+  little margin under the 30 s timeout), the 30 s check wall clock versus the
+  31.5 s per-transaction / PAC budget, and 400 as a terminal check error while
+  401/500 retry twice.
+- Removed the unused `MaxStunServerRetransmissions` constant and a stray UTF-8
+  BOM at the head of `pairing_strategy.cpp`.
+
+### Verified
+
+- Full ctest regression 26/26 on both Windows (OpenSSL) and the Linux VM
+  (OpenSSL) from the same tree, including the new restart coverage
+  (same-generation re-delivery, shared-UDPMux restart isolation, ICE-TCP mux
+  re-registration) and the stserver 446 unit case.
+- 2 h dual-platform four-mode soak at 128 MiB/s aggregate (Windows 32 ×
+  4 MiB/s, Linux 16 × 8 MiB/s, byte-exact zero loss, own-host stserver);
+  closes the two soak failures of the previous campaign — the Linux udpturn
+  80 MB loss and the Windows tcpturn startup wedge.
+
+## [0.14.0] - 2026-11-01
+
+Password agility (RFC 8489) lands end to end, the ICE agent closes the gaps the
+pion reconnect audit surfaced, RFC 8445 §9 peer-restart detection makes restart
+actually usable, and mDNS goes dual-stack. `stice_agent_restart` joins the C
+API. The wire-level changes are RFC-conformance fixes; the reconnect work adds
+bounded retries and wall caps where the old code either failed instantly or
+retried forever.
+
+### Added
+
+- **RFC 8489 password agility, client and server.** The client sends 0x001D
+  PASSWORD-ALGORITHM on Allocate and on long-credential Binding, and both sides
+  speak 0x8002 PASSWORD-ALGORITHMS in the RFC 8489 §14.1 entry format
+  (alg 2 B + paramLen 2 B + params padded to 4 B) — the old flat TLV misparsed
+  across stacks. stserver advertises MD5 + SHA-256 in its 401/438 challenges on
+  UDP and TCP alike (RFC 9.2.4) and mirrors the algorithm a signed request used
+  (§9.2.2). Usernames and passwords get RFC 8265 §4.2 OpaqueString preparation
+  (space mapping, control-character drop, trim) so non-ASCII credentials derive
+  the same key on both ends.
+- **RFC 8445 §9 peer-restart detection.** `setRemoteDescription` notices a peer
+  ufrag/pwd change and restarts implicitly; a `restartingLocally_` flag keeps
+  the fresh local credentials from bouncing the restart handshake back (no
+  ping-pong). The checklist is reset *before* `remote_` is replaced — pairs
+  hold bare pointers into its candidates — and restart() re-registers the agent
+  with the UDPMux/TCPMux under the new ufrag, resets the relay data-connection
+  rebind state, clears remote credentials, and runs the fresh gathering pass
+  itself, so the old "call gather after restart" contract is gone (double
+  gather returned -2).
+- **`stice_agent_restart` in the C API.**
+- **Dual-stack mDNS.** The resolver joins ff02::fb on every usable interface
+  (RFC 6762 §15.1) and runs a second IPv6 socket, so AAAA queries are both sent
+  and answered; failure to join degrades to IPv4-only rather than erroring.
+
+### Fixed
+
+- **Consent freshness is bidirectional.** Only outbound checks refreshed
+  consent, so a peer that received media but sent no checks expired its own
+  consent at 30 s while the link was healthy. Inbound Binding Requests that
+  pass integrity now refresh `consentExpiry` too (RFC 7675 consent proves
+  *mutual* liveness).
+- **The ALLOCATE retry matrix is bounded instead of one-shot.** 437 releases
+  the stale allocation first, with the Refresh(0) teardown serialized behind
+  `teardownRetryPending_` so a late teardown cannot delete the *new* allocation;
+  486/508/300 retry with backoff inside a wall-clock budget, and 300 without a
+  redirect handler no longer loops against the same server.
+- **Binding error responses get a retry buffer.** A 401/500 on a connectivity
+  check used to fail the pair immediately; it now retries twice
+  (`errorRetries`) before giving up.
+- **Checking has a wall cap.** A checklist with no succeeded pair fails at 30 s
+  instead of burning the full retransmission budget per pair (pion-aligned);
+  the COMPAT strategy's per-check retransmission count went 6→7 so its total
+  RTO budget reaches 31.5 s.
+- **Post-connection loss reports DISCONNECTED before FAILED.** A 5 s grace
+  window lets a blip bounce back to CONNECTED/COMPLETED on the next success;
+  the state guard accepts a DISCONNECTED state with a running grace timestamp,
+  without which FAILED could never fire.
+- **TCP redial gets ±20 % jitter and a 60 s total wall budget** — no
+  synchronized retry storms, no infinite redial loop.
+- **TCPMux no longer blocks the event loop.** A rejected inbound waited on a
+  2 s sync() inside the poll thread's own dispatch; destruction is deferred to
+  a cleanup queue reaped outside it, so one bad connection can't stall every
+  agent sharing the mux.
+- **ChannelData conformance.** The UDP form adds no padding (RFC 8656 §12.5),
+  the legacy 0x4000–0x7FFF range still parses on receive while allocation stays
+  within 0x4000–0x4FFF (§12.1), and the TCP frame reassembly buffer is bounded
+  so a peer flooding partial frames can't grow it without limit.
+- **ICE-TCP active candidates signal port 9** in SDP (RFC 6544 §4.5) — an
+  active candidate doesn't know its local port until it connects.
+- **Mbed TLS fails closed without a CA bundle** instead of downgrading to
+  VERIFY_NONE; an explicit skip_tls_verify opt-out is still honoured.
+- **mDNS deadlock removed.** `recordsMutex_` and `queriesMutex_` were taken in
+  opposite orders between the answer path and the resolver callbacks; answers
+  are now collected under the records lock and dispatched outside both (the
+  timeout path likewise).
+- **The libjuice bench counted in-flight residual as loss.** The send loop
+  exits at `received >= sent − window`; sampling at the 95 % threshold right
+  after recorded up to one window of still-airborne packets as lost (the
+  signature was loss == window). It now waits for full receipt before
+  sampling: 20 000/20 000 at both window sizes against stserver.
+- **`test_longrun_4mode` is registered in ctest at smoke scale** (10 clients ×
+  4 MiB/s × 60 s) — the driver's 100 × 10 MiB/s × 3 h defaults ran at ctest
+  time and failed within a minute at any realistic host capacity; the real
+  3 h four-mode soak stays in the regress flow.
+
+### Changed
+
+- Non-trickle SDP advertises `a=ice-options:ice2`.
+
+### Verified
+
+- Full ctest regression green on Windows, including the new restart (6/6
+  repeats), 401-retry, grace-window and ChannelData cases; the two historical
+  reds are non-regressions and are addressed above (driver defaults) or
+  re-attributed to client CPU density (`stress_mixed` at 1000 pairs).
+- 3 h dual-platform four-mode soak at 128 MiB/s aggregate (Windows 32 ×
+  4 MiB/s, Linux 16 × 8 MiB/s, byte-exact zero loss, own-host stserver) is the
+  release gate and runs separately from this commit.
+
 ## [0.13.1] - 2026-10-30
 
 TCP relay media is sharded across dedicated data threads on the server, and a

@@ -58,6 +58,12 @@ std::array<unsigned char, MD5_SIZE> longTermKey(const std::string &username,
                                                 const std::string &realm,
                                                 const std::string &password);
 
+// RFC 8489 §9.2.2: the long-term key for MESSAGE-INTEGRITY-SHA256 is
+// SHA-256(username:realm:password) instead of the MD5 form above.
+std::array<unsigned char, SHA256_SIZE> longTermKeySha256(const std::string &username,
+                                                         const std::string &realm,
+                                                         const std::string &password);
+
 } // namespace stice::crypto
 
 #endif

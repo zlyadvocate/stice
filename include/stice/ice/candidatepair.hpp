@@ -42,17 +42,24 @@ struct CandidatePair {
 	// pairPriority = 2^32 * MIN(G,D) + 2 * MAX(G,D) + (G > D ? 1 : 0)
 	// where G is the controlling priority and D is the controlled priority.
 	//
-	// Note: pion-ice (candidatepair.go priority()) uses (2^32 - 1) instead of
-	// 2^32 to avoid uint64 overflow when both G and D are maxUint32. We align
-	// with pion-ice for bit-level numeric compatibility. In practice candidate
-	// priorities never reach maxUint32, so ordering is unaffected.
+	// The RFC formula is used verbatim (2^32, not 2^32-1). Candidate priorities
+	// built by the RFC 8445 §5.1.2.2 formula are bounded by (126<<24)|(65535<<8)
+	// < 2^31, so 2^32*MIN stays below 2^63 and cannot overflow uint64. A remote
+	// priority is attacker-controlled SDP input, so it is clamped to 2^31-1 to
+	// keep the arithmetic in range without changing the ordering of legitimate
+	// candidates.
 	static std::uint64_t computePriority(std::uint32_t localPriority,
 	                                     std::uint32_t remotePriority, bool localIsControlling) {
-		std::uint64_t g = localIsControlling ? localPriority : remotePriority;
-		std::uint64_t d = localIsControlling ? remotePriority : localPriority;
+		constexpr std::uint32_t MaxReasonablePriority = 0x7FFFFFFFu;
+		std::uint64_t g = localIsControlling
+			? (localPriority > MaxReasonablePriority ? MaxReasonablePriority : localPriority)
+			: (remotePriority > MaxReasonablePriority ? MaxReasonablePriority : remotePriority);
+		std::uint64_t d = localIsControlling
+			? (remotePriority > MaxReasonablePriority ? MaxReasonablePriority : remotePriority)
+			: (localPriority > MaxReasonablePriority ? MaxReasonablePriority : localPriority);
 		std::uint64_t min = g < d ? g : d;
 		std::uint64_t max = g > d ? g : d;
-		return ((1ull << 32) - 1) * min + (max << 1) + (g > d ? 1 : 0);
+		return (min << 32) + (max << 1) + (g > d ? 1 : 0);
 	}
 
 	void updatePriority(bool localIsControlling) {

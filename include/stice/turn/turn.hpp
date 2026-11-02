@@ -36,13 +36,28 @@
 
 namespace stice::turn {
 
-// Retransmission parameters aligned with pion-turn (transaction.go / client.go).
-// RTO starts at 200ms, doubles each retransmit, capped at 1600ms, max 7 retries.
-constexpr int TurnRtoMs = 200;
-constexpr int TurnMaxRtxIntervalMs = 1600;
+// Retransmission parameters aligned with RFC 8489 §6.2.1 (the STUN transaction
+// model TURN reuses): initial RTO 500 ms, doubling, capped at 8 s, Rc=7
+// retransmissions. The full budget is 0.5+1+2+4+8+8+8 = 31.5 s (the "39.5 s"
+// this comment used to quote was the Rc=6-era figure), matching the standalone
+// STUN client and the RFC's recommended transaction tail.
+constexpr int TurnRtoMs = 500;
+constexpr int TurnMaxRtxIntervalMs = 8000;
 constexpr int TurnMaxRtxCount = 7;
+// CONNECT uses a longer transaction budget than the generic STUN transaction.
+// The TURN server may spend up to 30 s dialing the peer before it can answer a
+// CONNECT (RFC 6062 §4.3: "Connection Timeout or Failure"), so the generic
+// 31.5 s budget is extended to 32 s of wall-clock pacing for CONNECT (the
+// retransmit cadence itself follows RFC 8489 §6.2.1: initial RTO 500 ms,
+// doubling, capped at 8 s).
+constexpr int TurnConnectRtoMs = 500;
+constexpr int TurnConnectMaxRtxIntervalMs = 8000;
+constexpr int TurnConnectTimeoutMs = 32000;
 // Max 438 StaleNonce retries before giving up (prevents infinite nonce-refresh loops).
 constexpr int MaxNonceRetries = 3;
+// Bounded retries for RFC 8656 §10.2 recoverable Allocate errors
+// (300 Try Alternate / 437 Allocation Mismatch / 486 Quota / 508 Capacity).
+constexpr int MaxAllocateRetries = 2;
 
 enum class TurnTransport { UDP, TCP, TLS };
 
@@ -120,6 +135,10 @@ struct TurnSink {
 	// establish a TCP connection to the peer's relayed address. The agent
 	// should mark the candidate pair as Failed.
 	std::function<void(int errorCode, const std::string &reason, const net::AddrRecord &peer)> onConnectFailed;
+	// RFC 8489 §14.11: a 300 Try Alternate response redirected the Allocate.
+	// The owner must retarget subsequent sends to `alternate` before the client
+	// retries (otherwise the retry hits the same server again).
+	std::function<void(const net::AddrRecord &alternate)> onAlternateServer;
 };
 
 class Client {
@@ -166,9 +185,18 @@ public:
 	// refresh. Returns the next wake-up timestamp (ms since epoch), or 0
 	// if nothing is pending.
 	std::chrono::steady_clock::time_point tick();
+	// Test seam: run the same timer logic against a caller-supplied clock so
+	// long budgets (e.g. the 32 s CONNECT deadline) can be exercised without
+	// real-time sleeps.
+	std::chrono::steady_clock::time_point tick(std::chrono::steady_clock::time_point now);
 	std::chrono::steady_clock::time_point nextTick() const { return nextTick_; }
 
 	AllocState state() const { return state_; }
+	// True while any TURN transaction is still awaiting a response
+	// (Allocate/Refresh/CreatePermission/ChannelBind/CONNECT). The ICE agent
+	// uses this to veto relay-entry reclamation: a terminal allocation with an
+	// in-flight transaction can still fire its callback.
+	bool hasPendingTransaction() const { return !pending_.empty(); }
 	const net::AddrRecord &relayedAddr() const { return relayedAddr_; }
 	std::uint32_t lifetime() const { return lifetime_; }
 
@@ -195,6 +223,12 @@ public:
 	// After the server's success response, raw application data flows on
 	// that connection. Returns the encoded message (with MESSAGE-INTEGRITY).
 	std::vector<unsigned char> buildConnectionBindRequest(std::uint32_t connectionId);
+	// RFC 8489 §14.5 / RFC 6062 §6.3: verify a STUN response that arrives on a
+	// side channel (the data connection before it is bound) with the same
+	// credentials and FINGERPRINT policy as the control channel. Without this,
+	// an off-path peer could fake a CONNECTION-BIND success and the agent would
+	// start treating the connection as a trusted data tunnel.
+	bool verifySideChannelResponse(const stun::Message &m);
 
 private:
 	// Send a STUN request, applying long-term credentials if we have them.
@@ -239,6 +273,9 @@ private:
 	void handleDataIndication(const stun::Message &msg);
 	// Handle a ChannelData frame.
 	void handleChannelData(const unsigned char *data, std::size_t size);
+	// Verify MESSAGE-INTEGRITY on a TURN response once credentials are known.
+	// Before the first 401 challenge there is no key, so the check is skipped.
+	bool verifyResponseIntegrity(const stun::Message &m);
 	// Handle a CONNECT response (RFC 6062 active mode): extract CONNECTION-ID.
 	void handleConnectResponse(const stun::Message &msg, bool isError,
 	                           const net::AddrRecord &peer);
@@ -266,6 +303,20 @@ private:
 	AllocState state_ = AllocState::Idle;
 	std::optional<stun::Credentials> creds_;
 	int nonceRetries_ = 0; // 438 StaleNonce retry counter (reset on successful auth)
+	// RFC 8656 §10.2: bounded retries for recoverable Allocate failures
+	// (300 Try Alternate / 437 Allocation Mismatch / 486 Quota / 508 Capacity).
+	int allocRetries_ = 0;
+	// RFC 8656 §10.2: a recoverable Allocate error must not be re-sent
+	// immediately — a server that is crowded (486/508) or redirecting (300) would
+	// otherwise be hammered at round-trip speed. The retry is deferred by an
+	// exponential backoff (1s, 2s) with ±20% jitter so a fleet of clients does
+	// not re-synchronise on the same server.
+	std::chrono::steady_clock::time_point nextAllocateRetryAt_{};
+	// Clock seam: the poll loop drives tick(now) and then handles inbound
+	// responses for the same iteration, so the last tick timestamp is the
+	// natural "now" for response-driven timers. Keeping the two in one clock
+	// domain also lets tests drive the whole timer model with a synthetic clock.
+	std::chrono::steady_clock::time_point lastTickNow_{};
 	// onFailed is a terminal event for this allocation: the ICE agent decrements
 	// its pending-relay counter in the callback, so it must fire AT MOST ONCE.
 	// Set once we emit onFailed (auth failure, timeout, transport loss, refresh
@@ -283,6 +334,12 @@ private:
 	// continuous "REFRESH(method=4) -> ERROR(cls=2)" stream during teardown),
 	// grew pending_ without bound, and pinned the poll thread.
 	bool refreshTidFresh_ = false;
+	// 437-on-Allocate teardown serialization: set while a Refresh(0) that
+	// releases the stale allocation is in flight, so the Allocate retry is
+	// deferred until the teardown reaches a terminal state. A fire-and-forget
+	// teardown races the retry and can delete the FRESH allocation when it
+	// lands (or is re-sent after its own auth retry) after the retry succeeded.
+	bool teardownRetryPending_ = false;
 	std::chrono::steady_clock::time_point nextTick_{};
 	// Allocate transaction ID (for tracking the in-flight allocate).
 	std::array<unsigned char, 12> allocateTid_{};

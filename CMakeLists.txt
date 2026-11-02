@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.13)
 project(stice
-	VERSION 0.13.1
+	VERSION 0.14.1
 	LANGUAGES CXX C
 	DESCRIPTION "C++17 ICE + TURN client (ported from pion/webrtc), libjuice replacement"
 	HOMEPAGE_URL "https://github.com/zlyadvocate/stice")
@@ -243,8 +243,9 @@ function(stice_apply_common target_name)
 		# ws2_32: sockets. bcrypt: BCryptGenRandom, the CSPRNG in
 		# src/crypto/crypto.cpp (MSVC picks it up from the #pragma comment in
 		# that file, other toolchains such as MinGW-w64 need it on the link
-		# line).
-		target_link_libraries(${target_name} PUBLIC ws2_32 bcrypt)
+		# line). iphlpapi: GetAdaptersAddresses, used by src/net/mdns.cpp to
+		# join ff02::fb on every interface.
+		target_link_libraries(${target_name} PUBLIC ws2_32 bcrypt iphlpapi)
 	endif()
 	if(STICE_HAVE_OPENSSL)
 		target_compile_definitions(${target_name} PUBLIC STICE_HAVE_OPENSSL=1)
@@ -444,6 +445,16 @@ if (STICE_BUILD_TESTS)
         if (WIN32 AND STICE_HAVE_OPENSSL)
             target_link_libraries(${test_name} PRIVATE crypt32)
         endif()
-        add_test(NAME ${test_name} COMMAND ${test_name})
+        if (test_name STREQUAL "test_longrun_4mode")
+            # Driver-style soak tool (regress scripts pass explicit args, e.g.
+            # 32x4MiB x 3h). Registered bare it would run its 100x10MiB/s 3h
+            # defaults inside ctest - far past host capacity, consent starves
+            # and the run fails in <60s. Pin a smoke-scale invocation instead;
+            # the real 3h 4-mode longrun stays in the regress flow.
+            add_test(NAME ${test_name} COMMAND ${test_name}
+                --clients 10 --rate-mib 4 --duration-sec 60 --log warn)
+        else()
+            add_test(NAME ${test_name} COMMAND ${test_name})
+        endif()
     endforeach()
 endif()

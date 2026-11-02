@@ -207,10 +207,43 @@ bool readIceControlled(const Message &msg, std::uint64_t &out) {
 	return true;
 }
 
+namespace {
+// RFC 8489 §14.8: the ERROR-CODE reason phrase MUST be a UTF-8 string of at
+// most 128 bytes. Copy valid UTF-8 sequences and replace malformed bytes so a
+// caller-supplied reason can never produce an unparsable attribute.
+std::string sanitizeReason(const std::string &in) {
+	std::string out;
+	out.reserve(std::min<std::size_t>(in.size(), 128));
+	for (std::size_t i = 0; i < in.size() && out.size() < 128; ++i) {
+		unsigned char c = static_cast<unsigned char>(in[i]);
+		if (c < 0x80) {
+			if (c < 0x20 && c != '\t') continue; // strip control characters
+			out.push_back(static_cast<char>(c));
+			continue;
+		}
+		std::size_t len = 0;
+		if ((c & 0xE0) == 0xC0) len = 2;
+		else if ((c & 0xF0) == 0xE0) len = 3;
+		else if ((c & 0xF8) == 0xF0) len = 4;
+		bool valid = len != 0 && i + len <= in.size();
+		for (std::size_t k = 1; valid && k < len; ++k)
+			if ((static_cast<unsigned char>(in[i + k]) & 0xC0) != 0x80) valid = false;
+		if (!valid) {
+			out.push_back('?');
+			continue;
+		}
+		if (out.size() + len > 128) break;
+		out.append(in, i, len);
+		i += len - 1;
+	}
+	return out;
+}
+} // namespace
+
 void addErrorCode(Message &msg, int code, const std::string &reason) {
 	int cls = code / 100;
 	int num = code % 100;
-	std::string r = reason.empty() ? errorReason(code) : reason;
+	std::string r = sanitizeReason(reason.empty() ? errorReason(code) : reason);
 	bytes v;
 	v.resize(4 + r.size());
 	v[0] = 0; v[1] = 0;
@@ -283,6 +316,96 @@ bool readTcpType(const Message &msg, std::uint32_t &out) {
 	if (!a || a->value.size() != 4) return false;
 	out = readU32Be(a->value.data());
 	return true;
+}
+
+void addUnknownAttributes(Message &msg, const std::vector<std::uint16_t> &types) {
+	std::vector<unsigned char> v;
+	v.reserve(types.size() * 2);
+	for (std::uint16_t t : types) {
+		v.push_back(static_cast<unsigned char>(t >> 8));
+		v.push_back(static_cast<unsigned char>(t & 0xFF));
+	}
+	msg.addAttribute(AttrType::UnknownAttributes, v.data(), v.size());
+}
+
+bool readUnknownAttributes(const Message &msg, std::vector<std::uint16_t> &out) {
+	const auto *a = msg.find(AttrType::UnknownAttributes);
+	if (!a) return false;
+	out.clear();
+	out.reserve(a->value.size() / 2);
+	for (std::size_t i = 0; i + 1 < a->value.size(); i += 2)
+		out.push_back(static_cast<std::uint16_t>((a->value[i] << 8) | a->value[i + 1]));
+	return true;
+}
+
+void addPasswordAlgorithms(Message &msg, const std::vector<std::uint16_t> &algorithms) {
+	// RFC 8489 §14.1: the value is a sequence of entries, each being the
+	// algorithm number (2 bytes) followed by a 2-byte parameters length and
+	// the (possibly empty) parameters. A bare u16 list is not parseable by
+	// other stacks — coturn reads the 4-byte entry header and misaligns.
+	std::vector<unsigned char> v;
+	v.reserve(algorithms.size() * 4);
+	for (std::uint16_t alg : algorithms) {
+		v.push_back(static_cast<unsigned char>(alg >> 8));
+		v.push_back(static_cast<unsigned char>(alg & 0xFF));
+		v.push_back(0);
+		v.push_back(0);
+	}
+	msg.addAttribute(AttrType::PasswordAlgorithms, v.data(), v.size());
+}
+
+bool readPasswordAlgorithms(const Message &msg, std::vector<std::uint16_t> &out) {
+	const auto *a = msg.find(AttrType::PasswordAlgorithms);
+	if (!a) return false;
+	out.clear();
+	// RFC 8489 §14.1 entry format: alg(2) | paramLen(2) | params(4-aligned).
+	std::size_t i = 0;
+	while (i + 4 <= a->value.size()) {
+		out.push_back(static_cast<std::uint16_t>((a->value[i] << 8) | a->value[i + 1]));
+		const std::size_t plen =
+		    static_cast<std::size_t>((a->value[i + 2] << 8) | a->value[i + 3]);
+		i += 4 + ((plen + 3) & ~static_cast<std::size_t>(3));
+	}
+	return true;
+}
+
+void addPasswordAlgorithm(Message &msg, std::uint16_t algorithm) {
+	// RFC 8489 §14.2: algorithm number (2 bytes) + parameters length (2 bytes)
+	// + parameters. MD5/SHA-256 carry no parameters.
+	const unsigned char v[4] = {static_cast<unsigned char>(algorithm >> 8),
+	                            static_cast<unsigned char>(algorithm & 0xFF), 0, 0};
+	msg.addAttribute(AttrType::PasswordAlgorithm, v, sizeof(v));
+}
+
+bool readAlternateServer(const Message &msg, net::AddrRecord &out) {
+	const auto *a = msg.find(AttrType::AlternateServer);
+	if (!a || a->value.size() < 4) return false;
+	const std::uint8_t family = a->value[1];
+	const std::uint16_t port =
+	    static_cast<std::uint16_t>((static_cast<std::uint16_t>(a->value[2]) << 8) | a->value[3]);
+	if (family == FamilyIPv4) {
+		if (a->value.size() < 8) return false;
+		sockaddr_in in{};
+		in.sin_family = AF_INET;
+		in.sin_port = htons(port);
+		std::memcpy(&in.sin_addr, a->value.data() + 4, 4);
+		std::memcpy(&out.addr, &in, sizeof(in));
+		out.len = sizeof(in);
+		out.socktype = SOCK_DGRAM;
+		return true;
+	}
+	if (family == FamilyIPv6) {
+		if (a->value.size() < 20) return false;
+		sockaddr_in6 in6{};
+		in6.sin6_family = AF_INET6;
+		in6.sin6_port = htons(port);
+		std::memcpy(&in6.sin6_addr, a->value.data() + 4, 16);
+		std::memcpy(&out.addr, &in6, sizeof(in6));
+		out.len = sizeof(in6);
+		out.socktype = SOCK_DGRAM;
+		return true;
+	}
+	return false;
 }
 
 } // namespace stice::stun
