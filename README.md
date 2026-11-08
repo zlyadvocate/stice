@@ -1,7 +1,7 @@
 # stice
 
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
-[![Version](https://img.shields.io/badge/version-0.14.1-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-0.15.0-blue.svg)]()
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)]()
 
 **C++17 ICE + TURN client library, ported from [pion/webrtc](https://github.com/pion/webrtc) (Go), designed as a drop-in replacement for [libjuice](https://github.com/paullouisageneau/libjuice).**
@@ -28,7 +28,7 @@ stice implements the ICE (Interactive Connectivity Establishment, RFC 8445) agen
 - **STUN client (RFC 8489)** — server-reflexive candidate gathering, multi-STUN parallel queries, authentication; responses are expected to carry XOR-MAPPED-ADDRESS, and a legacy response with only MAPPED-ADDRESS (removed in RFC 8489) is still accepted with a warning
 - **TURN client (RFC 8656 + RFC 6062)** — UDP/TCP/TLS transports; channel data; permissions; **RFC 6062 TCP allocations** (opt-in via `STICE_TURN_TCP_RFC6062`) with Mode-A control connection and Mode-B data pipe (CONNECT / CONNECTION-ATTEMPT / CONNECTION-BIND / CONNECTION-ID)
 - **ICE-TCP (RFC 6544)** — active / passive modes, TCP priority offset, per-pair TCPMux for passive listeners; simultaneous-open is **experimental** (symmetric-breakout framework only, no `so` candidates are emitted)
-- **Multicast DNS (mDNS)** — local announcement (gather) plus query-mode resolution of remote `.local` candidates through the library's own multicast resolver; names are random UUIDv4 labels, so the draft's SHOULD-level conflict probing is skipped (a colliding name is not detected)
+- **Multicast DNS (mDNS)** — local announcement (gather) plus query-mode resolution of remote `.local` candidates through the library's own multicast resolver; names are random UUIDv4 labels and an auto-generated label is conflict-probed before it is advertised (draft-ietf-rtcweb-mdns-ice-candidates §3.1)
 - **NAT 1:1 Address Rewrite** — replace or append external IP mappings for host/srflx/relay candidates
 - **UDP / TCP Multiplexing** — share a single socket across multiple agents (UDPMux / TCPMux)
 - **Configurable Pairing Strategy** — RFC 8445 strict, serial, limited-concurrent, phased-UDP-first scheduling; aggressive / regular / stable nomination; RFC 6062 TCP-relay fallback policies; lazy Mode-B pre-allocation
@@ -45,13 +45,17 @@ stice implements the ICE (Interactive Connectivity Establishment, RFC 8445) agen
   the agent never acts as a lite implementation (it always runs full
   connectivity checks). A lite peer is handled correctly as a peer; acting as
   lite is a reserved extension.
-- **mDNS conflict probing.** Advertised names are random UUIDv4 labels, so the
-  draft's SHOULD-level conflict probing is skipped: a name collision would not
-  be detected. See the mDNS feature bullet above.
-- **`raddr`/`rport` compatibility hack.** srflx/relay candidates are serialized
-  with `raddr 0.0.0.0 rport 0` for Firefox interoperability, which is not the
-  real base address required by RFC 8839 §5.1.1. Set `STICE_SDP_RADDR_HACK=0` to
-  emit spec-clean lines.
+- **mDNS conflict probing covers auto-generated labels only.** A random UUIDv4
+  label is probed with one query and a 200 ms window before it is advertised,
+  and regenerated (up to 3 attempts) if a host answers. A caller-supplied
+  `hostname` is advertised as-is without a probe, and `QueryOnly` never
+  advertises. A responder slower than the 200 ms window would not be detected.
+- **`raddr`/`rport` carry the real base address.** srflx/relay candidates are
+  serialized as `raddr <base-ip> rport <base-port>` right after `typ` (before
+  `tcptype`), per RFC 8839 §5.1.1 and matching pion; a candidate whose base
+  address is unknown omits the pair. The old libjuice-style
+  `raddr 0.0.0.0 rport 0` Firefox hack and the `STICE_SDP_RADDR_HACK` switch
+  were removed.
 - **Selected-candidate introspection.** `stice_get_selected_candidates()` returns
   the SDP form of the pair, so in `QueryAndGather` mDNS mode the local host
   candidate appears under its `.local` name. `stice_get_selected_addresses()`
@@ -70,11 +74,12 @@ stice implements the ICE (Interactive Connectivity Establishment, RFC 8445) agen
 - **Error-response retries.** Transient connectivity-check errors (401/500) are
   retried up to 2 times before the pair fails; a 400 (ufrag/pwd mismatch) fails
   the pair immediately, because it cannot heal within a generation.
-- **stserver answers 420 before authentication.** Unknown comprehension-required
-  attributes are reported to unauthenticated clients so a misconfigured
-  endpoint fails fast with the real cause. RFC 8489 §9.2.1 authenticates first,
-  but this ordering is not a MUST-level violation and no interop issue has been
-  observed.
+- **stserver authenticates before it inspects attributes.** Requests that need
+  credentials (Allocate / Refresh / CreatePermission / ChannelBind / Connect /
+  ConnectionBind) are challenged with 401/438 before unknown
+  comprehension-required attributes are examined (RFC 8489 §9.2.1), so a
+  misconfigured client is told "unauthenticated" rather than "unknown
+  attribute". Anonymous Binding still answers 420 for unknown attributes.
 
 ## Project Structure
 

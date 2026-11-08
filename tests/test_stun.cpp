@@ -17,6 +17,7 @@
 #include "stice/turn/channeldata.hpp"
 #include "stice/crypto.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <set>
 #include <string>
@@ -867,6 +868,45 @@ TEST_CASE("Security: HMAC with empty key", "[stun][security]") {
 	REQUIRE(hmac.size() == 20);
 }
 
+TEST_CASE("Security: HMAC empty key matches RFC 2104 zero-padded key and known digests",
+          "[stun][security]") {
+	// Regression for the UBSan finding: with keyLen == 0 the HMAC key schedule
+	// must skip the memcpy into the key block instead of calling
+	// memcpy(k0, nullptr, 0) (a null pointer violates memcpy's non-null
+	// contract even for a zero-length copy). Semantically, RFC 2104 §2 pads
+	// the key with zeros to the block size, so a zero-length key MUST produce
+	// the same digest as a key of block-size zero bytes (64 bytes for both
+	// SHA-1 and SHA-256).
+	const unsigned char msg[] = "data";
+	constexpr std::size_t kBlock = 64;
+	std::array<unsigned char, kBlock> zeroKey{};
+	zeroKey.fill(0);
+
+	auto sha1Empty = crypto::hmacSha1(nullptr, 0, msg, 4);
+	auto sha1NonNullEmpty = crypto::hmacSha1(zeroKey.data(), 0, msg, 4);
+	auto sha1ZeroPadded = crypto::hmacSha1(zeroKey.data(), kBlock, msg, 4);
+	REQUIRE(sha1Empty == sha1ZeroPadded);
+	REQUIRE(sha1Empty == sha1NonNullEmpty);
+	// Known-answer digest (independently computed):
+	// HMAC-SHA1(key = <empty>, msg = "data").
+	static const std::array<unsigned char, 20> sha1Expected = {
+	    0x25, 0x7d, 0x2c, 0x35, 0x44, 0x3a, 0xf1, 0xe2, 0xfe, 0x59,
+	    0x0b, 0xcf, 0x71, 0xd7, 0xcf, 0xc2, 0xe7, 0x25, 0x33, 0x10};
+	REQUIRE(sha1Empty == sha1Expected);
+
+	auto sha256Empty = crypto::hmacSha256(nullptr, 0, msg, 4);
+	auto sha256ZeroPadded = crypto::hmacSha256(zeroKey.data(), kBlock, msg, 4);
+	REQUIRE(sha256Empty == sha256ZeroPadded);
+	// Known-answer digest (independently computed):
+	// HMAC-SHA256(key = <empty>, msg = "data").
+	static const std::array<unsigned char, 32> sha256Expected = {
+	    0xe5, 0x28, 0xc4, 0xd9, 0x9e, 0x61, 0x77, 0xf5, 0x84, 0x1f,
+	    0x71, 0x2a, 0x14, 0x3b, 0x90, 0x84, 0x32, 0x99, 0xa4, 0xaa,
+	    0x18, 0x1a, 0x06, 0x50, 0x14, 0x22, 0xd9, 0xca, 0x86, 0x2b,
+	    0xd2, 0xa5};
+	REQUIRE(sha256Empty == sha256Expected);
+}
+
 TEST_CASE("Fuzz: truncated STUN header (10 bytes) rejected", "[stun][fuzz]") {
 	unsigned char buf[10] = {0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42, 0x00, 0x00};
 	REQUIRE_FALSE(Message::isMessage(buf, sizeof(buf)));
@@ -941,6 +981,143 @@ TEST_CASE("Fuzz: XOR-MAPPED-ADDRESS with 3-byte value (too short)", "[stun][fuzz
 	REQUIRE_FALSE(readXorAddress(d, AttrType::XorMappedAddress, addr, d.transactionID));
 }
 
+// ---------------------------------------------------------------------------
+// RFC 8265 §4.2 OpaqueString preparation (0.14.0): usernames and passwords are
+// prepared before key derivation, so credentials differing only by non-ASCII
+// spaces, control characters or surrounding whitespace derive the same
+// long-term key on both ends (password-agility follow-up).
+// ---------------------------------------------------------------------------
+TEST_CASE("STUN long-term key applies RFC 8265 OpaqueString preparation",
+          "[stun][crypto][opaquestring]") {
+	const std::string realm = "example.org";
+	const std::string baseU = "alice";
+	const std::string baseP = "secret";
+	auto base = crypto::longTermKey(baseU, realm, baseP);
+
+	SECTION("MD5 known answer: MD5(prepared(username):realm:prepared(password))") {
+		// MD5("alice:example.org:secret")
+		const unsigned char expected[crypto::MD5_SIZE] = {0x54, 0x3e, 0x1a, 0xec, 0x5d, 0x36, 0x14, 0xf0,
+		                                                  0x31, 0x41, 0x65, 0x2d, 0x6a, 0xda, 0x51, 0xb2};
+		REQUIRE(std::equal(expected, expected + crypto::MD5_SIZE, base.begin()));
+	}
+	SECTION("leading/trailing ASCII spaces are trimmed") {
+		REQUIRE(crypto::longTermKey(" alice ", realm, baseP) == base);
+		REQUIRE(crypto::longTermKey(baseU, realm, " secret ") == base);
+	}
+	SECTION("non-ASCII spaces map to SP") {
+		// U+00A0 NBSP (UTF-8 C2 A0), U+3000 IDEOGRAPHIC SPACE (E3 80 80).
+		REQUIRE(crypto::longTermKey("ali\xC2\xA0"
+		                            "ce",
+		                            realm, baseP) == crypto::longTermKey("ali ce", realm, baseP));
+		REQUIRE(crypto::longTermKey(baseU, realm, "sec\xE3\x80\x80"
+		                                               "ret") == crypto::longTermKey(baseU, realm, "sec ret"));
+	}
+	SECTION("C0 and C1 control characters are dropped") {
+		REQUIRE(crypto::longTermKey("al\x01ice", realm, baseP) == base);
+		REQUIRE(crypto::longTermKey(baseU, realm, "se\x7F"
+		                                               "cret") == base);
+		// U+0085 NEL (C1, UTF-8 C2 85).
+		REQUIRE(crypto::longTermKey("al\xC2\x85"
+		                            "ice",
+		                            realm, baseP) == base);
+	}
+	SECTION("invalid UTF-8 bytes are dropped") {
+		REQUIRE(crypto::longTermKey("al\xFF"
+		                            "ice",
+		                            realm, baseP) == base);
+	}
+	SECTION("preparation actually changes the key for unprepared input") {
+		// Without preparation " alice" would derive a different key than
+		// "alice"; these asserts keep the equivalence checks above from
+		// passing vacuously (e.g. preparation silently dropped).
+		REQUIRE(crypto::longTermKey(" alice", realm, baseP) == base);
+		REQUIRE(crypto::longTermKey("alice ", realm, baseP) == base);
+		REQUIRE(crypto::longTermKey(baseU, realm, baseP) != crypto::longTermKey(baseU, realm, "secreT"));
+	}
+}
+
+TEST_CASE("STUN long-term key SHA-256 known answer (RFC 8489 §9.2.2)",
+          "[stun][crypto][opaquestring]") {
+	// RFC 8489 §9.2.2: the MESSAGE-INTEGRITY-SHA256 long-term key is
+	// SHA-256(username:realm:password) with the same OpaqueString preparation
+	// as the MD5 form.
+	auto key = crypto::longTermKeySha256("alice", "example.org", "secret");
+	const unsigned char expected[crypto::SHA256_SIZE] = {
+	    0xd1, 0x65, 0x9f, 0xff, 0x7a, 0x50, 0x1b, 0xe1, 0x59, 0x62, 0xad, 0xc3,
+	    0x55, 0x14, 0xca, 0x6a, 0x58, 0x68, 0x90, 0x56, 0x95, 0xf2, 0xdd, 0x10,
+	    0x93, 0x74, 0x1f, 0x93, 0x1e, 0x00, 0x0a, 0x1f};
+	REQUIRE(std::equal(expected, expected + crypto::SHA256_SIZE, key.begin()));
+}
+
+// ---------------------------------------------------------------------------
+// RFC 8489 §14.1: PASSWORD-ALGORITHMS (0x8002) must use the entry format
+// (alg 2B + paramLen 2B + params padded to 4B). The old flat u16 list could
+// not be parsed by other stacks — coturn reads the 4-byte entry header and
+// misaligns on the rest of the message.
+// ---------------------------------------------------------------------------
+TEST_CASE("PASSWORD-ALGORITHMS 0x8002 wire format is the RFC 8489 §14.1 entry list",
+          "[stun][password-agility]") {
+	Message m;
+	m.method = Method::Allocate;
+	m.cls = Class::Request;
+	m.newTransactionID();
+	addPasswordAlgorithms(m, {PasswordAlgorithmMd5, PasswordAlgorithmSha256});
+	REQUIRE(m.encode(nullptr, nullptr, nullptr));
+
+	Message d;
+	REQUIRE(d.decode(m.raw.data(), m.raw.size()));
+	const auto *a = d.find(AttrType::PasswordAlgorithms);
+	REQUIRE(a != nullptr);
+
+	SECTION("attribute value is the concatenated 4-byte entries") {
+		REQUIRE(a->value.size() == 8);
+		const unsigned char md5Entry[4] = {0x00, 0x01, 0x00, 0x00};
+		const unsigned char shaEntry[4] = {0x00, 0x02, 0x00, 0x00};
+		REQUIRE(std::equal(md5Entry, md5Entry + 4, a->value.begin()));
+		REQUIRE(std::equal(shaEntry, shaEntry + 4, a->value.begin() + 4));
+	}
+	SECTION("raw wire bytes carry type 0x8002 with length 8") {
+		// Walk the TLV chain to the attribute and check the on-the-wire header.
+		const auto &raw = d.raw;
+		std::size_t off = MessageHeaderSize;
+		const std::size_t end = MessageHeaderSize + readU16Be(raw.data() + 2);
+		bool found = false;
+		while (off + AttributeHeaderSize <= end) {
+			std::uint16_t type = readU16Be(raw.data() + off);
+			std::uint16_t len = readU16Be(raw.data() + off + 2);
+			if (type == static_cast<std::uint16_t>(AttrType::PasswordAlgorithms)) {
+				found = true;
+				REQUIRE(len == 8);
+				break;
+			}
+			off += AttributeHeaderSize + ((len + 3) & ~static_cast<std::size_t>(3));
+		}
+		REQUIRE(found);
+	}
+	SECTION("readPasswordAlgorithms round-trips") {
+		std::vector<std::uint16_t> algs;
+		REQUIRE(readPasswordAlgorithms(d, algs));
+		REQUIRE((algs == std::vector<std::uint16_t>{PasswordAlgorithmMd5, PasswordAlgorithmSha256}));
+	}
+	SECTION("PASSWORD-ALGORITHM 0x001D carries the same entry layout") {
+		Message p;
+		p.method = Method::Allocate;
+		p.cls = Class::Request;
+		p.newTransactionID();
+		addPasswordAlgorithm(p, PasswordAlgorithmSha256);
+		REQUIRE(p.encode(nullptr, nullptr, nullptr));
+		Message pd;
+		REQUIRE(pd.decode(p.raw.data(), p.raw.size()));
+		const auto *pa = pd.find(AttrType::PasswordAlgorithm);
+		REQUIRE(pa != nullptr);
+		REQUIRE(pa->value.size() == 4);
+		REQUIRE(pa->value[0] == 0x00);
+		REQUIRE(pa->value[1] == 0x02); // PasswordAlgorithmSha256
+		REQUIRE(pa->value[2] == 0x00); // paramLen = 0 (no parameters)
+		REQUIRE(pa->value[3] == 0x00);
+	}
+}
+
 TEST_CASE("Fuzz: random garbage bytes rejected as STUN", "[stun][fuzz]") {
 	// 100 bytes of random-looking data — should not be accepted as STUN.
 	unsigned char buf[100];
@@ -960,6 +1137,236 @@ TEST_CASE("Fuzz: ChannelData with length exceeding buffer", "[turn][fuzz]") {
 	// Channel 0x4000, length=100, but only 4 bytes of payload.
 	unsigned char buf[] = {0x40, 0x00, 0x00, 0x64, 0xDE, 0xAD, 0xBE, 0xEF};
 	REQUIRE_FALSE(isChannelData(buf, sizeof(buf)));
+}
+
+// ===========================================================================
+// RFC 8489 §9.2.4 / §9: integrity attribute rules
+// ===========================================================================
+
+namespace {
+// Minimal raw builder for the integrity tests: encode() deliberately emits only
+// one integrity attribute, so the dual-integrity and post-integrity cases have
+// to be assembled byte by byte.
+bytes rawHeader(Method m, Class c) {
+	bytes b(MessageHeaderSize, 0);
+	writeU16Be(b.data(), encodeType(m, c));
+	writeU32Be(b.data() + 4, MagicCookie);
+	for (std::size_t i = 0; i < TransactionIDSize; ++i)
+		b[8 + i] = static_cast<unsigned char>(0x40 + i);
+	return b;
+}
+
+void appendRawAttr(bytes &b, AttrType t, const unsigned char *v, std::size_t n) {
+	std::size_t off = b.size();
+	b.resize(off + AttributeHeaderSize + paddedSize(n), 0);
+	writeU16Be(b.data() + off, static_cast<std::uint16_t>(t));
+	writeU16Be(b.data() + off + 2, static_cast<std::uint16_t>(n));
+	if (n) std::memcpy(b.data() + off + AttributeHeaderSize, v, n);
+}
+
+// Appends MESSAGE-INTEGRITY with the correct HMAC over the preceding bytes and
+// returns the offset of its 20-byte value.
+std::size_t appendMi(bytes &b, const unsigned char *key, std::size_t keyLen) {
+	writeU16Be(b.data() + 2, static_cast<std::uint16_t>(
+	    (b.size() - MessageHeaderSize) + AttributeHeaderSize + HmacSha1Size));
+	auto h = crypto::hmacSha1(key, keyLen, b.data(), b.size());
+	std::size_t off = b.size() + AttributeHeaderSize;
+	appendRawAttr(b, AttrType::MessageIntegrity, h.data(), h.size());
+	return off;
+}
+
+std::size_t appendMi256(bytes &b, const unsigned char *key, std::size_t keyLen) {
+	writeU16Be(b.data() + 2, static_cast<std::uint16_t>(
+	    (b.size() - MessageHeaderSize) + AttributeHeaderSize + HmacSha256Size));
+	auto h = crypto::hmacSha256(key, keyLen, b.data(), b.size());
+	std::size_t off = b.size() + AttributeHeaderSize;
+	appendRawAttr(b, AttrType::MessageIntegritySha256, h.data(), h.size());
+	return off;
+}
+
+void finalizeLength(bytes &b) {
+	writeU16Be(b.data() + 2, static_cast<std::uint16_t>(b.size() - MessageHeaderSize));
+}
+
+std::size_t countAttr(const Message &m, AttrType t) {
+	return static_cast<std::size_t>(std::count_if(
+	    m.attributes.begin(), m.attributes.end(), [t](const Attribute &a) { return a.type == t; }));
+}
+} // namespace
+
+TEST_CASE("MESSAGE-INTEGRITY-SHA256 encodes, decodes and verifies (G-STUN-1)",
+          "[stun][sha256]") {
+	auto key1 = crypto::longTermKey("alice", "example.org", "secret");
+	auto key256 = crypto::longTermKeySha256("alice", "example.org", "secret");
+
+	Credentials creds;
+	creds.username = "alice";
+	creds.realm = "example.org";
+	creds.nonce = "nonce-1";
+	creds.key.assign(key1.begin(), key1.end());
+	creds.keySha256.assign(key256.begin(), key256.end());
+	creds.algo = IntegrityAlgo::HmacSha256;
+
+	Message m;
+	m.method = Method::Binding;
+	m.cls = Class::Request;
+	m.newTransactionID();
+	REQUIRE(m.encode("secret", &creds, nullptr));
+
+	Message d;
+	REQUIRE(d.decode(m.raw.data(), m.raw.size()));
+	// §9.2.4: exactly one integrity attribute, the SHA-256 one.
+	REQUIRE(d.find(AttrType::MessageIntegritySha256) != nullptr);
+	REQUIRE(d.find(AttrType::MessageIntegrity) == nullptr);
+	REQUIRE(d.checkIntegrityDual(key1.data(), key1.size(), key256.data(), key256.size()));
+	// A SHA-1-only verifier must not accept a SHA-256-signed message.
+	REQUIRE_FALSE(d.checkIntegrity(key1.data(), key1.size()));
+
+	SECTION("tampering the HMAC value fails verification") {
+		bytes tampered = d.raw;
+		const Attribute *mi = d.find(AttrType::MessageIntegritySha256);
+		REQUIRE(mi != nullptr);
+		// Flip a bit in the value (the attribute is the second-to-last TLV).
+		std::size_t valueOff = 0;
+		for (std::size_t off = MessageHeaderSize;
+		     off + AttributeHeaderSize <= MessageHeaderSize + readU16Be(tampered.data() + 2);
+		     off += AttributeHeaderSize + paddedSize(readU16Be(tampered.data() + off + 2))) {
+			if (static_cast<AttrType>(readU16Be(tampered.data() + off)) ==
+			    AttrType::MessageIntegritySha256) {
+				valueOff = off + AttributeHeaderSize;
+				break;
+			}
+		}
+		REQUIRE(valueOff != 0);
+		tampered[valueOff] ^= 0x01;
+		Message t;
+		REQUIRE(t.decode(tampered.data(), tampered.size()));
+		REQUIRE_FALSE(t.checkIntegrityDual(key1.data(), key1.size(), key256.data(), key256.size()));
+	}
+}
+
+TEST_CASE("checkIntegrityDual prefers MESSAGE-INTEGRITY-SHA256 (G-STUN-2)",
+          "[stun][sha256]") {
+	auto key1 = crypto::longTermKey("alice", "example.org", "secret");
+	auto key256 = crypto::longTermKeySha256("alice", "example.org", "secret");
+
+	bytes b = rawHeader(Method::Binding, Class::Request);
+	const unsigned char user[] = {'a', 'l', 'i', 'c', 'e'};
+	appendRawAttr(b, AttrType::Username, user, sizeof(user));
+	appendMi(b, key1.data(), key1.size());
+	std::size_t mi256Off = appendMi256(b, key256.data(), key256.size());
+	finalizeLength(b);
+
+	Message m;
+	REQUIRE(m.decode(b.data(), b.size()));
+	REQUIRE(countAttr(m, AttrType::MessageIntegrity) == 1);
+	REQUIRE(countAttr(m, AttrType::MessageIntegritySha256) == 1);
+	REQUIRE(m.checkIntegrityDual(key1.data(), key1.size(), key256.data(), key256.size()));
+
+	SECTION("tampered SHA-256 value fails even with a valid SHA-1 value") {
+		bytes t = b;
+		t[mi256Off] ^= 0x01;
+		Message tm;
+		REQUIRE(tm.decode(t.data(), t.size()));
+		REQUIRE_FALSE(tm.checkIntegrityDual(key1.data(), key1.size(), key256.data(), key256.size()));
+	}
+
+	SECTION("a bogus SHA-256 value fails even though SHA-1 is valid") {
+		// SHA-256 is preferred, so a message whose SHA-256 attribute does not
+		// verify must be rejected as a whole - the valid SHA-1 value is ignored.
+		// (The reverse - tampering the SHA-1 value - also fails, because the
+		// SHA-256 HMAC covers the SHA-1 TLV that precedes it.)
+		bytes t = rawHeader(Method::Binding, Class::Request);
+		appendRawAttr(t, AttrType::Username, user, sizeof(user));
+		appendMi(t, key1.data(), key1.size());
+		const unsigned char bogus[HmacSha256Size] = {0};
+		appendRawAttr(t, AttrType::MessageIntegritySha256, bogus, sizeof(bogus));
+		finalizeLength(t);
+		Message tm;
+		REQUIRE(tm.decode(t.data(), t.size()));
+		REQUIRE_FALSE(tm.checkIntegrityDual(key1.data(), key1.size(), key256.data(), key256.size()));
+	}
+
+	SECTION("without MESSAGE-INTEGRITY-SHA256 the SHA-1 value is used") {
+		bytes t = rawHeader(Method::Binding, Class::Request);
+		appendRawAttr(t, AttrType::Username, user, sizeof(user));
+		appendMi(t, key1.data(), key1.size());
+		finalizeLength(t);
+		Message tm;
+		REQUIRE(tm.decode(t.data(), t.size()));
+		REQUIRE(tm.checkIntegrityDual(key1.data(), key1.size(), key256.data(), key256.size()));
+	}
+}
+
+TEST_CASE("attributes after MESSAGE-INTEGRITY are ignored (G-STUN-6)",
+          "[stun][integrity]") {
+	auto key1 = crypto::longTermKey("alice", "example.org", "secret");
+	// Two distinguishable XOR-PEER-ADDRESS values.
+	const unsigned char beforeVal[] = {0x00, 0x01, 0x00, 0x04, 192, 0, 2, 1, 0x1F, 0x90};
+	const unsigned char afterVal[] = {0x00, 0x01, 0x00, 0x04, 192, 0, 2, 9, 0x23, 0x28};
+
+	bytes b = rawHeader(Method::Allocate, Class::Request);
+	appendRawAttr(b, AttrType::XorPeerAddress, beforeVal, sizeof(beforeVal));
+	appendMi(b, key1.data(), key1.size());
+	appendRawAttr(b, AttrType::XorPeerAddress, afterVal, sizeof(afterVal));
+	// A comprehension-required attribute the server does not know, placed after
+	// the integrity attribute: it must NOT be surfaced for 420 processing.
+	appendRawAttr(b, static_cast<AttrType>(0x7777), nullptr, 0);
+	finalizeLength(b);
+
+	Message m;
+	REQUIRE(m.decode(b.data(), b.size()));
+	REQUIRE(countAttr(m, AttrType::XorPeerAddress) == 1);
+	REQUIRE(m.find(AttrType::XorPeerAddress)->value.size() == sizeof(beforeVal));
+	REQUIRE(std::memcmp(m.find(AttrType::XorPeerAddress)->value.data(), beforeVal,
+	                    sizeof(beforeVal)) == 0);
+	REQUIRE(m.unknownComprehensionRequired.empty());
+	REQUIRE(m.checkIntegrity(key1.data(), key1.size()));
+
+	SECTION("the same rule applies after MESSAGE-INTEGRITY-SHA256") {
+		auto key256 = crypto::longTermKeySha256("alice", "example.org", "secret");
+		bytes s = rawHeader(Method::Allocate, Class::Request);
+		appendRawAttr(s, AttrType::XorPeerAddress, beforeVal, sizeof(beforeVal));
+		appendMi256(s, key256.data(), key256.size());
+		appendRawAttr(s, AttrType::XorPeerAddress, afterVal, sizeof(afterVal));
+		finalizeLength(s);
+		Message sm;
+		REQUIRE(sm.decode(s.data(), s.size()));
+		REQUIRE(countAttr(sm, AttrType::XorPeerAddress) == 1);
+	}
+}
+
+TEST_CASE("FINGERPRINT must be the last attribute (G-STUN-8)", "[stun][fingerprint]") {
+	SECTION("attribute after FINGERPRINT rejects the whole message") {
+		bytes b = rawHeader(Method::Binding, Class::Request);
+		const unsigned char fp[4] = {0xDE, 0xAD, 0xBE, 0xEF};
+		appendRawAttr(b, AttrType::Fingerprint, fp, sizeof(fp));
+		const unsigned char sw[] = {'x'};
+		appendRawAttr(b, AttrType::Software, sw, sizeof(sw));
+		finalizeLength(b);
+		Message m;
+		REQUIRE_FALSE(m.decode(b.data(), b.size()));
+	}
+
+	SECTION("FINGERPRINT with a non-4-byte value is rejected") {
+		bytes b = rawHeader(Method::Binding, Class::Request);
+		const unsigned char fp[2] = {0x00, 0x00};
+		appendRawAttr(b, AttrType::Fingerprint, fp, sizeof(fp));
+		finalizeLength(b);
+		Message m;
+		REQUIRE_FALSE(m.decode(b.data(), b.size()));
+	}
+
+	SECTION("FINGERPRINT last is accepted") {
+		Message m;
+		m.method = Method::Binding;
+		m.cls = Class::Request;
+		m.newTransactionID();
+		REQUIRE(m.encode(nullptr, nullptr, nullptr));
+		Message d;
+		REQUIRE(d.decode(m.raw.data(), m.raw.size()));
+		REQUIRE(d.checkFingerprint());
+	}
 }
 
 // ===========================================================================

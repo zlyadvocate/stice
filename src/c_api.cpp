@@ -298,6 +298,13 @@ static stice::ice::IcePairingConfig toCppPairingConfig(const stice_ice_pairing_c
 	cfg.pre_allocate_tcp_relay = c.pre_allocate_tcp_relay;
 	cfg.early_phase_max_concurrent = c.early_phase_max_concurrent;
 	cfg.early_phase_duration = std::chrono::milliseconds(c.early_phase_duration_ms);
+	// 0 keeps the RFC 8445 §14.2 default so a zero-initialized C struct still
+	// gets the standard 50 ms pacing.
+	cfg.ta = std::chrono::milliseconds(c.ta_ms ? c.ta_ms : 50);
+	cfg.use_rfc8445_rto = c.use_rfc8445_rto;
+	// RFC 8445 §6.1.2.5: the checklist limit MUST be configurable; 0 keeps the
+	// historical 90-pair default.
+	cfg.max_candidate_pairs = c.max_candidate_pairs ? c.max_candidate_pairs : 90;
 	return cfg;
 }
 
@@ -345,6 +352,9 @@ STICE_EXPORT int stice_make_pairing_config(stice_ice_pairing_profile_t profile,
 	out_config->pre_allocate_tcp_relay = cfg.pre_allocate_tcp_relay;
 	out_config->early_phase_max_concurrent = cfg.early_phase_max_concurrent;
 	out_config->early_phase_duration_ms = static_cast<uint32_t>(cfg.early_phase_duration.count());
+	out_config->ta_ms = static_cast<uint32_t>(cfg.ta.count());
+	out_config->use_rfc8445_rto = cfg.use_rfc8445_rto;
+	out_config->max_candidate_pairs = cfg.max_candidate_pairs;
 	return STICE_ERR_SUCCESS;
 }
 

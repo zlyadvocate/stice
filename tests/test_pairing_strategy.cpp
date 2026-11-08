@@ -82,6 +82,16 @@ bool waitFor(std::function<bool()> cond, int timeoutMs) {
 	}
 }
 
+// Race-free reads of AgentState::received (callback pushes on the poll thread).
+static size_t recvCount(AgentState &s) {
+	std::lock_guard<std::mutex> lk(s.receivedMutex);
+	return s.received.size();
+}
+static std::string recvAt(AgentState &s, size_t i) {
+	std::lock_guard<std::mutex> lk(s.receivedMutex);
+	return i < s.received.size() ? s.received[i] : std::string();
+}
+
 void trickleExchange(stice_agent_t *a, AgentState &sa, stice_agent_t *b, AgentState &sb) {
 	REQUIRE(waitFor([&] { return sa.gatheringDone.load(); }, 3000));
 	REQUIRE(waitFor([&] { return sb.gatheringDone.load(); }, 3000));
@@ -100,14 +110,18 @@ void trickleExchange(stice_agent_t *a, AgentState &sa, stice_agent_t *b, AgentSt
 // Profile factory: each preset must produce the documented field values.
 // ---------------------------------------------------------------------------
 TEST_CASE("Pairing profile factory produces expected configs", "[pairing][profile]") {
-	SECTION("RFC8445_COMPAT mirrors pion-ice") {
+	SECTION("RFC8445_COMPAT follows RFC 8445 nomination and pacing") {
 		auto c = makeIcePairingConfig(IcePairingProfile::RFC8445_COMPAT);
 		REQUIRE(c.schedule_mode == IceCheckScheduleMode::RFC8445_STRICT);
-		REQUIRE(c.nomination_mode == IceNominationMode::AGGRESSIVE);
+		// RFC 8445 §8.1.1 removed aggressive nomination.
+		REQUIRE(c.nomination_mode == IceNominationMode::REGULAR);
 		REQUIRE(c.tcp_relay_fallback == TcpRelayFallbackMode::ALWAYS_ENABLE);
 		REQUIRE(c.reselect_policy == LinkReselectPolicy::RFC8445);
 		// max_concurrent_check == 0 means unlimited under RFC8445_STRICT.
 		REQUIRE(c.max_concurrent_check == 0);
+		// §14.2 Ta and §14.3 RTO-N are enabled for this profile.
+		REQUIRE(c.ta.count() == 50);
+		REQUIRE(c.use_rfc8445_rto == true);
 		// Speed optimization fields: eager pre-alignment, no early-phase
 		// boost (RFC8445_STRICT is already unlimited).
 		REQUIRE(c.enable_trickle == true);
@@ -132,6 +146,9 @@ TEST_CASE("Pairing profile factory produces expected configs", "[pairing][profil
 		// 1200ms, then fall back to 2); lazy Mode-B allocation.
 		REQUIRE(c.rto_initial.count() == 500);
 		REQUIRE(c.max_check_retransmit == 3);
+		REQUIRE(c.ta.count() == 50);
+		// Product profiles keep the tuned fixed RTO for fast failure.
+		REQUIRE(c.use_rfc8445_rto == false);
 		REQUIRE(c.enable_trickle == true);
 		REQUIRE(c.pre_allocate_tcp_relay == false);
 		REQUIRE(c.early_phase_max_concurrent == 3);
@@ -152,6 +169,7 @@ TEST_CASE("Pairing profile factory produces expected configs", "[pairing][profil
 		REQUIRE(c.early_phase_duration.count() == 1500);
 		REQUIRE(c.rto_initial.count() == 500);
 		REQUIRE(c.max_check_retransmit == 3);
+		REQUIRE(c.use_rfc8445_rto == false);
 	}
 
 	SECTION("MINIMAL_RESOURCE uses serial checks") {
@@ -169,6 +187,7 @@ TEST_CASE("Pairing profile factory produces expected configs", "[pairing][profil
 		REQUIRE(c.early_phase_duration.count() == 0);
 		REQUIRE(c.rto_initial.count() == 1000);
 		REQUIRE(c.max_check_retransmit == 5);
+		REQUIRE(c.use_rfc8445_rto == false);
 	}
 }
 
@@ -225,6 +244,44 @@ TEST_CASE("Pairing predicates", "[pairing][predicate]") {
 }
 
 // ---------------------------------------------------------------------------
+// RFC 8445 §14.2 Ta pacing + §14.3 RTO-N formula (F-ICE-2).
+// The scheduler arms consecutive checks one Ta apart and sizes the UDP
+// retransmission timer from the checklist state instead of a fixed value.
+// ---------------------------------------------------------------------------
+TEST_CASE("RFC 8445 Ta pacing and RTO-N formula", "[pairing][rfc8445][timing]") {
+	using namespace std::chrono;
+
+	SECTION("Ta pacing spreads consecutive checks one interval apart") {
+		REQUIRE(checkPacingDelayMs(milliseconds(50), 1) == 50);
+		REQUIRE(checkPacingDelayMs(milliseconds(50), 2) == 100);
+		REQUIRE(checkPacingDelayMs(milliseconds(50), 3) == 150);
+		REQUIRE(checkPacingDelayMs(milliseconds(50), 10) == 500);
+		// 0 falls back to the RFC 8445 default of 50 ms.
+		REQUIRE(checkPacingDelayMs(milliseconds(0), 1) == 50);
+		// A custom (negotiated) Ta is honored.
+		REQUIRE(checkPacingDelayMs(milliseconds(20), 4) == 80);
+	}
+
+	SECTION("RTO-N never drops below the RFC 500 ms floor") {
+		REQUIRE(computeRfc8445Rto(milliseconds(50), 0, 0, 0).count() == 500);
+		REQUIRE(computeRfc8445Rto(milliseconds(50), 1, 1, 0).count() == 500);
+		REQUIRE(computeRfc8445Rto(milliseconds(50), 3, 3, 0).count() == 500);
+		REQUIRE(computeRfc8445Rto(milliseconds(0), 2, 2, 0).count() == 500);
+	}
+
+	SECTION("RTO-N scales with N and the outstanding check count") {
+		// N=4, all four still waiting: 50 * 4 * 4 = 800 ms.
+		REQUIRE(computeRfc8445Rto(milliseconds(50), 4, 4, 0).count() == 800);
+		// N=10, nine in progress + one waiting: 50 * 10 * 10 = 5000 ms.
+		REQUIRE(computeRfc8445Rto(milliseconds(50), 10, 1, 9).count() == 5000);
+		// Completed checks drop out of Waiting/In-Progress: 50 * 10 * 2 = 1000 ms.
+		REQUIRE(computeRfc8445Rto(milliseconds(50), 10, 0, 2).count() == 1000);
+		// A negotiated Ta scales the timer proportionally.
+		REQUIRE(computeRfc8445Rto(milliseconds(100), 4, 4, 0).count() == 1600);
+	}
+}
+
+// ---------------------------------------------------------------------------
 // C API: stice_make_pairing_config round-trips each profile.
 // ---------------------------------------------------------------------------
 TEST_CASE("C API pairing config factory", "[pairing][capi]") {
@@ -233,9 +290,11 @@ TEST_CASE("C API pairing config factory", "[pairing][capi]") {
 	SECTION("RFC8445_COMPAT") {
 		REQUIRE(stice_make_pairing_config(STICE_PAIRING_RFC8445_COMPAT, &cfg) == STICE_ERR_SUCCESS);
 		REQUIRE(cfg.schedule_mode == STICE_SCHEDULE_RFC8445_STRICT);
-		REQUIRE(cfg.nomination_mode == STICE_NOMINATION_AGGRESSIVE);
+		REQUIRE(cfg.nomination_mode == STICE_NOMINATION_REGULAR);
 		REQUIRE(cfg.tcp_relay_fallback == STICE_TCP_RELAY_ALWAYS_ENABLE);
 		REQUIRE(cfg.reselect_policy == STICE_RESELECT_RFC8445);
+		REQUIRE(cfg.ta_ms == 50);
+		REQUIRE(cfg.use_rfc8445_rto == true);
 	}
 	SECTION("EMBEDDED_STABLE") {
 		REQUIRE(stice_make_pairing_config(STICE_PAIRING_EMBEDDED_STABLE, &cfg) == STICE_ERR_SUCCESS);
@@ -320,6 +379,8 @@ TEST_CASE("C++ Agent setPairingConfig stores config", "[pairing][cpp]") {
 	REQUIRE(applied.early_phase_duration.count() == 1200);
 	REQUIRE(applied.rto_initial.count() == 500);
 	REQUIRE(applied.max_check_retransmit == 3);
+	REQUIRE(applied.ta.count() == 50);
+	REQUIRE(applied.use_rfc8445_rto == false);
 	// setPairingConfig resets all phase-tracking / early-phase state
 	// regardless of the input values, so a fresh gather starts clean.
 	REQUIRE(!applied.tcp_phase_entered);
@@ -381,8 +442,8 @@ TEST_CASE("Pairing profiles preserve UDP loopback connectivity", "[pairing][inte
 
 		const char *msg = "profile-ping";
 		REQUIRE(stice_send(a, msg, std::strlen(msg)) == STICE_ERR_SUCCESS);
-		REQUIRE(waitFor([&] { return sb.received.size() >= 1; }, 2000));
-		REQUIRE(sb.received[0] == msg);
+		REQUIRE(waitFor([&] { return recvCount(sb) >= 1; }, 2000));
+		REQUIRE(recvAt(sb, 0) == msg);
 
 		stice_destroy(a);
 		stice_destroy(b);
@@ -447,8 +508,8 @@ TEST_CASE("Pairing config partial override preserves connectivity", "[pairing][i
 
 	const char *msg = "override-ok";
 	REQUIRE(stice_send(a, msg, std::strlen(msg)) == STICE_ERR_SUCCESS);
-	REQUIRE(waitFor([&] { return sb.received.size() >= 1; }, 2000));
-	REQUIRE(sb.received[0] == msg);
+	REQUIRE(waitFor([&] { return recvCount(sb) >= 1; }, 2000));
+	REQUIRE(recvAt(sb, 0) == msg);
 
 	stice_destroy(a);
 	stice_destroy(b);

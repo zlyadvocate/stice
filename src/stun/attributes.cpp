@@ -297,8 +297,10 @@ void addRequestedTransport(Message &msg, std::uint8_t protocol) {
 }
 
 void addRequestedAddressFamily(Message &msg, std::uint8_t family) {
-	unsigned char buf[1] = {family};
-	msg.addAttribute(AttrType::RequestedAddressFamily, buf, 1);
+	// RFC 8656 §14.5: REQUESTED-ADDRESS-FAMILY is a 4-byte value - the family
+	// in the first byte followed by three reserved bytes.
+	unsigned char buf[4] = {family, 0, 0, 0};
+	msg.addAttribute(AttrType::RequestedAddressFamily, buf, 4);
 }
 
 void addReservationToken(Message &msg, const unsigned char token[8]) {
@@ -375,6 +377,65 @@ void addPasswordAlgorithm(Message &msg, std::uint16_t algorithm) {
 	const unsigned char v[4] = {static_cast<unsigned char>(algorithm >> 8),
 	                            static_cast<unsigned char>(algorithm & 0xFF), 0, 0};
 	msg.addAttribute(AttrType::PasswordAlgorithm, v, sizeof(v));
+}
+
+std::vector<unsigned char> encodePasswordAlgorithms(const std::vector<std::uint16_t> &algorithms) {
+	// RFC 8489 §14.1: one entry per algorithm = alg(2) | paramLen(2) | params.
+	// MD5 and SHA-256 take no parameters, so the entry is exactly four bytes.
+	std::vector<unsigned char> v;
+	v.reserve(algorithms.size() * 4);
+	for (std::uint16_t alg : algorithms) {
+		v.push_back(static_cast<unsigned char>(alg >> 8));
+		v.push_back(static_cast<unsigned char>(alg & 0xFF));
+		v.push_back(0);
+		v.push_back(0);
+	}
+	return v;
+}
+
+namespace {
+constexpr char kNonceCookiePrefix[] = "obMatJos2";
+constexpr std::size_t kNonceCookiePrefixLen = 9; // strlen("obMatJos2")
+
+int base64Value(unsigned char c) {
+	if (c >= 'A' && c <= 'Z') return c - 'A';
+	if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+	if (c >= '0' && c <= '9') return c - '0' + 52;
+	if (c == '+') return 62;
+	if (c == '/') return 63;
+	return -1;
+}
+} // namespace
+
+std::string makeNonceCookie(std::uint32_t features) {
+	// RFC 8489 §9.2.1 / §14.10: "obMatJos2" + the 4-character base64 encoding
+	// of the 24-bit STUN Security Features field (bit 0 = most significant bit
+	// of the first encoded byte = PASSWORD-ALGORITHMS support).
+	static const char kAlphabet[] =
+	    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	features &= 0xFFFFFFu;
+	std::string out(kNonceCookiePrefix);
+	out.push_back(kAlphabet[(features >> 18) & 0x3F]);
+	out.push_back(kAlphabet[(features >> 12) & 0x3F]);
+	out.push_back(kAlphabet[(features >> 6) & 0x3F]);
+	out.push_back(kAlphabet[features & 0x3F]);
+	return out;
+}
+
+bool nonceHasPasswordAlgorithmsFeature(const std::string &nonce) {
+	// Only an RFC 8489 §14.10 cookie can carry feature bits. A nonce minted by
+	// an older stserver ("obMatJos2:<decimal>:...") or by another stack in a
+	// different format is treated as not advertising the feature, so the
+	// §9.2.4 presence requirement is not imposed on such clients.
+	if (nonce.size() < kNonceCookiePrefixLen + 4) return false;
+	if (nonce.compare(0, kNonceCookiePrefixLen, kNonceCookiePrefix) != 0) return false;
+	std::uint32_t features = 0;
+	for (std::size_t i = 0; i < 4; ++i) {
+		int v = base64Value(static_cast<unsigned char>(nonce[kNonceCookiePrefixLen + i]));
+		if (v < 0) return false;
+		features = (features << 6) | static_cast<std::uint32_t>(v);
+	}
+	return (features & SecurityFeaturePasswordAlgorithms) != 0;
 }
 
 bool readAlternateServer(const Message &msg, net::AddrRecord &out) {

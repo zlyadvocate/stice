@@ -458,8 +458,19 @@ private:
 	// TCP connection are removed. Returns true when at least one pair was
 	// dropped.
 	bool pruneFailedPairs();
+	// RFC 8445 §6.1.2.5: bound the checklist set to pairingCfg_.max_candidate_pairs
+	// by discarding the lowest-priority unsent (Frozen) pairs. Pairs that are
+	// selected/nominated, referenced by a STUN entry, a live TCP connection, or
+	// already checked are never discarded.
+	void enforcePairLimit();
+	std::size_t pairLimit() const;
 	// Arm a STUN entry's next transmission time with the given delay.
 	void armTransmission(StunEntry &e, int delayMs);
+	// RFC 8445 §14.3 RTO for a UDP connectivity check being armed:
+	//   RTO = MAX(500ms, Ta * N * (Num-Waiting + Num-In-Progress))
+	// N is the total number of checks in the checklist; the other two counts
+	// are the checks still outstanding right now.
+	std::chrono::milliseconds rfc8445CheckRto() const;
 	void armKeepalive(StunEntry &e);
 	// Sort the candidate pairs by priority descending.
 	void updateOrderedPairs();
@@ -851,6 +862,13 @@ private:
 	// key each arrival would fire a second query and append a duplicate
 	// resolved copy, producing duplicate pairs.
 	std::unordered_set<std::string> mdnsQueryKeys_;
+	// mDNS generation token. Bumped (under mutex_) whenever the remote
+	// candidate set is discarded wholesale — restart(), and every
+	// setRemoteDescription path that replaces remote_. The resolver callback
+	// captures the token at query start and drops resolutions whose token no
+	// longer matches, so a `.local` answer that belonged to a superseded
+	// candidate set can never append into the new generation's description.
+	std::uint64_t mdnsEpoch_ = 0;
 
 	std::deque<StunEntry> entries_;
 	std::vector<std::unique_ptr<CandidatePair>> pairs_;

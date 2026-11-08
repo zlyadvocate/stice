@@ -80,6 +80,12 @@ static bool waitFor(std::function<bool()> cond, int timeoutMs) {
 	}
 }
 
+// Race-free read of AgentState::received (callback pushes on the poll thread).
+static size_t recvSize(AgentState &s) {
+	std::lock_guard<std::mutex> lk(s.receivedMutex);
+	return s.received.size();
+}
+
 static std::string filterRelayOnly(const std::string &sdp) {
 	std::string out;
 	std::string line;
@@ -251,15 +257,15 @@ int main(int argc, char **argv) {
 	int dataOkCount = 0;
 	for (int i = 0; i < pairs; ++i) {
 		if (!results[i].connectOk) continue;
-		bool ra = waitFor([&] { return statesA[i]->received.size() >= 1; }, 5000);
-		bool rb = waitFor([&] { return statesB[i]->received.size() >= 1; }, 5000);
+		bool ra = waitFor([&] { return recvSize(*statesA[i]) >= 1; }, 5000);
+		bool rb = waitFor([&] { return recvSize(*statesB[i]) >= 1; }, 5000);
 		if (ra && rb) {
 			results[i].dataOk = true;
 			++dataOkCount;
 		} else {
 			results[i].failReason = "data timeout A=" +
-			    std::to_string(statesA[i]->received.size()) +
-			    " B=" + std::to_string(statesB[i]->received.size());
+			    std::to_string(recvSize(*statesA[i])) +
+			    " B=" + std::to_string(recvSize(*statesB[i]));
 		}
 	}
 	std::fprintf(stderr, "[phase4] done in %lldms  dataOk=%d/%d\n",

@@ -315,9 +315,13 @@ TEST_CASE("Functional: stice_make_pairing_config for all 4 profiles", "[function
 
 	SECTION("RFC8445_COMPAT") {
 		REQUIRE(stice_make_pairing_config(STICE_PAIRING_RFC8445_COMPAT, &cfg) == STICE_ERR_SUCCESS);
-		// RFC8445_COMPAT mirrors pion-ice: strict scheduling, aggressive nomination.
+		// RFC 8445 §8.1.1 removed aggressive nomination, so the compat profile
+		// uses regular nomination with standard Ta pacing and the §14.3 RTO-N
+		// formula instead.
 		REQUIRE(cfg.schedule_mode == STICE_SCHEDULE_RFC8445_STRICT);
-		REQUIRE(cfg.nomination_mode == STICE_NOMINATION_AGGRESSIVE);
+		REQUIRE(cfg.nomination_mode == STICE_NOMINATION_REGULAR);
+		REQUIRE(cfg.ta_ms == 50);
+		REQUIRE(cfg.use_rfc8445_rto == true);
 	}
 
 	SECTION("EMBEDDED_STABLE") {

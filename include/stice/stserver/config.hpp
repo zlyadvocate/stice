@@ -22,7 +22,18 @@ struct Config {
 	std::string realm = "stserver";
 	std::map<std::string, std::string> users; // username -> password
 	int maxAllocations = 2000;
+	// Default allocation lifetime (RFC 8656 §7.2) when the request omits
+	// LIFETIME or asks for 0.
 	std::uint32_t allocationLifetime = 600; // seconds
+	// Maximum allocation lifetime the server grants. A request asking for more
+	// is clamped to this value (RFC 8656 §7.2: "the server ... sets the value to
+	// the maximum"). Kept separate from allocationLifetime so the server can
+	// honour requests above its default (proper lifetime negotiation).
+	std::uint32_t maxAllocationLifetime = 3600; // seconds
+	// Permission / channel lifetimes (RFC 8656 §2.5/§2.6). Exposed so tests can
+	// drive expiry quickly instead of waiting the protocol's 5/10 minutes.
+	std::uint32_t permissionLifetimeSec = 300;
+	std::uint32_t channelLifetimeSec = 600;
 	// TURN/STUN long-term-credential nonce lifetime (seconds, RFC 5389 §15.4).
 	// Exposed so tests can force nonce rotation quickly: the rotation window is
 	// where the "each stale request mints a new nonce" stampede used to kill

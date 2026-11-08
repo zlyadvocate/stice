@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <atomic>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -12,9 +13,10 @@
 #define Sleep(x) usleep((x) * 1000)
 #endif
 
-static int connected = 0;
-static int gathering_done = 0;
-static int recv_count = 0;
+// Callbacks fire on the agent's poll thread; main polls these concurrently.
+static std::atomic<int> connected{0};
+static std::atomic<int> gathering_done{0};
+static std::atomic<int> recv_count{0};
 
 static void on_state_changed(juice_agent_t *agent, juice_state_t state, void *user_ptr) {
     printf("State: %s\n", juice_state_to_string(state));
@@ -131,7 +133,7 @@ int main(int argc, char **argv) {
         }
 
         printf("Sent %d packets\n", sent);
-        printf("Received %d packets\n", recv_count);
+        printf("Received %d packets\n", recv_count.load());
     } else {
         printf("Connection timeout (expected - need peer to exchange SDP)\n");
     }

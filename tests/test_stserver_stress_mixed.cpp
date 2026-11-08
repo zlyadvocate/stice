@@ -86,6 +86,12 @@ static bool waitFor(std::function<bool()> cond, int timeoutMs) {
 	}
 }
 
+// Race-free read of AgentState::received (callback pushes on the poll thread).
+static size_t recvSize(AgentState &s) {
+	std::lock_guard<std::mutex> lk(s.receivedMutex);
+	return s.received.size();
+}
+
 // Filter SDP to relay-only candidates.
 static std::string filterRelayOnly(const std::string &sdp) {
 	std::string out;
@@ -477,39 +483,62 @@ int main(int argc, char **argv) {
 	std::fprintf(stderr, "[phase4] data exchange...\n");
 
 	auto dataExchange = [&](PairGroup &g) {
-		// Send data on all connected pairs first.
-		for (size_t i = 0; i < g.agentsA.size(); ++i) {
-			if (!g.results[i].connectOk) continue;
-			std::string msgA = "p" + std::to_string(i) + "A";
-			std::string msgB = "p" + std::to_string(i) + "B";
-			stice_send(g.agentsA[i], msgA.data(), msgA.size());
-			stice_send(g.agentsB[i], msgB.data(), msgB.size());
-		}
 		// Wait for data on all connected pairs concurrently (global 5s deadline).
 		std::vector<size_t> pending;
 		for (size_t i = 0; i < g.agentsA.size(); ++i) {
 			if (!g.results[i].connectOk) continue;
 			pending.push_back(i);
 		}
-		auto deadline = std::chrono::steady_clock::now() + 5s;
+		// Retransmit each direction every 100 ms until it is delivered. A single
+		// UDP datagram can be dropped when ~1000 pairs share one process and the
+		// host is CPU-saturated; the property under test is bidirectional
+		// reachability, not zero loss on a one-shot send.
+		std::vector<std::chrono::steady_clock::time_point> lastSend(g.agentsA.size());
+		std::vector<int> lastRcA(g.agentsA.size(), 0), lastRcB(g.agentsA.size(), 0);
+		const auto start = std::chrono::steady_clock::now();
+		for (auto &t : lastSend) t = start - 200ms;
+		auto deadline = start + 5s;
 		while (!pending.empty()) {
-			if (std::chrono::steady_clock::now() >= deadline) break;
+			auto now = std::chrono::steady_clock::now();
+			if (now >= deadline) break;
 			for (auto it = pending.begin(); it != pending.end(); ) {
 				size_t i = *it;
-				if (g.statesA[i]->received.size() >= 1 && g.statesB[i]->received.size() >= 1) {
+				const bool needA = recvSize(*g.statesA[i]) < 1;
+				const bool needB = recvSize(*g.statesB[i]) < 1;
+				if (needA || needB) {
+					if (now - lastSend[i] >= 100ms) {
+						if (needA) {
+							std::string msgA = "p" + std::to_string(i) + "A";
+							lastRcA[i] = stice_send(g.agentsA[i], msgA.data(), msgA.size());
+						}
+						if (needB) {
+							std::string msgB = "p" + std::to_string(i) + "B";
+							lastRcB[i] = stice_send(g.agentsB[i], msgB.data(), msgB.size());
+						}
+						lastSend[i] = now;
+					}
+					++it;
+				} else {
 					g.results[i].dataOk = true;
 					++g.dataOkCount;
 					it = pending.erase(it);
-				} else {
-					++it;
 				}
 			}
 			if (!pending.empty()) std::this_thread::sleep_for(5ms);
 		}
 		for (size_t i : pending) {
+			char la[128] = {}, ra[128] = {}, lb[128] = {}, rb[128] = {};
+			stice_get_selected_addresses(g.agentsA[i], la, sizeof(la), ra, sizeof(ra));
+			stice_get_selected_addresses(g.agentsB[i], lb, sizeof(lb), rb, sizeof(rb));
 			g.results[i].failReason = "data timeout A=" +
-			    std::to_string(g.statesA[i]->received.size()) +
-			    " B=" + std::to_string(g.statesB[i]->received.size());
+			    std::to_string(recvSize(*g.statesA[i])) +
+			    " B=" + std::to_string(recvSize(*g.statesB[i])) +
+			    " rcA=" + std::to_string(lastRcA[i]) +
+			    " rcB=" + std::to_string(lastRcB[i]) +
+			    " stA=" + std::to_string(static_cast<int>(g.statesA[i]->state.load())) +
+			    " stB=" + std::to_string(static_cast<int>(g.statesB[i]->state.load())) +
+			    " A[" + la + "->" + ra + "]" +
+			    " B[" + lb + "->" + rb + "]";
 		}
 	};
 	dataExchange(iceGroup);

@@ -66,10 +66,20 @@ static bool waitFor(std::function<bool()> cond, int timeoutMs) {
 	while (true) {
 		if (cond()) return true;
 		auto el = std::chrono::duration_cast<std::chrono::milliseconds>(
-		              std::chrono::steady_clock::now() - start);
+		    std::chrono::steady_clock::now() - start);
 		if (el.count() >= timeoutMs) return false;
 		std::this_thread::sleep_for(10ms);
 	}
+}
+
+// Race-free reads of AgentState::received (callback pushes on the poll thread).
+static size_t recvCount(AgentState &s) {
+	std::lock_guard<std::mutex> lk(s.receivedMutex);
+	return s.received.size();
+}
+static std::string recvAt(AgentState &s, size_t i) {
+	std::lock_guard<std::mutex> lk(s.receivedMutex);
+	return i < s.received.size() ? s.received[i] : std::string();
 }
 
 // Filter SDP to relay-only candidates (for TURN relay tests).
@@ -256,15 +266,13 @@ int main(int argc, char **argv) {
 	stice_send(a, msgA, std::strlen(msgA));
 	stice_send(b, msgB, std::strlen(msgB));
 
-	waitFor([&] { return sb.received.size() >= 1; }, 5000);
-	waitFor([&] { return sa.received.size() >= 1; }, 5000);
+	waitFor([&] { return recvCount(sb) >= 1; }, 5000);
+	waitFor([&] { return recvCount(sa) >= 1; }, 5000);
 
-	bool ok = !sb.received.empty() && !sa.received.empty() &&
-	          sb.received[0] == msgA && sa.received[0] == msgB;
-	std::fprintf(stderr, "A received %zu: %s\n", sa.received.size(),
-	             sa.received.empty() ? "(none)" : sa.received[0].c_str());
-	std::fprintf(stderr, "B received %zu: %s\n", sb.received.size(),
-	             sb.received.empty() ? "(none)" : sb.received[0].c_str());
+	bool ok = recvCount(sb) >= 1 && recvCount(sa) >= 1 &&
+	          recvAt(sb, 0) == msgA && recvAt(sa, 0) == msgB;
+	std::fprintf(stderr, "A received %zu: %s\n", recvCount(sa), recvAt(sa, 0).c_str());
+	std::fprintf(stderr, "B received %zu: %s\n", recvCount(sb), recvAt(sb, 0).c_str());
 
 	stice_destroy(a);
 	stice_destroy(b);

@@ -76,6 +76,12 @@ bool Client::handleAuthError(const stun::Message &msg, int code, bool retryAuthe
 			creds_->algo = offersSha256 ? stun::IntegrityAlgo::HmacSha256
 			                            : stun::IntegrityAlgo::HmacSha1;
 		}
+		// RFC 8489 §9.2.4: remember the challenge value verbatim; every
+		// authenticated request must repeat it so the server can detect an
+		// on-path attacker stripping it (bid-down).
+		creds_->passwordAlgorithms.clear();
+		if (const auto *pas = msg.find(stun::AttrType::PasswordAlgorithms))
+			creds_->passwordAlgorithms = pas->value;
 		return true;
 	}
 	if (code == stun::StunErrorStaleNonce) {
@@ -83,7 +89,14 @@ bool Client::handleAuthError(const stun::Message &msg, int code, bool retryAuthe
 		// only Allocate counted, so refresh/permission/channelbind could loop
 		// against a misbehaving server).
 		if (++nonceRetries_ > MaxNonceRetries) return false;
-		if (creds_) creds_->nonce = stun::getString(msg, stun::AttrType::Nonce);
+		if (creds_) {
+			creds_->nonce = stun::getString(msg, stun::AttrType::Nonce);
+			// A rotated nonce comes with a fresh PASSWORD-ALGORITHMS list; the
+			// echo must track it or the server rejects the request (§9.2.4).
+			creds_->passwordAlgorithms.clear();
+			if (const auto *pas = msg.find(stun::AttrType::PasswordAlgorithms))
+				creds_->passwordAlgorithms = pas->value;
+		}
 		return true;
 	}
 	return false;

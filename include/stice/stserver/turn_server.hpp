@@ -378,6 +378,9 @@ private:
 	std::map<std::string, std::string> users_;
 	int maxAllocations_ = 2000;
 	std::uint32_t allocationLifetime_ = 600;
+	std::uint32_t maxAllocationLifetime_ = 3600;
+	std::uint32_t permissionLifetimeMs_ = 5 * 60 * 1000;
+	std::uint32_t channelLifetimeMs_ = 10 * 60 * 1000;
 	std::uint16_t relayPortBegin_ = 49152;
 	std::uint16_t relayPortEnd_ = 65535;
 	int workerCount_ = 4;

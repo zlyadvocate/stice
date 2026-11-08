@@ -90,6 +90,13 @@ public:
 	// Check if a hostname is an mDNS name (ends with ".local").
 	static bool isMDnsName(const std::string &hostname);
 
+	// draft-ietf-rtcweb-mdns-ice-candidates §3.1 conflict probing: multicast a
+	// query for `name` and report whether any host answered. init() runs it for
+	// an auto-generated label and regenerates the name on a collision; exposed
+	// so a test can drive the probe directly (a real collision cannot be
+	// provoked through the random-UUID path).
+	bool probeNameConflict(const std::string &name);
+
 	// Generate a random mDNS hostname (UUID v4 + ".local").
 	static std::string generateHostname();
 
@@ -198,6 +205,14 @@ private:
 	// Multicast destinations.
 	sockaddr_in mcastAddr4_{};
 	sockaddr_in6 mcastAddr6_{};
+
+	// Conflict-probe rendezvous. The probe callback runs on the mDNS thread, so
+	// init() waits on this pair instead of touching queriesMutex_ from both
+	// sides. Never held while queriesMutex_ is taken.
+	std::mutex probeMutex_;
+	std::condition_variable probeCv_;
+	bool probeDone_ = false;
+	bool probeConflict_ = false;
 };
 
 } // namespace stice::net

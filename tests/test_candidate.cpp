@@ -199,6 +199,27 @@ TEST_CASE("Candidate SDP serialization (TCP active)", "[candidate]") {
 	auto sdp = c.toSdp();
 	REQUIRE(sdp.find(" TCP ") != std::string::npos);
 	REQUIRE(sdp.find("tcptype active") != std::string::npos);
+	// RFC 6544 §4.5: an active candidate does not know its local port until
+	// it connects, so the signaled port MUST be 9 (the discard port) — not
+	// the ephemeral bind port it happens to hold (0.14.0 fix).
+	REQUIRE(sdp.find(" 10.0.0.1 9 typ host") != std::string::npos);
+	REQUIRE(sdp.find(" 10.0.0.1 8000 ") == std::string::npos);
+}
+
+TEST_CASE("Candidate SDP serialization (TCP passive keeps the real port)", "[candidate]") {
+	// Only active candidates signal port 9; passive candidates own a live
+	// listener and must keep advertising its actual port.
+	Candidate c;
+	c.type = CandidateType::Host;
+	c.transport = CandidateTransport::TCPPassive;
+	c.component = 1;
+	c.priority = 12345u;
+	c.foundation = "F1";
+	c.hostname = "10.0.0.1";
+	c.service = "8000";
+	auto sdp = c.toSdp();
+	REQUIRE(sdp.find("tcptype passive") != std::string::npos);
+	REQUIRE(sdp.find(" 10.0.0.1 8000 typ host") != std::string::npos);
 }
 
 TEST_CASE("Candidate SDP round-trip parse", "[candidate]") {
@@ -243,6 +264,103 @@ TEST_CASE("Candidate SDP parse reads tcptype", "[candidate]") {
 	Candidate c2;
 	REQUIRE(Candidate::parse(line2, c2));
 	REQUIRE(c2.transport == CandidateTransport::TCPSimultaneousOpen);
+}
+
+TEST_CASE("Candidate SDP emits the real base as raddr/rport", "[candidate][rfc8839][raddr]") {
+	// RFC 8839 §5.1.1: rel-addr/rel-port carry the candidate's real base
+	// address. pion marshals the same shape; the old libjuice-compatible
+	// "raddr 0.0.0.0 rport 0" hack advertised a false address.
+	Candidate c;
+	c.type = CandidateType::ServerReflexive;
+	c.transport = CandidateTransport::UDP;
+	c.component = 1;
+	c.priority = 999999u;
+	c.foundation = "abcd";
+	c.hostname = "203.0.113.7";
+	c.service = "3478";
+	c.related = makeV4(0xC0A80105u, 5000); // 192.168.1.5:5000
+	c.hasRelated = true;
+
+	auto sdp = c.toSdp();
+	REQUIRE(sdp.find("typ srflx raddr 192.168.1.5 rport 5000") != std::string::npos);
+	REQUIRE(sdp.find("raddr 0.0.0.0") == std::string::npos);
+	REQUIRE(sdp.find("rport 0 ") == std::string::npos);
+}
+
+TEST_CASE("Candidate SDP omits raddr/rport when no base is known",
+          "[candidate][rfc8839][raddr]") {
+	// RFC 8839 §5.1.1 allows rel-addr/rel-port to be absent; emitting a fake
+	// base is worse than emitting none.
+	Candidate c;
+	c.type = CandidateType::ServerReflexive;
+	c.transport = CandidateTransport::UDP;
+	c.component = 1;
+	c.priority = 999999u;
+	c.foundation = "abcd";
+	c.hostname = "203.0.113.7";
+	c.service = "3478";
+	c.hasRelated = false;
+
+	auto sdp = c.toSdp();
+	REQUIRE(sdp.find("raddr") == std::string::npos);
+	REQUIRE(sdp.find("rport") == std::string::npos);
+	REQUIRE(sdp.find("typ srflx") != std::string::npos);
+}
+
+TEST_CASE("Candidate SDP puts rel-addr before the tcptype extension",
+          "[candidate][rfc8839][raddr]") {
+	// RFC 8839 §5.1 ABNF: [SP rel-addr] [SP rel-port] come before
+	// *(SP extension-att-name SP extension-att-value), and tcptype (RFC 6544)
+	// is such an extension.
+	Candidate c;
+	c.type = CandidateType::Relayed;
+	c.transport = CandidateTransport::TCPPassive;
+	c.component = 1;
+	c.priority = 12345u;
+	c.foundation = "R1";
+	c.hostname = "203.0.113.9";
+	c.service = "50000";
+	c.related = makeV4(0xC0A80105u, 5000);
+	c.hasRelated = true;
+
+	auto sdp = c.toSdp();
+	REQUIRE(sdp.find("typ relay raddr 192.168.1.5 rport 5000 tcptype passive") !=
+	        std::string::npos);
+	REQUIRE(sdp.find("rport 5000") < sdp.find("tcptype"));
+}
+
+TEST_CASE("Candidate SDP round-trips raddr/rport", "[candidate][rfc8839][raddr]") {
+	Candidate c;
+	c.type = CandidateType::Relayed;
+	c.transport = CandidateTransport::UDP;
+	c.component = 1;
+	c.priority = 777u;
+	c.foundation = "R2";
+	c.hostname = "203.0.113.9";
+	c.service = "50000";
+	c.related = makeV4(0x0A000105u, 6000); // 10.0.1.5:6000
+	c.hasRelated = true;
+
+	auto sdp = c.toSdp();
+	Candidate p;
+	REQUIRE(Candidate::parse(sdp, p));
+	REQUIRE(p.hasRelated);
+	REQUIRE(net::addrToString(reinterpret_cast<const sockaddr *>(&p.related.addr)) ==
+	        "10.0.1.5:6000");
+	REQUIRE(net::addrPort(reinterpret_cast<const sockaddr *>(&p.related.addr)) == 6000);
+	REQUIRE(p.toSdp() == sdp);
+}
+
+TEST_CASE("Candidate SDP parse accepts a peer's spec-clean srflx line",
+          "[candidate][rfc8839][raddr]") {
+	Candidate p;
+	REQUIRE(Candidate::parse(
+	    "a=candidate:F 1 UDP 100 203.0.113.7 3478 typ srflx raddr 192.168.1.5 rport 5000", p));
+	REQUIRE(p.type == CandidateType::ServerReflexive);
+	REQUIRE(p.hasRelated);
+	REQUIRE(net::addrPort(reinterpret_cast<const sockaddr *>(&p.related.addr)) == 5000);
+	// The advertised address stays the reflexive one; rel-addr is metadata only.
+	REQUIRE(p.hostname == "203.0.113.7");
 }
 
 TEST_CASE("Candidate foundation is deterministic for same input", "[candidate]") {

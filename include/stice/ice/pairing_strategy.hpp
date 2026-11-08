@@ -98,6 +98,12 @@ struct IcePairingConfig {
 	// LIMITED_CONCURRENT: maximum simultaneously InProgress checks.
 	// 0 means unlimited (RFC8445_STRICT semantics).
 	std::size_t max_concurrent_check{2};
+	// RFC 8445 §6.1.2.5: hard limit on the number of candidate pairs in the
+	// checklist set. When the list would exceed it, the lowest-priority unsent
+	// pairs are discarded so the highest-priority ones are kept. The RFC
+	// default is 100 but explicitly requires the value to be configurable;
+	// the product default stays at the long-standing 90. 0 means "use 90".
+	std::size_t max_candidate_pairs{90};
 	// PHASED_UDP_FIRST: how long the UDP phase lasts before TCP pairs
 	// are armed. 0 means "wait until all UDP pairs fail".
 	std::chrono::milliseconds udp_phase_timeout{3000};
@@ -119,6 +125,18 @@ struct IcePairingConfig {
 	// defaults) when set via setPairingConfig before gatherCandidates.
 	std::chrono::milliseconds rto_initial{600};
 	int max_check_retransmit{4};
+	// RFC 8445 §14.2 connectivity-check pacing interval (Ta). Consecutive
+	// checks are armed one Ta apart instead of being sent as a burst.
+	// 0 falls back to the compiled-in 50 ms default.
+	std::chrono::milliseconds ta{50};
+	// Use the RFC 8445 §14.3 retransmission formula for UDP connectivity
+	// checks:
+	//   RTO = MAX(500ms, Ta * N * (Num-Waiting + Num-In-Progress))
+	// where N is the total number of checks to be performed. Enabled by the
+	// RFC8445_COMPAT profile; the product profiles keep their tuned fixed
+	// rto_initial for faster pair-failure detection (the RFC allows other
+	// mechanisms as long as RTO never drops below 500 ms).
+	bool use_rfc8445_rto{false};
 	// Consent freshness period (RFC 7675 §5.1 mandates a 5 s base, randomized
 	// 4-6 s by the Agent). This doubles as the idle keepalive cadence; keeping
 	// it at the RFC's basic period means consent never silently expires at 30 s
@@ -193,6 +211,30 @@ inline bool scheduleArmsTcp(const IcePairingConfig &c) {
 
 inline bool nominationIsAggressive(const IcePairingConfig &c) {
 	return c.nomination_mode == IceNominationMode::AGGRESSIVE;
+}
+
+// RFC 8445 §14.2 pacing: delay before the ordinal-th (1-based) check of a
+// wave is sent. Consecutive checks are spread one Ta apart instead of being
+// emitted as a burst, so a peer sees at most one new check per Ta.
+inline int checkPacingDelayMs(std::chrono::milliseconds ta, std::size_t ordinal) {
+	int base = ta.count() > 0 ? static_cast<int>(ta.count()) : 50;
+	return base * static_cast<int>(ordinal);
+}
+
+// RFC 8445 §14.3 retransmission timeout for a UDP connectivity check:
+//   RTO = MAX(500ms, Ta * N * (Num-Waiting + Num-In-Progress))
+// totalChecks is N (every check to be performed); numWaiting and
+// numInProgress are the checks still outstanding when the transaction is
+// armed. The 500 ms floor is an RFC MUST ("Agents MUST NOT use an RTO value
+// smaller than 500 ms").
+inline std::chrono::milliseconds computeRfc8445Rto(std::chrono::milliseconds ta,
+	std::size_t totalChecks, std::size_t numWaiting, std::size_t numInProgress) {
+	constexpr long long minRtoMs = 500;
+	if (totalChecks == 0) return std::chrono::milliseconds(minRtoMs);
+	long long taMs = ta.count() > 0 ? static_cast<long long>(ta.count()) : 50;
+	long long rtoMs = taMs * static_cast<long long>(totalChecks) *
+		static_cast<long long>(numWaiting + numInProgress);
+	return std::chrono::milliseconds(rtoMs > minRtoMs ? rtoMs : minRtoMs);
 }
 
 } // namespace stice::ice

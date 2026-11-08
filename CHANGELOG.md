@@ -1,3 +1,170 @@
+## [0.15.0] - 2026-11-08
+
+RFC 8489 §9.2.4 anti-bid-down is enforced end to end (the nonce advertises the
+security feature, the server verifies the client's echo, and both clients
+repeat the list verbatim), the sanitizer audit closes the remaining ASAN/UBSan
+findings, and the protocol-conformance cases the audit report asked for
+(G-STUN-4b, G-TURN-9, G-ICE-1/3/4/7) now exist.
+
+### Fixed
+
+- **Duplicate delivery of the current remote description no longer corrupts
+  the live checklist.** `Agent::setRemoteDescription` move-replaced
+  `remote_` unconditionally; `CandidatePair` stores raw `Candidate*` into
+  `remote_.candidates`, so re-delivering the same generation (same
+  ufrag/pwd — no restart detection) freed the deque storage under every
+  formed pair. ASAN: heap-use-after-free on the first `Agent::send` after
+  re-delivery (read of `selectedPair_->remote->type`). An identical (or
+  trickle-subset) re-delivery is now a no-op that only absorbs a newly
+  arrived `a=end-of-candidates`; a genuinely changed same-generation
+  candidate list goes through `resetChecklist()` before the replacement,
+  same discipline as the restart path.
+- **HMAC with an empty key is no longer UB.** `hmacImpl` called
+  `memcpy(k0, key, 0)` with `key == nullptr` — a nonnull-contract
+  violation even at length zero (UBSan nonnull-attribute catch). The copy
+  is now skipped for `keyLen == 0`; RFC 2104 zero-pad semantics unchanged.
+- **The same-generation checklist rebuild is unconditional.** The changed
+  candidate-list branch of `setRemoteDescription` gated
+  `resetChecklist()` on `!pairs_.empty()`, so when the earlier delivery
+  had produced no pair at all, the rebuilt candidate list was applied to
+  `remote_` while `checklistRebuilt` stayed false — `formPairs()` never
+  ran and the new candidates could only die at the PAC timeout. Local
+  candidates held back for a non-trickle application are preserved across
+  the rebuild (they belong to the unchanged local generation).
+- **A duplicate delivery now absorbs session-level attribute changes.**
+  The `allKnown` early-return silently dropped everything except a newly
+  arrived `a=end-of-candidates`; a signalling retry that carries a
+  corrected `a=ice-lite` flag or a changed trickle ice-option is now
+  absorbed into the live description as well.
+- **mDNS resolutions are generation-guarded.** The resolver callback
+  captured no generation marker, so an answer for a `.local` candidate of
+  a superseded candidate set (restart, or a changed same-generation
+  description) appended into the new generation's remote description.
+  Queries now snapshot an epoch token that is bumped wherever the remote
+  candidate set is discarded wholesale; late answers whose token no longer
+  matches are dropped. The in-flight resolution counter is also clamped at
+  zero — `restart()` resets it while queries are still outstanding, and a
+  late callback used to drag it negative (the fast-failure gate keys on
+  `== 0`).
+- **The RFC 6062 data-connection getters are lock-protected.** The poll
+  thread calls `Agent::hasTurnDataTcp()` / `turnDataTcpSocket()` /
+  `turnDataDesiredEvents()` from `PollRegistry::epollSync`, which read
+  `turnDataConn_` with no lock while `restart()` and the TURN data handlers
+  `reset()` it under `mutex_` — TSAN reported the pair of accesses as a real
+  race (a restart landing between the null check and the dereference is a
+  use-after-free window). The getters now take `mutex_` like the sibling
+  `turnTcp*` getters. The passive `onConnectionAttempt` callback also
+  entered `beginTurnDataConnect()` unlocked (the active
+  `onConnectSuccess` path already locked); it now takes the same lock.
+  `setUDPMux()` no longer calls `PollRegistry::sync()` while holding
+  `mutex_`: the poll thread takes `mutex_` in those same getters, so the
+  sync would have waited out its full 2 s timeout for an iteration that
+  could not finish. The registry detach (remove → sync → release) now runs
+  outside the agent lock, before the socket is closed.
+- **REQUESTED-ADDRESS-FAMILY is a 4-byte value.** `addRequestedAddressFamily`
+  serialized one byte; RFC 8656 §14.5 defines the family byte followed by
+  three reserved bytes. Servers that validate the attribute length rejected
+  the allocation request.
+
+### Changed
+
+- **`raddr`/`rport` now carry the real base address (RFC 8839 §5.1.1).**
+  srflx/relay candidates were serialized with the libjuice Firefox hack
+  `raddr 0.0.0.0 rport 0`, i.e. a false base address. `Candidate::toSdp()` now
+  emits `raddr <base-ip> rport <base-port>` right after `typ` and before
+  `tcptype` (pion's order), and omits the pair when the base address is
+  unknown. `Candidate::parse()` reads the fields back so a parsed line
+  round-trips. `STICE_SDP_RADDR_HACK` is gone.
+- **mDNS conflict probing is implemented**
+  (draft-ietf-rtcweb-mdns-ice-candidates §3.1). `MDnsClient::init()` probes an
+  auto-generated UUIDv4 label with one query and a 200 ms window, regenerating
+  the label (up to 3 attempts) when a host answers. A caller-supplied hostname
+  is still honoured as-is, and `QueryOnly`/`Disabled` never probe. The probe
+  uses its own condition variable so the mDNS thread never takes
+  `queriesMutex_` and `probeMutex_` in the opposite order.
+- **stserver authenticates before it inspects attributes (RFC 8489 §9.2.1).**
+  `TurnServer::dispatchStun()` checked attributes first: an unauthenticated
+  ALLOCATE carrying an unknown comprehension-required attribute got 420, which
+  both leaked the attribute table to a peer with no credential and reported
+  "unknown attribute" when the real cause was "not authenticated". Allocate /
+  Refresh / CreatePermission / ChannelBind / Connect / ConnectionBind are now
+  authenticated before the 420 check; anonymous Binding keeps its previous
+  behaviour.
+- **RFC 8489 §9.2.4 anti-bid-down is enforced end to end.** The stserver
+  nonce now carries the 24-bit STUN Security Features field in its
+  `obMatJos2` + base64 cookie (bit 0 = PASSWORD-ALGORITHMS), so the challenge
+  is self-describing across a restart without per-nonce state.
+  `authenticate()` requires a client whose nonce declares the feature to echo
+  the advertised PASSWORD-ALGORITHMS list byte-for-byte and to name an
+  algorithm from that list; a missing, rewritten or unknown value is answered
+  with 400 (malformed auth attributes) rather than 401. The TURN client
+  (`turn.cpp`) and the standalone STUN client (`client.cpp`) store the
+  challenge value and repeat it on every retried request, refreshing it when
+  a 438 rotates the nonce, and the hand-built CONNECTION-BIND request now
+  carries 0x001D like every other authenticated transaction. Previously the
+  feature bit was advertised but never checked, so an on-path attacker could
+  strip the list and force MD5 undetected.
+
+### Tests
+
+- Known-answer regression for the empty-key HMAC (equals the RFC 2104
+  block-of-zeros key for both SHA-1 and SHA-256; independently computed
+  digests for HMAC over `"data"`).
+- `test_integration`: a changed same-generation candidate list re-forms
+  pairs from an empty checklist (connectivity check observed on a
+  test-owned UDP probe peer), a changed list on a live session rebuilds
+  the checklist and reconnects (the ASAN UAF regression), and a duplicate
+  delivery absorbs `a=end-of-candidates` / `a=ice-lite` (fast-failure
+  observable for the `allKnown` absorb path).
+- `test_turn_data_race`: the three RFC 6062 data-socket getters are hammered
+  from a reader thread while the main thread restarts the agent 16 times;
+  the deterministic assertions pin the "no data socket before setup / after
+  restart" contract, and TSAN is the detector for the lock regression.
+- `test_candidate`: real `raddr`/`rport` for srflx and relay (including the
+  attribute order relative to `tcptype`), omission when the base address is
+  unknown, SDP round-trip through `parse()`, and a spec-conformant peer line.
+- `test_mdns_conflict`: the advertised label is a single-label UUIDv4
+  (`8-4-4-4-12`, version 4, variant `10xx`); the probe reports a conflict for
+  a name the client already advertises (multicast loopback self-answer) and no
+  conflict for a fresh label; the probe is a no-op in `Disabled` mode.
+- `test_stserver_auth_order`: an unauthenticated ALLOCATE carrying an unknown
+  comprehension-required attribute gets 401 with REALM/NONCE (never 420), the
+  same request with valid credentials gets 420 listing exactly that type, and
+  the credential check itself is proven by a clean ALLOCATE succeeding. The
+  test drives a `TurnServer` in-process over UDP, so it needs no external
+  stserver.
+- `test_stserver_protocol`: in-process wire-level suite over raw UDP for the
+  server's error-code and lifetime branches — G-STUN-4b (a missing or
+  rewritten PASSWORD-ALGORITHMS echo gets 400: the §9.2.4 anti-bid-down
+  contract), G-STUN-3/4/5/7, G-TURN-1/2/3, and G-TURN-9 (300 Try Alternate
+  migrates the allocation to the alternate server and the redirect loop
+  terminates).
+- `test_integration`: G-ICE-1 (bidirectional 487 role conflict with tiebreaker
+  regeneration), G-ICE-3 (peer-reflexive discovery from an unknown source
+  creates a selectable pair), G-ICE-4 (§6.1.2.6 frozen pairs unfreeze one
+  foundation per Ta), and G-ICE-7 (§6.1.2.5 checklist limit prunes the
+  lowest-priority pairs).
+- `test_tls_turn`: TURN over TLS allocation end to end against an in-process
+  TLS TURN server, including the "no application retransmission on a reliable
+  transport" contract (a 1.2 s first-Allocate delay must still produce exactly
+  one unauthenticated Allocate).
+- `test_mdns_e2e`: a real multicast query/answer round trip resolves a
+  `.local` candidate and connects over it, and host candidates never leak the
+  interface IP in the SDP.
+- `test_stserver_6062`: in-process RFC 6062 server branches — 447/446,
+  CreatePermission/ChannelBind accepted as no-ops on a TCP allocation, and the
+  data connection relaying STUN verbatim without ever answering it.
+
+### Verified
+
+- ASAN + UBSan (`-fsanitize=address,undefined`, Linux VM, GCC 11): full ctest
+  33/33, zero sanitizer reports.
+- TSAN (`-fsanitize=thread`): every test binary's assertions pass; the 323
+  reports are the known teardown / poll-sync patterns (UdpSocket and
+  TcpTransport close races, PollRegistry sync-mutex address reuse, the
+  stserver WorkItem shard queue, test-callback lock inversion) and none touch
+  the PASSWORD-ALGORITHMS, `authenticate()`, G-ICE-4 or G-TURN-9 paths.
+
 ## [0.14.1] - 2026-11-02
 
 The post-0.14.0 hardening pass: the remaining pion reconnect-audit items land,

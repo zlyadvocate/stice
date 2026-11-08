@@ -1,7 +1,7 @@
 # stice
 
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
-[![Version](https://img.shields.io/badge/version-0.14.1-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-0.15.0-blue.svg)]()
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)]()
 
 **C++17 ICE + TURN 客户端库，从 [pion/webrtc](https://github.com/pion/webrtc) (Go) 移植，设计为 [libjuice](https://github.com/paullouisageneau/libjuice) 的 drop-in 替代品。**
@@ -30,7 +30,7 @@ stice 用现代 C++17 实现了 ICE（Interactive Connectivity Establishment，R
 - **STUN client (RFC 8489)** — server-reflexive 候选者收集、多 STUN 并行查询、认证；响应以 XOR-MAPPED-ADDRESS 为准，仅返回 MAPPED-ADDRESS 的旧式响应（RFC 8489 已移除该属性）仍可接受并记录告警
 - **TURN client (RFC 8656 + RFC 6062)** — UDP/TCP/TLS 传输；channel data；permissions；**RFC 6062 TCP allocations**（需 `STICE_TURN_TCP_RFC6062` 显式开启），含 Mode-A 控制连接和 Mode-B 数据管道（CONNECT / CONNECTION-ATTEMPT / CONNECTION-BIND / CONNECTION-ID）
 - **ICE-TCP (RFC 6544)** — active / passive 模式、TCP 优先级偏移、per-pair TCPMux 被动监听；simultaneous-open 为 **experimental**（仅对称破缺框架，不产出 `so` 候选）
-- **Multicast DNS (mDNS)** — 本地候选者宣告（gather）+ 远端 `.local` 候选查询解析（使用库内自带组播解析器）；主机名为随机 UUIDv4 标签，因此跳过草案 SHOULD 级的冲突探测（同名冲突不会被检测）
+- **Multicast DNS (mDNS)** — 本地候选者宣告（gather）+ 远端 `.local` 候选查询解析（使用库内自带组播解析器）；主机名为随机 UUIDv4 标签，自动生成的标签在宣告前会做冲突探测（draft-ietf-rtcweb-mdns-ice-candidates §3.1）
 - **NAT 1:1 地址重写** — replace 或 append 外部 IP 映射，支持 host/srflx/relay 候选者
 - **UDP / TCP 多路复用** — 多个 agent 共享单个 socket（UDPMux / TCPMux）
 - **可配置配对策略** — RFC 8445 strict、serial、limited-concurrent、phased-UDP-first 调度；aggressive / regular / stable 提名；RFC 6062 TCP-relay 回退策略；lazy Mode-B 预分配
@@ -42,13 +42,13 @@ stice 用现代 C++17 实现了 ICE（Interactive Connectivity Establishment，R
 
 - **单一 ICE component。** 仅收集、配对与检查 component 1，不支持独立的 RTCP component。这与 BUNDLE 单 5-tuple 媒体栈一致，也是 libjuice 的限制。
 - **不实现 ICE-lite 角色。** `a=ice-lite` 可序列化与解析，但 agent 始终执行完整连接性检查，从不以 lite 身份运行；对端为 lite 时按普通对端处理，作为 lite 运行属预留扩展。
-- **mDNS 冲突探测。** 宣告名为随机 UUIDv4 标签，因此跳过草案 SHOULD 级冲突探测，同名冲突不会被检测（见上方 mDNS 特性条目）。
-- **`raddr`/`rport` 兼容性 hack。** srflx/relay 候选者会序列化为 `raddr 0.0.0.0 rport 0` 以兼容 Firefox，并非 RFC 8839 §5.1.1 要求的真实 base 地址。设置 `STICE_SDP_RADDR_HACK=0` 可输出规范行。
+- **mDNS 冲突探测仅覆盖自动生成的标签。** 随机 UUIDv4 标签在宣告前会发起一次查询并等待 200 ms 窗口，若有主机应答则重新生成（最多 3 次）。调用方显式传入的 `hostname` 不做探测、直接宣告，`QueryOnly` 模式从不宣告。慢于 200 ms 窗口的应答者不会被检测到。
+- **`raddr`/`rport` 携带真实 base 地址。** srflx/relay 候选者按 RFC 8839 §5.1.1 在 `typ` 之后（`tcptype` 之前）序列化为 `raddr <base-ip> rport <base-port>`，与 pion 一致；base 地址未知时省略该字段。旧的 libjuice 风格 `raddr 0.0.0.0 rport 0` Firefox hack 与 `STICE_SDP_RADDR_HACK` 开关已移除。
 - **选中候选者自省接口。** `stice_get_selected_candidates()` 返回配对的 SDP 形式，因此在 `QueryAndGather` mDNS 模式下本地 host 候选以 `.local` 名出现；`stice_get_selected_addresses()` 返回解析后的真实地址，会暴露 IP。
 - **consent 保活周期。** 所有 profile 的 UDP consent 检查统一为 5 s（低功耗档此前为 15 s，叠加抖动后距 30 s 超时余量过小），并带 ±20% 抖动；已无应用数据的空闲会话拉伸到 10 s。入向应用数据同样刷新 consent（RFC 7675 双向）。
 - **检查阶段墙钟与事务预算。** 整个检查阶段以 30 s 封顶（`MaxCheckingWallMs`，对齐 pion），而单对 STUN 事务预算为 31.5 s（Rc=7、500 ms 指数退避封顶 8 s），PAC 兜底同为 31.5 s。正常情况下由 agent 墙钟先结束阶段，较长的事务预算只覆盖最后在途的检查。
 - **错误响应重试。** 连接性检查的瞬态错误（401/500）最多重试 2 次后判定该对失败；400（ufrag/pwd 不匹配）立即判定失败，因为它不会在同一代内自愈。
-- **stserver 在鉴权之前应答 420。** 未鉴权客户端也能获知无法理解的必选属性，便于错误配置端快速拿到真实原因。RFC 8489 §9.2.1 要求先鉴权，但该顺序不属于 MUST 级违例，且未观察到互操作问题。
+- **stserver 先鉴权再检查属性。** 需要凭证的请求（Allocate / Refresh / CreatePermission / ChannelBind / Connect / ConnectionBind）先以 401/438 挑战，之后才检查未知的必选属性（RFC 8489 §9.2.1），因此错误配置的客户端会得到「未鉴权」而非「未知属性」。匿名 Binding 仍对未知属性返回 420。
 
 ## 项目结构
 

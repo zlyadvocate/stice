@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // Author: zlyadvocate
-// Version: 0.14.1
+// Version: 0.15.0
 // stserver entry point: load stserver.conf, configure logging, run the TURN
 // server event loop until interrupted.
 

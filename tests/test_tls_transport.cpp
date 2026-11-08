@@ -155,11 +155,14 @@ public:
 
 	void stop() {
 		stop_.store(true);
+		// Join before closing: run() reads listenFd_ every accept attempt, so
+		// closing it while the echo thread is still in the loop is an fd race.
+		// The listener is non-blocking, so the loop observes stop_ within ~5ms.
+		if (thread_.joinable()) thread_.join();
 		if (listenFd_ != STICE_INVALID_SOCKET) {
 			sticeClosesocket(listenFd_);
 			listenFd_ = STICE_INVALID_SOCKET;
 		}
-		if (thread_.joinable()) thread_.join();
 	}
 
 	uint16_t port() const { return port_; }
@@ -294,11 +297,14 @@ public:
 
 	void stop() {
 		stop_.store(true);
+		// Join before closing: run() reads listenFd_ every accept attempt, so
+		// closing it while the echo thread is still in the loop is an fd race.
+		// The listener is non-blocking, so the loop observes stop_ within ~5ms.
+		if (thread_.joinable()) thread_.join();
 		if (listenFd_ != STICE_INVALID_SOCKET) {
 			sticeClosesocket(listenFd_);
 			listenFd_ = STICE_INVALID_SOCKET;
 		}
-		if (thread_.joinable()) thread_.join();
 	}
 
 	uint16_t port() const { return port_; }

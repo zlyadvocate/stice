@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // Author: zlyadvocate
-// Version: 0.14.1
+// Version: 0.15.0
 #include "stice/stserver/config.hpp"
 
 #include "stice/log.hpp"
@@ -127,6 +127,15 @@ bool Config::load(const std::string &path) {
 		} else if (nk == "allocationlifetime") {
 			if (!parseRange(val, "allocation_lifetime", 10, 86400, num)) return false;
 			allocationLifetime = static_cast<std::uint32_t>(num);
+		} else if (nk == "maxallocationlifetime") {
+			if (!parseRange(val, "max_allocation_lifetime", 10, 86400, num)) return false;
+			maxAllocationLifetime = static_cast<std::uint32_t>(num);
+		} else if (nk == "permissionlifetimesec") {
+			if (!parseRange(val, "permission_lifetime_sec", 1, 86400, num)) return false;
+			permissionLifetimeSec = static_cast<std::uint32_t>(num);
+		} else if (nk == "channellifetimesec") {
+			if (!parseRange(val, "channel_lifetime_sec", 1, 86400, num)) return false;
+			channelLifetimeSec = static_cast<std::uint32_t>(num);
 		} else if (nk == "noncelifetimesec") {
 			if (!parseRange(val, "nonce_lifetime_sec", 1, 86400, num)) return false;
 			nonceLifetimeSec = static_cast<std::uint32_t>(num);

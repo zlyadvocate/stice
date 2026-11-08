@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // Author: zlyadvocate
-// Version: 0.14.1
+// Version: 0.15.0
 // stserver TURN/STUN server implementation.
 //
 // Implements STUN Binding (RFC 5389), TURN Allocate/Refresh/CreatePermission/
@@ -81,8 +81,6 @@ bool fingerprintAcceptable(const Message &msg) {
 	STICE_LOG_DEBUG("stserver: FINGERPRINT mismatch tolerated (STICE_FP_STRICT=0)");
 	return true;
 }
-constexpr int PermissionLifetimeMs = 5 * 60 * 1000;   // RFC 8656 §2.5
-constexpr int ChannelBindLifetimeMs = 10 * 60 * 1000;  // RFC 8656 §2.6
 constexpr int PendingConnectLifetimeMs = 30 * 1000;   // RFC 6062 conn attempt
 constexpr int SelectTimeoutMs = 1000;
 
@@ -112,6 +110,12 @@ bool setReuseAddr(socket_t s) {
 bool samePeerIP(const AddrRecord &a, const AddrRecord &b) {
 	return addrEqual(reinterpret_cast<const sockaddr *>(&a.addr),
 	                 reinterpret_cast<const sockaddr *>(&b.addr), false);
+}
+
+// RFC 8656 §9: a peer address whose family differs from the allocation's relayed
+// address is rejected with 443 (Peer Address Family Mismatch).
+bool sameFamily(const AddrRecord &a, const AddrRecord &b) {
+	return a.addr.ss_family == b.addr.ss_family;
 }
 
 // Log a failed UDP sendto (relay forward / client delivery path). These
@@ -214,6 +218,9 @@ bool TurnServer::init(const Config &cfg) {
 	users_ = cfg.users;
 	maxAllocations_ = cfg.maxAllocations;
 	allocationLifetime_ = cfg.allocationLifetime;
+	maxAllocationLifetime_ = std::max(cfg.maxAllocationLifetime, cfg.allocationLifetime);
+	permissionLifetimeMs_ = cfg.permissionLifetimeSec * 1000u;
+	channelLifetimeMs_ = cfg.channelLifetimeSec * 1000u;
 	// nonceLifetimeMs_ is configurable (see Config::nonceLifetimeSec) so tests can
 	// exercise the nonce-rotation window without waiting 30 minutes.
 	nonceLifetimeMs_ = static_cast<std::int64_t>(cfg.nonceLifetimeSec) * 1000;
@@ -314,17 +321,19 @@ bool TurnServer::init(const Config &cfg) {
 
 void TurnServer::refreshNonce() {
 	// RFC 8489 §9.1.1: a nonce SHOULD be constructed so the server can judge
-	// its freshness without keeping per-nonce state. The RFC's example layout
-	// is a fixed cookie ("obMatJos2") followed by a security-feature field and
-	// a random tail. We keep a single active nonce, but emitting the cookie and
-	// the feature bits keeps the format interoperable with clients that parse
-	// the RFC example, and makes the expiry self-describing across a restart.
-	//   obMatJos2:<features>:<expiry-unix-sec>:<random>
-	// features bit 0 advertises that MESSAGE-INTEGRITY-SHA256 is supported.
-	std::uint32_t features = 0x01;
+	// its freshness without keeping per-nonce state. The RFC's layout is the
+	// 13-character nonce cookie ("obMatJos2" + base64 of the 24-bit Security
+	// Features) followed by a server-chosen tail; the expiry and random parts
+	// keep the nonce self-describing across a restart.
+	//   <cookie>:<expiry-unix-sec>:<random>
+	// Bit 0 of the feature field (0x800000) declares PASSWORD-ALGORITHMS
+	// support. A client that sees it MUST echo the attribute in every
+	// authenticated request, and authenticate() below enforces that (§9.2.4
+	// anti-bid-down).
+	const std::uint32_t features = SecurityFeaturePasswordAlgorithms;
 	std::int64_t expirySec = (nowMs() + nonceLifetimeMs_) / 1000;
-	nonce_ = std::string("obMatJos2:") + std::to_string(features) + ":" +
-	         std::to_string(expirySec) + ":" + stice::crypto::randomStr64(32);
+	nonce_ = makeNonceCookie(features) + ":" + std::to_string(expirySec) + ":" +
+	         stice::crypto::randomStr64(32);
 	nonceExpiryMs_ = nowMs() + nonceLifetimeMs_;
 }
 
@@ -509,8 +518,9 @@ bool TurnServer::buildRelayedAddr(std::uint16_t port, AddrRecord &out) const {
 // ---- Authentication -------------------------------------------------------
 
 // Authenticate a request using long-term credentials (RFC 5389 §15.4).
-// Returns: 0 on success, 401 (no/invalid MESSAGE-INTEGRITY), 438 (stale nonce).
-// On success, outUsername holds the verified username.
+// Returns: 0 on success, 400 (malformed auth attributes), 401 (no/invalid
+// MESSAGE-INTEGRITY), 438 (stale nonce). On success, outUsername holds the
+// verified username.
 int TurnServer::authenticate(const Message &msg, std::string &outUsername) {
 	const Attribute *mi = msg.find(AttrType::MessageIntegrity);
 	const Attribute *mi256 = msg.find(AttrType::MessageIntegritySha256);
@@ -519,6 +529,14 @@ int TurnServer::authenticate(const Message &msg, std::string &outUsername) {
 	std::string username = getString(msg, AttrType::Username);
 	std::string realm = getString(msg, AttrType::Realm);
 	std::string nonce = getString(msg, AttrType::Nonce);
+
+	// RFC 8489 §9.2.4: a request that carries MESSAGE-INTEGRITY but omits the
+	// long-term credential attributes is malformed, not unauthenticated. 401/438
+	// would tell the client to retry with a nonce it cannot use; 400 says the
+	// request itself is wrong.
+	if (username.empty() && !msg.find(AttrType::Userhash)) return StunErrorBadRequest;
+	if (realm.empty()) return StunErrorBadRequest;
+	if (nonce.empty()) return StunErrorBadRequest;
 
 	// Nonce validation (RFC 5389 §10.2.2 / §15.4). Rotate the server nonce ONLY
 	// when it has actually expired; answer a plain mismatch with 438 carrying the
@@ -537,6 +555,31 @@ int TurnServer::authenticate(const Message &msg, std::string &outUsername) {
 		return StunErrorStaleNonce;
 	}
 	if (nonce != nonce_) return StunErrorStaleNonce;
+
+	// RFC 8489 §9.2.4 checks 2 and 3 — the anti-bid-down chain. The 401/438
+	// challenge advertises PASSWORD-ALGORITHMS and the nonce cookie declares
+	// the feature, so:
+	//   * a request that carries PASSWORD-ALGORITHMS must repeat the exact
+	//     value the server sent (an attacker rewriting it is detected), and
+	//   * a request that omits it entirely is rejected, because the omission
+	//     is exactly how a bid-down attacker forces MD5.
+	//   * PASSWORD-ALGORITHM, when present, must name one of the advertised
+	//     algorithms (an arbitrary number is not a client choice).
+	const std::vector<std::uint16_t> advertised = {PasswordAlgorithmMd5,
+	                                               PasswordAlgorithmSha256};
+	const std::vector<unsigned char> advertisedWire = encodePasswordAlgorithms(advertised);
+	if (const Attribute *pas = msg.find(AttrType::PasswordAlgorithms)) {
+		if (pas->value != advertisedWire) return StunErrorBadRequest;
+	} else if (nonceHasPasswordAlgorithmsFeature(nonce_)) {
+		return StunErrorBadRequest;
+	}
+	if (const Attribute *pa = msg.find(AttrType::PasswordAlgorithm)) {
+		if (pa->value.size() < 2) return StunErrorBadRequest;
+		std::uint16_t algo = static_cast<std::uint16_t>(
+		    (static_cast<std::uint16_t>(pa->value[0]) << 8) | pa->value[1]);
+		if (std::find(advertised.begin(), advertised.end(), algo) == advertised.end())
+			return StunErrorBadRequest;
+	}
 
 	// RFC 8489 §14.2: USERHASH is the binary SHA-256 of "username:realm" and may
 	// replace USERNAME. Resolve it by hashing each configured user the same way.
@@ -750,9 +793,10 @@ void TurnServer::sendSuccessResponse(const Message &req, const std::string &user
 	creds.nonce = nonce_;
 	auto key = stice::crypto::longTermKey(username, realm_, it->second);
 	creds.key = stice::bytes(key.begin(), key.end());
-	// RFC 8489 §9.2.2: mirror the algorithm the request used. A request signed
-	// with MESSAGE-INTEGRITY-SHA256 gets a response carrying MI-SHA256 too (encode
-	// still appends MI so RFC 5389-only peers can verify as well).
+	// RFC 8489 §9.2.2/§9.2.4: mirror the algorithm the request used. A request
+	// signed with MESSAGE-INTEGRITY-SHA256 gets a response carrying MI-SHA256
+	// ONLY - a message may carry at most one integrity attribute, so encode()
+	// does not append MESSAGE-INTEGRITY on top of it.
 	if (req.find(AttrType::MessageIntegritySha256)) {
 		auto key256 = stice::crypto::longTermKeySha256(username, realm_, it->second);
 		creds.keySha256 = stice::bytes(key256.begin(), key256.end());
@@ -857,9 +901,62 @@ static bool knownComprehensionRequired(std::uint16_t t) {
 	}
 }
 
+// Methods whose requests must prove credentials before the server processes
+// them (RFC 8489 §9.2.1). Binding is deliberately absent: this server answers
+// anonymous STUN bindings.
+static bool methodRequiresAuth(Method m) {
+	switch (m) {
+	case Method::Allocate:
+	case Method::Refresh:
+	case Method::CreatePermission:
+	case Method::ChannelBind:
+	case Method::Connect:
+	case Method::ConnectionBind:
+		return true;
+	default:
+		return false;
+	}
+}
+
 void TurnServer::dispatchStun(Message &msg, const AddrRecord &src, TcpConn *tcpConn,
                                Allocation *alloc) {
 	if (msg.cls != Class::Request && msg.cls != Class::Indication) return;
+	// 400 (malformed auth attributes) is a plain error response: attaching
+	// REALM/NONCE would look like a credential challenge. 401/438 keep the
+	// challenge form so the client can retry.
+	auto rejectAuth = [&](int code) {
+		if (code == StunErrorBadRequest) {
+			if (tcpConn) sendErrorResponseTcp(*tcpConn, msg, code);
+			else sendErrorResponseUdp(src, msg, code);
+		} else if (tcpConn) {
+			sendAuthErrorResponseTcp(*tcpConn, msg, code);
+		} else {
+			sendAuthErrorResponse(src, msg, code);
+		}
+	};
+	// RFC 8656 §5: a request authenticated as a different user than the one that
+	// owns the allocation is rejected with 441 (Wrong Credentials) rather than
+	// being applied to someone else's allocation.
+	auto rejectWrongUser = [&](const std::string &user) {
+		if (!alloc || user.empty() || user == alloc->username) return false;
+		if (tcpConn) sendErrorResponseTcp(*tcpConn, msg, StunErrorWrongCredentials);
+		else sendErrorResponseUdp(src, msg, StunErrorWrongCredentials);
+		return true;
+	};
+	// RFC 8489 §9.2.1: authentication runs before request processing, so an
+	// unauthenticated request must get the 401 challenge (with REALM/NONCE)
+	// rather than a 420 listing unknown attributes - the 420 would tell an
+	// attacker which attributes exist without proving any credential. The
+	// per-method handlers below authenticate again; that is idempotent and
+	// keeps each handler self-contained.
+	if (msg.cls == Class::Request && methodRequiresAuth(msg.method)) {
+		std::string user;
+		int code = authenticate(msg, user);
+		if (code != 0) {
+			rejectAuth(code);
+			return;
+		}
+	}
 	// RFC 8489 §6.3.4: a request carrying a comprehension-required attribute
 	// the server does not understand MUST be rejected with 420 listing the
 	// offending attribute types. Comprehension-optional attributes (>= 0x8000)
@@ -894,6 +991,8 @@ void TurnServer::dispatchStun(Message &msg, const AddrRecord &src, TcpConn *tcpC
 					destroyAllocation(alloc);
 					alloc = nullptr;
 				} else {
+					// RFC 8656 §7.2: a second Allocate on a 5-tuple that already
+					// owns a live allocation is 437 (Allocation Mismatch).
 					if (tcpConn)
 						sendErrorResponseTcp(*tcpConn, msg, StunErrorAllocationMismatch);
 					else
@@ -904,12 +1003,10 @@ void TurnServer::dispatchStun(Message &msg, const AddrRecord &src, TcpConn *tcpC
 			std::string user;
 			int code = authenticate(msg, user);
 			if (code != 0) {
-				if (tcpConn) sendAuthErrorResponseTcp(*tcpConn, msg, code);
-				else sendAuthErrorResponse(src, msg, code);
+				rejectAuth(code);
 				return;
 			}
 			handleAllocate(msg, src, tcpConn, alloc);
-			(void)user;
 		}
 		break;
 	case Method::Refresh:
@@ -922,12 +1019,11 @@ void TurnServer::dispatchStun(Message &msg, const AddrRecord &src, TcpConn *tcpC
 			std::string user;
 			int code = authenticate(msg, user);
 			if (code != 0) {
-				if (tcpConn) sendAuthErrorResponseTcp(*tcpConn, msg, code);
-				else sendAuthErrorResponse(src, msg, code);
+				rejectAuth(code);
 				return;
 			}
+			if (rejectWrongUser(user)) return;
 			handleRefresh(msg, src, tcpConn, alloc);
-			(void)user;
 		}
 		break;
 	case Method::CreatePermission:
@@ -940,12 +1036,11 @@ void TurnServer::dispatchStun(Message &msg, const AddrRecord &src, TcpConn *tcpC
 			std::string user;
 			int code = authenticate(msg, user);
 			if (code != 0) {
-				if (tcpConn) sendAuthErrorResponseTcp(*tcpConn, msg, code);
-				else sendAuthErrorResponse(src, msg, code);
+				rejectAuth(code);
 				return;
 			}
+			if (rejectWrongUser(user)) return;
 			handleCreatePermission(msg, src, tcpConn, alloc);
-			(void)user;
 		}
 		break;
 	case Method::ChannelBind:
@@ -958,12 +1053,11 @@ void TurnServer::dispatchStun(Message &msg, const AddrRecord &src, TcpConn *tcpC
 			std::string user;
 			int code = authenticate(msg, user);
 			if (code != 0) {
-				if (tcpConn) sendAuthErrorResponseTcp(*tcpConn, msg, code);
-				else sendAuthErrorResponse(src, msg, code);
+				rejectAuth(code);
 				return;
 			}
+			if (rejectWrongUser(user)) return;
 			handleChannelBind(msg, src, tcpConn, alloc);
-			(void)user;
 		}
 		break;
 	case Method::Send:
@@ -982,11 +1076,11 @@ void TurnServer::dispatchStun(Message &msg, const AddrRecord &src, TcpConn *tcpC
 			std::string user;
 			int code = authenticate(msg, user);
 			if (code != 0) {
-				sendAuthErrorResponseTcp(*tcpConn, msg, code);
+				rejectAuth(code);
 				return;
 			}
+			if (rejectWrongUser(user)) return;
 			handleConnect(msg, tcpConn, alloc);
-			(void)user;
 		}
 		break;
 	case Method::ConnectionBind:
@@ -1027,17 +1121,68 @@ void TurnServer::handleBinding(Message &req, const AddrRecord &src, TcpConn *tcp
 void TurnServer::handleAllocate(Message &req, const AddrRecord &src, TcpConn *tcpConn,
                                  Allocation *alloc) {
 	(void)alloc;
+	auto sendErr = [&](int code, const std::vector<std::uint16_t> *unknown = nullptr) {
+		if (tcpConn) sendErrorResponseTcp(*tcpConn, req, code, unknown);
+		else sendErrorResponseUdp(src, req, code, unknown);
+	};
 	const Attribute *rt = req.find(AttrType::RequestedTransport);
-	if (!rt || rt->value.empty()) {
-		if (tcpConn) sendErrorResponseTcp(*tcpConn, req, StunErrorBadRequest);
-		else sendErrorResponseUdp(src, req, StunErrorBadRequest);
+	// RFC 8656 §14.7: REQUESTED-TRANSPORT is a 4-byte value (protocol + 3 reserved
+	// bytes). A wrong length is a malformed request, not an unsupported one.
+	if (!rt || rt->value.size() != 4) {
+		sendErr(StunErrorBadRequest);
 		return;
 	}
 	std::uint8_t proto = rt->value[0]; // 17=UDP, 6=TCP
+	// RFC 8656 §7.2 / §14.9: only UDP (17) and TCP (6) relays are defined. Any
+	// other protocol value is answered with 442 Unsupported Transport Protocol.
+	if (proto != 17 && proto != 6) {
+		STICE_LOG_INFO("stserver: ALLOCATE rejected: unsupported transport protocol %u",
+		               static_cast<unsigned>(proto));
+		sendErr(StunErrorUnsupportedTransport);
+		return;
+	}
+	// RFC 8656 §7.2: REQUESTED-ADDRESS-FAMILY selects the relay address family.
+	// This server relays on one family (whatever relayIp_ resolved to); asking
+	// for the other one is 440 Address Family not Supported.
+	if (const Attribute *raf = req.find(AttrType::RequestedAddressFamily)) {
+		if (raf->value.size() != 4) {
+			sendErr(StunErrorBadRequest);
+			return;
+		}
+		const std::uint8_t family = raf->value[0];
+		const bool wantV4 = (family == 0x01);
+		const bool wantV6 = (family == 0x02);
+		if (!wantV4 && !wantV6) {
+			sendErr(StunErrorBadRequest);
+			return;
+		}
+		const bool serverV4 = (relayIpAddr_.ss_family == AF_INET);
+		if ((wantV4 && !serverV4) || (wantV6 && serverV4)) {
+			STICE_LOG_INFO("stserver: ALLOCATE rejected: address family 0x%02x not supported",
+			               static_cast<unsigned>(family));
+			sendErr(StunErrorAddressFamilyNotSupported);
+			return;
+		}
+	}
+	// RFC 8656 §7.2: EVEN-PORT, RESERVATION-TOKEN and DONT-FRAGMENT are
+	// comprehension-required and this server does not implement them, so a
+	// request carrying one MUST be rejected with 420 listing the offending
+	// attributes (RFC 8489 §6.3.4). Previously they were silently accepted.
+	{
+		std::vector<std::uint16_t> unsupported;
+		if (req.find(AttrType::EvenPort)) unsupported.push_back(0x0018);
+		if (req.find(AttrType::DontFragment)) unsupported.push_back(0x001A);
+		if (req.find(AttrType::ReservationToken)) unsupported.push_back(0x0022);
+		if (!unsupported.empty()) {
+			STICE_LOG_INFO("stserver: ALLOCATE rejected: %zu unsupported TURN attribute(s)",
+			               unsupported.size());
+			sendErr(StunErrorUnknownAttribute, &unsupported);
+			return;
+		}
+	}
 
 	if (static_cast<int>(allocations_.size()) >= maxAllocations_) {
-		if (tcpConn) sendErrorResponseTcp(*tcpConn, req, StunErrorAllocationQuotaReached);
-		else sendErrorResponseUdp(src, req, StunErrorAllocationQuotaReached);
+		sendErr(StunErrorAllocationQuotaReached);
 		return;
 	}
 
@@ -1123,7 +1268,14 @@ void TurnServer::handleAllocate(Message &req, const AddrRecord &src, TcpConn *tc
 		a->controlSock = tcpConn ? tcpConn->sock : STICE_INVALID_SOCKET;
 	}
 
+	// RFC 8656 §7.2 lifetime negotiation: a request with no LIFETIME (or 0) gets
+	// the server default; a positive request is honoured up to the server maximum
+	// and clamped beyond it. The granted value is echoed in the response so the
+	// client schedules its refresh from what it actually got.
 	std::uint32_t lifetime = allocationLifetime_;
+	std::uint32_t requested = 0;
+	if (readLifetime(req, requested) && requested > 0)
+		lifetime = std::min(requested, maxAllocationLifetime_);
 	a->expiryMs = nowMs() + static_cast<std::int64_t>(lifetime) * 1000;
 
 	// Build the success response: XOR-RELAYED-ADDRESS, LIFETIME, XOR-MAPPED-ADDRESS.
@@ -1178,9 +1330,13 @@ void TurnServer::handleAllocate(Message &req, const AddrRecord &src, TcpConn *tc
 
 void TurnServer::handleRefresh(Message &req, const AddrRecord &src, TcpConn *tcpConn,
                                Allocation *alloc) {
+	// RFC 8656 §7.2: Refresh negotiates the same way as Allocate. A missing
+	// LIFETIME means "use the default"; 0 means "delete now"; a positive value is
+	// granted up to the server maximum and clamped beyond it.
 	std::uint32_t lifetime = allocationLifetime_;
-	if (readLifetime(req, lifetime)) {
-		if (lifetime > allocationLifetime_) lifetime = allocationLifetime_;
+	std::uint32_t requested = 0;
+	if (readLifetime(req, requested)) {
+		lifetime = (requested == 0) ? 0 : std::min(requested, maxAllocationLifetime_);
 	}
 	Message resp;
 	if (lifetime == 0) {
@@ -1204,8 +1360,9 @@ void TurnServer::handleRefresh(Message &req, const AddrRecord &src, TcpConn *tcp
 
 void TurnServer::handleCreatePermission(Message &req, const AddrRecord &src, TcpConn *tcpConn,
                                         Allocation *alloc) {
-	std::int64_t expiry = nowMs() + PermissionLifetimeMs;
+	std::int64_t expiry = nowMs() + permissionLifetimeMs_;
 	int added = 0;
+	bool familyMismatch = false;
 	// alloc->permissions is traversed by the IO data plane (handleChannelDataFrame
 	// / forwardToClient on reader threads) under alloc->mtx. Those readers do NOT
 	// hold stateMutex_, so the control-plane stateMutex_ does not serialize
@@ -1221,6 +1378,12 @@ void TurnServer::handleCreatePermission(Message &req, const AddrRecord &src, Tcp
 			tmp.addAttribute(AttrType::XorPeerAddress, a.value);
 			AddrRecord peer;
 			if (!readXorAddress(tmp, AttrType::XorPeerAddress, peer, req.transactionID)) continue;
+			// RFC 8656 §9: peers on a different address family than the
+			// allocation's relayed address cannot be reached through it.
+			if (!sameFamily(peer, alloc->relayedAddr)) {
+				familyMismatch = true;
+				continue;
+			}
 			// Replace existing permission for the same peer IP (port ignored).
 			bool found = false;
 			for (auto &p : alloc->permissions) {
@@ -1238,6 +1401,17 @@ void TurnServer::handleCreatePermission(Message &req, const AddrRecord &src, Tcp
 		}
 	}
 	(void)added;
+	if (familyMismatch) {
+		if (tcpConn) sendErrorResponseTcp(*tcpConn, req, StunErrorPeerAddressFamilyMismatch);
+		else sendErrorResponseUdp(src, req, StunErrorPeerAddressFamilyMismatch);
+		return;
+	}
+	// RFC 8656 §9: CreatePermission without any XOR-PEER-ADDRESS is malformed.
+	if (added == 0) {
+		if (tcpConn) sendErrorResponseTcp(*tcpConn, req, StunErrorBadRequest);
+		else sendErrorResponseUdp(src, req, StunErrorBadRequest);
+		return;
+	}
 	Message resp;
 	sendSuccessResponse(req, alloc->username, resp);
 	if (tcpConn) sendTcp(*tcpConn, resp);
@@ -1264,6 +1438,13 @@ void TurnServer::handleChannelBind(Message &req, const AddrRecord &src, TcpConn 
 		else sendErrorResponseUdp(src, req, StunErrorBadRequest);
 		return;
 	}
+	// RFC 8656 §9: the peer must be on the same address family as the relayed
+	// address; otherwise 443 Peer Address Family Mismatch.
+	if (!sameFamily(peer, alloc->relayedAddr)) {
+		if (tcpConn) sendErrorResponseTcp(*tcpConn, req, StunErrorPeerAddressFamilyMismatch);
+		else sendErrorResponseUdp(src, req, StunErrorPeerAddressFamilyMismatch);
+		return;
+	}
 	// Validation and mutation both touch alloc->channels/alloc->permissions,
 	// which the IO data plane traverses under alloc->mtx without holding
 	// stateMutex_. Take alloc->mtx for the whole inspect-then-mutate section so
@@ -1272,7 +1453,10 @@ void TurnServer::handleChannelBind(Message &req, const AddrRecord &src, TcpConn 
 	bool badBinding = false;
 	{
 		std::lock_guard<std::mutex> al(alloc->mtx);
-		// A channel number may bind to only one peer and vice versa.
+		// A channel number may bind to only one peer and vice versa. RFC 8656 §11
+		// mandates 400 (Bad Request) for this conflict; 441 is reserved for a
+		// credential mismatch and is emitted by the wrong-user check in
+		// dispatchStun, so the two semantics stay distinct.
 		for (const auto &c : alloc->channels) {
 			if ((c.number == channel && !samePeerIP(c.peer, peer)) ||
 			    (samePeerIP(c.peer, peer) && c.number != channel)) {
@@ -1281,7 +1465,7 @@ void TurnServer::handleChannelBind(Message &req, const AddrRecord &src, TcpConn 
 			}
 		}
 		if (!badBinding) {
-			std::int64_t expiry = nowMs() + ChannelBindLifetimeMs;
+			std::int64_t expiry = nowMs() + channelLifetimeMs_;
 			bool updated = false;
 			for (auto &c : alloc->channels) {
 				if (c.number == channel) {
@@ -1297,12 +1481,12 @@ void TurnServer::handleChannelBind(Message &req, const AddrRecord &src, TcpConn 
 			bool permFound = false;
 			for (auto &p : alloc->permissions) {
 				if (samePeerIP(p.peer, peer)) {
-					p.expiryMs = nowMs() + PermissionLifetimeMs;
+					p.expiryMs = nowMs() + permissionLifetimeMs_;
 					permFound = true;
 					break;
 				}
 			}
-			if (!permFound) alloc->permissions.push_back({peer, nowMs() + PermissionLifetimeMs});
+			if (!permFound) alloc->permissions.push_back({peer, nowMs() + permissionLifetimeMs_});
 		}
 	}
 	if (badBinding) {
@@ -1378,7 +1562,10 @@ void TurnServer::handleChannelDataFrame(const unsigned char *data, std::size_t s
 		std::lock_guard<std::mutex> al(alloc->mtx);
 		const Channel *ch = nullptr;
 		for (const auto &c : alloc->channels) {
-			if (c.number == channel) { ch = &c; break; }
+			// RFC 8656 §2.6/§11: a channel expires 10 minutes after its last
+			// ChannelBind. An expired binding must not match, otherwise ChannelData
+			// keeps flowing past the protocol lifetime.
+			if (c.number == channel && c.expiryMs > nowMs()) { ch = &c; break; }
 		}
 		chanCount = alloc->channels.size();
 		if (ch) {

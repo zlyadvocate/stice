@@ -29,6 +29,20 @@ namespace stice::ice {
 // Runtime-configurable TCP priority offset (P2-1). Defaults to TcpPenalty.
 std::atomic<std::uint32_t> g_tcpPriorityOffset{TcpPenalty};
 
+namespace {
+// Bare address for SDP rel-addr. net::addrToString renders "host:port" (and
+// brackets IPv6 literals for display), but RFC 8839 §5.1.1 carries the address
+// and port as two separate tokens, and an SDP address must be unbracketed.
+std::string relAddrHost(const net::AddrRecord &r) {
+	std::string s = net::addrToString(reinterpret_cast<const sockaddr *>(&r.addr));
+	auto colon = s.rfind(':');
+	if (colon != std::string::npos) s = s.substr(0, colon);
+	if (s.size() >= 2 && s.front() == '[' && s.back() == ']') s = s.substr(1, s.size() - 2);
+	return s;
+}
+} // namespace
+
+
 const char *typeString(CandidateType t) {
 	switch (t) {
 	case CandidateType::Host: return "host";
@@ -141,35 +155,25 @@ std::string Candidate::computeFoundation(CandidateType type, const std::string &
 	return buf;
 }
 
-// libjuice appends "raddr 0.0.0.0 rport 0" to srflx/relay candidates purely so
-// old Firefox builds accept the line, but the address it advertises is FALSE.
-// RFC 8839 §5.1.1 wants the real base address, or no raddr/rport at all. It is
-// therefore a compatibility hack rather than protocol output: default-on (interop
-// first, matching libjuice) with an opt-out for a strict peer:
-//     set STICE_SDP_RADDR_HACK=0
-static bool sdpRaddrHackEnabled() {
-	static const bool enabled = [] {
-		const char *v = std::getenv("STICE_SDP_RADDR_HACK");
-		if (!v || !v[0]) return true;
-		const char c = v[0];
-		return !(c == '0' || c == 'n' || c == 'N' || c == 'f' || c == 'F');
-	}();
-	return enabled;
-}
-
 std::string Candidate::toSdp() const {
-	// a=candidate:<foundation> <component> <transport> <priority> <host> <port> typ <type>[ tcptype active|passive|so][ raddr .. rport ..]
+	// a=candidate:<foundation> <component> <transport> <priority> <host> <port> typ <type>[ raddr .. rport ..][ tcptype active|passive|so]
 	char buf[512];
 	std::string suffix;
+	// RFC 8839 §5.1.1: rel-addr/rel-port carry the candidate's real base
+	// address and MUST appear right after cand-type, before the extension
+	// attributes (tcptype). pion marshals the same shape. The old
+	// "raddr 0.0.0.0 rport 0" Firefox hack advertised a false address, so it
+	// was removed; STICE_SDP_RADDR_HACK no longer exists.
+	if ((type == CandidateType::ServerReflexive || type == CandidateType::Relayed) && hasRelated) {
+		suffix += " raddr ";
+		suffix += relAddrHost(related);
+		suffix += " rport ";
+		suffix += std::to_string(net::addrPort(reinterpret_cast<const sockaddr *>(&related.addr)));
+	}
 	// TCP candidates MUST include tcptype (RFC 6544 §4.5).
 	if (transport == CandidateTransport::TCPActive) suffix += " tcptype active";
 	else if (transport == CandidateTransport::TCPPassive) suffix += " tcptype passive";
 	else if (transport == CandidateTransport::TCPSimultaneousOpen) suffix += " tcptype so";
-	// Firefox-compatibility hack (see sdpRaddrHackEnabled above).
-	if ((type == CandidateType::ServerReflexive || type == CandidateType::Relayed) &&
-		sdpRaddrHackEnabled()) {
-		suffix += " raddr 0.0.0.0 rport 0";
-	}
     // RFC 6544 §4.5: an active candidate does not know its local port until it
     // connects, so the signaled port MUST be 9 (the discard port).
     const char* portStr = (transport == CandidateTransport::TCPActive) ? "9" : service.c_str();
@@ -226,6 +230,32 @@ bool Candidate::parse(const std::string &line, Candidate &out) {
 		}
 	} else {
 		out.transport = CandidateTransport::UDP;
+	}
+
+	// rel-addr / rel-port (RFC 8839 §5.1.1): the real base address of a
+	// srflx/relay candidate. Optional on the wire; kept so a parsed line
+	// round-trips through toSdp().
+	{
+		std::size_t rpos = s.find(" raddr ");
+		if (rpos != std::string::npos) {
+			std::string rest = s.substr(rpos + 7);
+			std::size_t sp = rest.find(' ');
+			std::string raddr = (sp == std::string::npos) ? rest : rest.substr(0, sp);
+			std::uint16_t rport = 0;
+			std::size_t ppos = s.find(" rport ", rpos);
+			if (ppos != std::string::npos) {
+				rport = static_cast<std::uint16_t>(std::atoi(s.c_str() + ppos + 7));
+			}
+			struct sockaddr_storage ss{};
+			socklen_t slen = 0;
+			if (net::parseAddr(raddr, rport, ss, slen)) {
+				out.related.addr = ss;
+				out.related.len = slen;
+				out.related.socktype =
+					(out.transport == CandidateTransport::UDP) ? SOCK_DGRAM : SOCK_STREAM;
+				out.hasRelated = true;
+			}
+		}
 	}
 
 	// Resolve hostname:port into a sockaddr so the agent can send connectivity

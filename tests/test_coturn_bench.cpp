@@ -86,10 +86,12 @@ struct AgentState {
 	std::atomic<long long> skipLost{0};
 	std::vector<uint32_t> seqs;      // only when trackSeq
 	std::mutex seqMutex;
-	bool trackSeq = false;
+	std::atomic<bool> trackSeq{false};
 	stice_agent_t *agent = nullptr;
-	bool echo = false;   // bounce every received message back (latency phase)
-	bool store = true;   // keep payloads (disabled during bulk phase)
+	// Written by main between phases, read by the recv callback on the poll
+	// thread — must be atomic.
+	std::atomic<bool> echo{false};   // bounce every received message back (latency phase)
+	std::atomic<bool> store{true};   // keep payloads (disabled during bulk phase)
 
 	std::int64_t markLastRecvMs() const {
 		return std::chrono::duration_cast<std::chrono::milliseconds>(

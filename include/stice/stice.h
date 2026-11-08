@@ -110,8 +110,13 @@ typedef enum stice_ice_tcp_mode {
 	STICE_ICE_TCP_MODE_NONE = 0,
 	STICE_ICE_TCP_MODE_ACTIVE,      // Local active: initiates TCP connections
 	STICE_ICE_TCP_MODE_PASSIVE,     // Local passive: listens for incoming TCP (requires TcpMux)
-	// experimental: currently behaves like PASSIVE (auto-dial via ufrag
-	// breakout) and emits no `tcptype so` candidates. Kept for API compat.
+	// Simultaneous-Open (RFC 6544). KNOWN LIMITATION: stice implements the
+	// SO *framework* only (tcptype codec, priority table, RFC 6544 §6.2 pairing
+	// rules) but not the dual-connect state machine. This mode therefore
+	// behaves exactly like PASSIVE: it listens on the TCPMux and advertises
+	// `tcptype passive` candidates, never `tcptype so`. Because §6.2 only pairs
+	// tcp-so with tcp-so, remote `tcptype so` candidates are ignored. Kept for
+	// API compatibility; do not rely on true simultaneous-open behaviour.
 	STICE_ICE_TCP_MODE_SO,          // Simultaneous-Open (experimental, see above)
 } stice_ice_tcp_mode_t;
 
@@ -325,6 +330,9 @@ typedef struct stice_ice_pairing_config {
 	bool pre_allocate_tcp_relay;       // background Mode-B allocation during UDP phase
 	size_t early_phase_max_concurrent; // 0 = disabled, else temp boost during early_phase_duration_ms
 	uint32_t early_phase_duration_ms;  // 0 = disabled
+	uint32_t ta_ms;                    // RFC 8445 §14.2 check pacing (0 = 50 ms default)
+	bool use_rfc8445_rto;              // RFC 8445 §14.3 RTO-N formula for UDP connectivity checks
+	size_t max_candidate_pairs;        // RFC 8445 §6.1.2.5 checklist limit (0 = 90 default)
 } stice_ice_pairing_config_t;
 
 // Preset profiles (mirror of stice::ice::IcePairingProfile).

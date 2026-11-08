@@ -206,14 +206,20 @@ struct Credentials {
 	// SHA-256(username:realm:password) (RFC 8489 §9.2.2).
 	bytes keySha256;
 	// Integrity algorithm negotiated with the server. HmacSha1 keeps the
-	// RFC 5389 behaviour; HmacSha256 makes encode() append
-	// MESSAGE-INTEGRITY-SHA256 (in addition to MESSAGE-INTEGRITY, so peers that
-	// only understand SHA-1 still verify the message).
+	// RFC 5389 behaviour; HmacSha256 makes encode() emit MESSAGE-INTEGRITY-SHA256
+	// INSTEAD of MESSAGE-INTEGRITY (RFC 8489 §9.2.4 allows only one integrity
+	// attribute per message).
 	IntegrityAlgo algo = IntegrityAlgo::HmacSha1;
 	// Emit USERHASH instead of USERNAME (RFC 8489 §14.2). The value is the
 	// binary SHA-256 of "username:realm"; the server resolves the user by
 	// hashing each known username the same way.
 	bool useUserhash = false;
+	// PASSWORD-ALGORITHMS echoed verbatim from the 401/438 challenge (RFC 8489
+	// §9.2.4): a client that received the attribute MUST repeat it unchanged in
+	// every authenticated request, otherwise the server cannot tell whether an
+	// on-path attacker stripped it to force MD5 (bid-down). Empty when the
+	// server did not advertise a list.
+	bytes passwordAlgorithms;
 };
 
 // Build the 16-byte XOR mask used by XOR-MAPPED-ADDRESS and friends:

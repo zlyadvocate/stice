@@ -340,3 +340,130 @@ TEST_CASE("post-connection loss reports DISCONNECTED before FAILED",
 
 	stice_destroy(a);
 }
+
+// ---------------------------------------------------------------------------
+// RFC 7675 mutual liveness, extension part (0.14.1): inbound application data
+// refreshes the delivering pair's consent window — a one-way media stream is
+// live traffic as well. The refresh has no externally visible effect short of
+// a 30 s expiry, so the behaviour is observed through its DEBUG log line
+// (same technique as the outbound-TID test above).
+// ---------------------------------------------------------------------------
+TEST_CASE("inbound application data refreshes consent", "[consent][rfc7675]") {
+	stice_set_log_level(STICE_LOG_LEVEL_DEBUG);
+	{
+		std::lock_guard<std::mutex> lk(g_logMutex);
+		g_logText.clear();
+	}
+	g_capture = true;
+	stice_set_log_handler(captureLog);
+
+	// AgentState plus an application-data sink for A (the receiving side).
+	struct RecvTracker {
+		AgentState base;
+		std::mutex m;
+		std::vector<std::string> got;
+	} ta;
+	AgentState sb;
+
+	stice_config_t cfgA = makeConfig(ta.base);
+	cfgA.cb_recv = [](stice_agent_t *, const char *data, size_t size, void *user_ptr) {
+		auto *t = static_cast<RecvTracker *>(user_ptr);
+		std::lock_guard<std::mutex> lk(t->m);
+		t->got.emplace_back(data, size);
+	};
+	cfgA.user_ptr = &ta;
+	stice_config_t cfgB = makeConfig(sb);
+
+	stice_agent_t *a = stice_create(&cfgA);
+	stice_agent_t *b = stice_create(&cfgB);
+	REQUIRE(a != nullptr);
+	REQUIRE(b != nullptr);
+	REQUIRE(stice_gather_candidates(a) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_gather_candidates(b) == STICE_ERR_SUCCESS);
+	exchangeDescriptions(a, ta.base, b, sb);
+	REQUIRE(waitFor([&] {
+		auto as = ta.base.state.load();
+		auto bs = sb.state.load();
+		return (as == STICE_STATE_CONNECTED || as == STICE_STATE_COMPLETED) &&
+		       (bs == STICE_STATE_CONNECTED || bs == STICE_STATE_COMPLETED);
+	}, 15000));
+
+	// One-way media: B sends, A delivers. emitRecv must refresh A's pair.
+	const char *media = "one-way-media";
+	REQUIRE(stice_send(b, media, std::strlen(media)) == STICE_ERR_SUCCESS);
+	bool delivered = false;
+	CHECK(waitFor([&] {
+		std::lock_guard<std::mutex> lk(ta.m);
+		for (const auto &g : ta.got)
+			if (g == media) delivered = true;
+		return delivered;
+	}, 5000));
+
+	g_capture = false;
+	stice_set_log_handler(nullptr);
+
+	// The data reached the application, so emitRecv ran — and on a Succeeded
+	// pair it must have refreshed consent before invoking the callback.
+	std::string log;
+	{
+		std::lock_guard<std::mutex> lk(g_logMutex);
+		log = g_logText;
+	}
+	REQUIRE(delivered);
+	CHECK(log.find("inbound application data refreshes pair") != std::string::npos);
+
+	stice_destroy(a);
+	stice_destroy(b);
+}
+
+// ---------------------------------------------------------------------------
+// RFC 7675 mutual liveness (0.14.0): a validated inbound Binding Request
+// refreshes the matching pair's consent freshness on the receiving side too.
+// After CONNECTED the log is cleared, so the observed refresh comes from the
+// consent-keepalive traffic, not the connectivity checks of the setup phase.
+// ---------------------------------------------------------------------------
+TEST_CASE("inbound binding request refreshes consent", "[consent][rfc7675]") {
+	stice_set_log_level(STICE_LOG_LEVEL_DEBUG);
+	{
+		std::lock_guard<std::mutex> lk(g_logMutex);
+		g_logText.clear();
+	}
+	g_capture = true;
+	stice_set_log_handler(captureLog);
+
+	AgentState sa, sb;
+	stice_config_t ca = makeConfig(sa);
+	stice_config_t cb = makeConfig(sb);
+	stice_agent_t *a = stice_create(&ca);
+	stice_agent_t *b = stice_create(&cb);
+	REQUIRE(a != nullptr);
+	REQUIRE(b != nullptr);
+	REQUIRE(stice_gather_candidates(a) == STICE_ERR_SUCCESS);
+	REQUIRE(stice_gather_candidates(b) == STICE_ERR_SUCCESS);
+	exchangeDescriptions(a, sa, b, sb);
+	REQUIRE(waitFor([&] {
+		auto as = sa.state.load();
+		auto bs = sb.state.load();
+		return (as == STICE_STATE_CONNECTED || as == STICE_STATE_COMPLETED) &&
+		       (bs == STICE_STATE_CONNECTED || bs == STICE_STATE_COMPLETED);
+	}, 15000));
+
+	// Both sides are now exchanging consent keepalives (Binding Requests) at
+	// the 5 s cadence; each one must refresh the receiver's pair.
+	{
+		std::lock_guard<std::mutex> lk(g_logMutex);
+		g_logText.clear();
+	}
+	bool seen = false;
+	CHECK(waitFor([&] {
+		std::lock_guard<std::mutex> lk(g_logMutex);
+		seen = g_logText.find("inbound binding request refreshes pair") != std::string::npos;
+		return seen;
+	}, 15000));
+
+	g_capture = false;
+	stice_set_log_handler(nullptr);
+
+	stice_destroy(a);
+	stice_destroy(b);
+}

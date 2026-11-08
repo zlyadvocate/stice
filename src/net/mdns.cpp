@@ -41,6 +41,10 @@ constexpr std::uint16_t kDnsClassCacheFlush = 0x8000; // RFC 6762 §10.2
 constexpr std::uint16_t kDnsClassINUnicast = 0x8001; // IN with unicast-response bit
 constexpr int kQueryIntervalMs = 1000;
 constexpr int kQueryTimeoutMs = 5000;
+// draft-ietf-rtcweb-mdns-ice-candidates §3.1 conflict probe: one query, short
+// window. Long enough for a same-link responder to answer, short enough that it
+// does not visibly delay gathering.
+constexpr int kConflictProbeWindowMs = 200;
 constexpr std::uint32_t kResponseTTL = 120;
 
 std::string lowerName(std::string s) {
@@ -214,6 +218,19 @@ bool MDnsClient::init(MulticastDNSMode mode, const std::string &hostname,
 	running_ = true;
 	thread_ = std::thread([this] { run(); });
 
+	// draft-ietf-rtcweb-mdns-ice-candidates §3.1: probe an auto-generated label
+	// before advertising it. A collision is astronomically unlikely with a
+	// UUIDv4, but the draft asks for the probe and it is cheap. A caller-supplied
+	// hostname is honoured as-is; QueryOnly never advertises a name, so it needs
+	// no probe either.
+	if (hostname.empty() && mode_ == MulticastDNSMode::QueryAndGather) {
+		for (int attempt = 0; attempt < 3; ++attempt) {
+			if (!probeNameConflict(hostname_)) break;
+			hostname_ = generateHostname();
+			STICE_LOG_WARN("mDNS: name conflict detected, retrying with %s", hostname_.c_str());
+		}
+	}
+
 	STICE_LOG_INFO("mDNS: initialized mode=%d hostname=%s localAddr=%s",
 	               static_cast<int>(mode_), hostname_.c_str(), localAddr_.c_str());
 	return true;
@@ -312,6 +329,39 @@ bool MDnsClient::query(const std::string &hostname, MDnsQueryCallback cb) {
 	// Send the initial query immediately.
 	sendPendingQueries();
 	return true;
+}
+
+bool MDnsClient::probeNameConflict(const std::string &name) {
+	if (mode_ == MulticastDNSMode::Disabled || sock_ == STICE_INVALID_SOCKET) return false;
+	{
+		std::lock_guard<std::mutex> lk(probeMutex_);
+		probeDone_ = false;
+		probeConflict_ = false;
+	}
+	PendingQuery pq;
+	pq.hostname = name;
+	pq.callback = [this](const std::string &addr) {
+		{
+			std::lock_guard<std::mutex> lk(probeMutex_);
+			// The timeout path reports an empty address; only a real answer
+			// proves another host already owns the name.
+			if (!addr.empty()) probeConflict_ = true;
+			probeDone_ = true;
+		}
+		probeCv_.notify_all();
+	};
+	pq.deadline =
+		std::chrono::steady_clock::now() + std::chrono::milliseconds(kConflictProbeWindowMs);
+	pq.lastSent = {};
+	{
+		std::lock_guard<std::mutex> lk(queriesMutex_);
+		queries_.push_back(std::move(pq));
+	}
+	sendPendingQueries();
+	std::unique_lock<std::mutex> lk(probeMutex_);
+	probeCv_.wait_for(lk, std::chrono::milliseconds(kConflictProbeWindowMs + 200),
+	                  [this] { return probeDone_; });
+	return probeConflict_;
 }
 
 bool MDnsClient::addRecord(const std::string &hostname, const std::string &addr) {

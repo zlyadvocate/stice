@@ -334,6 +334,11 @@ bool isTcpPairAllowed(const Candidate &local, const Candidate &remote) {
 		bool remoteActive = (remote.transport == CandidateTransport::TCPActive);
 		bool localPassive = (local.transport == CandidateTransport::TCPPassive);
 		bool remotePassive = (remote.transport == CandidateTransport::TCPPassive);
+		bool localSo = (local.transport == CandidateTransport::TCPSimultaneousOpen);
+		bool remoteSo = (remote.transport == CandidateTransport::TCPSimultaneousOpen);
+		// RFC 6544 §6.2: SO pairs only with SO; mixed SO/active or SO/passive
+		// combinations are not in the table.
+		if (localSo != remoteSo) return false;
 		// active-active illegal.
 		if (localActive && remoteActive) return false;
 		// RFC 6062: two TCP-relayed (passive) candidates CAN pair — the
@@ -390,17 +395,24 @@ TEST_CASE("RFC 6062: relayed active-passive TCP pair is allowed", "[pair][rfc606
 	REQUIRE(isTcpPairAllowed(localRelayedActive, remoteRelayedPassive));
 }
 
-TEST_CASE("RFC 6062: SO with any TCP type is allowed", "[pair][rfc6062]") {
-	// Simultaneous-Open can pair with any TCP type (RFC 6544 §5.2).
+TEST_CASE("RFC 6544 §6.2: SO pairs only with SO", "[pair][rfc6544]") {
+	// RFC 6544 §6.2 pairing table:
+	//   tcp-so      <-> tcp-so
+	//   tcp-active  <-> tcp-passive
+	//   tcp-passive <-> tcp-active
+	// Mixed SO/active and SO/passive pairs are outside the table and MUST NOT
+	// be formed. This mirrors Agent::formPairs(), which filters on
+	// `localSo != remoteSo`.
 	auto so = makeCandidate(CandidateType::Host, CandidateTransport::TCPSimultaneousOpen, 100u);
 	auto passive = makeCandidate(CandidateType::Host, CandidateTransport::TCPPassive, 90u);
 	auto active = makeCandidate(CandidateType::Host, CandidateTransport::TCPActive, 90u);
 	auto so2 = makeCandidate(CandidateType::Host, CandidateTransport::TCPSimultaneousOpen, 90u);
-	REQUIRE(isTcpPairAllowed(so, passive));
-	REQUIRE(isTcpPairAllowed(so, active));
 	REQUIRE(isTcpPairAllowed(so, so2));
-	REQUIRE(isTcpPairAllowed(passive, so));
-	REQUIRE(isTcpPairAllowed(active, so));
+	REQUIRE(isTcpPairAllowed(so2, so));
+	REQUIRE_FALSE(isTcpPairAllowed(so, passive));
+	REQUIRE_FALSE(isTcpPairAllowed(so, active));
+	REQUIRE_FALSE(isTcpPairAllowed(passive, so));
+	REQUIRE_FALSE(isTcpPairAllowed(active, so));
 }
 
 TEST_CASE("RFC 6062: UDP-TCP cross-transport pair is filtered", "[pair][rfc6062]") {

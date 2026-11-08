@@ -54,6 +54,13 @@ void applyChallenge(const Message &resp, const char *password, Credentials &cred
 		creds.algo = IntegrityAlgo::HmacSha1;
 	}
 
+	// RFC 8489 §9.2.4: the client must echo the server's PASSWORD-ALGORITHMS
+	// verbatim in the retried request; omitting it is what a bid-down attacker
+	// would do to force MD5.
+	creds.passwordAlgorithms.clear();
+	if (const auto *pas = resp.find(AttrType::PasswordAlgorithms))
+		creds.passwordAlgorithms = pas->value;
+
 	if (password && *password && !creds.username.empty()) {
 		auto sha1Key = crypto::longTermKey(creds.username, creds.realm, password);
 		creds.key.assign(sha1Key.begin(), sha1Key.end());

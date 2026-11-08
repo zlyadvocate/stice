@@ -290,7 +290,10 @@ std::array<unsigned char, Out> hmacImpl(const unsigned char *key, std::size_t ke
                                         const unsigned char *msg, std::size_t msgLen) {
 	unsigned char k0[64] = {};
 	if (keyLen <= 64) {
-		std::memcpy(k0, key, keyLen);
+		// keyLen == 0 (empty key) must skip the copy: memcpy(k0, nullptr, 0)
+		// violates the nonnull contract even at length zero (UBSan nonnull-attribute).
+		if (keyLen)
+			std::memcpy(k0, key, keyLen);
 	} else {
 		Ctx c;
 		Init(c);

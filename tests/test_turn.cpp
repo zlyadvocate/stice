@@ -386,6 +386,11 @@ TEST_CASE("TURN allocate retries on 401 with REALM/NONCE", "[turn]") {
 	REQUIRE(retry.find(AttrType::Username) != nullptr);
 	REQUIRE(getString(retry, AttrType::Realm) == "example.org");
 	REQUIRE(getString(retry, AttrType::Nonce) == "nonce123");
+	// RFC 8489 §9.2.4: PASSWORD-ALGORITHM (0x001D) is only advertised when a
+	// non-default algorithm was negotiated. A plain 401 without
+	// PASSWORD-ALGORITHMS keeps the RFC 5389 default (MD5), so the retry must
+	// NOT carry 0x001D — the server verifies with the default key.
+	REQUIRE(retry.find(AttrType::PasswordAlgorithm) == nullptr);
 }
 
 TEST_CASE("TURN allocate success stores relayed address + lifetime", "[turn]") {
@@ -1901,6 +1906,79 @@ TEST_CASE("RFC 6062: buildConnectionBindRequest produces valid CONNECTION-BIND",
 	// MESSAGE-INTEGRITY must be present (CONNECTION-BIND is authenticated
 	// with the same long-term credentials as the allocation, per RFC 6062 §6.5).
 	REQUIRE(m.find(AttrType::MessageIntegrity) != nullptr);
+}
+
+TEST_CASE("RFC 6062: CONNECTION-BIND success response is verified via verifySideChannelResponse",
+          "[turn][rfc6062][password-agility]") {
+	// 0.14.1: the CONNECTION-BIND success response arriving on the data
+	// connection used to be accepted unchecked. It must be verified —
+	// MESSAGE-INTEGRITY (dual-algorithm dispatch) and FINGERPRINT — before the
+	// data connection is considered bound.
+	TurnHarness h;
+	h.init();
+	h.reachAllocated(/*tcp=*/true);
+
+	// A success response signed with the allocation's long-term credentials
+	// (and carrying FINGERPRINT, as encode() always appends) must verify.
+	Message ok;
+	ok.method = Method::ConnectionBind;
+	ok.cls = Class::SuccessResponse;
+	ok.newTransactionID();
+	encodeSignedResponse(ok);
+	Message signedResp;
+	REQUIRE(signedResp.decode(ok.raw.data(), ok.raw.size()));
+	REQUIRE(h.client.verifySideChannelResponse(signedResp));
+
+	SECTION("wrong-key MESSAGE-INTEGRITY is rejected") {
+		// Signed with a different password: FINGERPRINT stays valid (encode
+		// computed it over the final bytes) but the MESSAGE-INTEGRITY HMAC
+		// does not match the allocation's long-term key — the exact signature
+		// of a spoofed data-connection response.
+		Message wrong;
+		wrong.method = Method::ConnectionBind;
+		wrong.cls = Class::SuccessResponse;
+		wrong.newTransactionID();
+		REQUIRE(wrong.encode("not-the-secret", nullptr, nullptr));
+		Message d;
+		REQUIRE(d.decode(wrong.raw.data(), wrong.raw.size()));
+		REQUIRE(d.checkFingerprint()); // FP intact: rejection must come from MI
+		REQUIRE_FALSE(h.client.verifySideChannelResponse(d));
+	}
+	SECTION("success response without MESSAGE-INTEGRITY is rejected (strict default)") {
+		// A compliant server signs CONNECTION-BIND with the same long-term
+		// credentials (RFC 6062 §6.5); an unsigned success response must not
+		// pass — the old behaviour accepted anything.
+		Message unsignedOk;
+		unsignedOk.method = Method::ConnectionBind;
+		unsignedOk.cls = Class::SuccessResponse;
+		unsignedOk.newTransactionID();
+		REQUIRE(unsignedOk.encode(nullptr, nullptr, nullptr));
+		Message d;
+		REQUIRE(d.decode(unsignedOk.raw.data(), unsignedOk.raw.size()));
+		REQUIRE_FALSE(h.client.verifySideChannelResponse(d));
+	}
+	SECTION("FINGERPRINT present but wrong is rejected") {
+		bytes tampered = ok.raw;
+		REQUIRE(tampered.size() >= 4);
+		tampered[tampered.size() - 1] ^= 0xFF; // last FINGERPRINT byte
+		Message d;
+		REQUIRE(d.decode(tampered.data(), tampered.size()));
+		REQUIRE_FALSE(h.client.verifySideChannelResponse(d));
+	}
+	SECTION("no credentials yet: nothing to verify, accepted") {
+		// Before the Allocate challenge the client has no key material; the
+		// server cannot have signed anything, so verification must not fail.
+		TurnHarness fresh;
+		fresh.init();
+		Message any;
+		any.method = Method::ConnectionBind;
+		any.cls = Class::SuccessResponse;
+		any.newTransactionID();
+		REQUIRE(any.encode(nullptr, nullptr, nullptr));
+		Message d;
+		REQUIRE(d.decode(any.raw.data(), any.raw.size()));
+		REQUIRE(fresh.client.verifySideChannelResponse(d));
+	}
 }
 
 TEST_CASE("RFC 6062: CONNECTION-ATTEMPT fires onConnectionAttempt", "[turn][rfc6062]") {

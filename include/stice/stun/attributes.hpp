@@ -155,6 +155,20 @@ bool readPasswordAlgorithms(const Message &msg, std::vector<std::uint16_t> &out)
 // otherwise the server verifies with MD5 and a SHA-256 MESSAGE-INTEGRITY fails.
 void addPasswordAlgorithm(Message &msg, std::uint16_t algorithm);
 
+// Encode the PASSWORD-ALGORITHMS value (RFC 8489 §14.1). Exposed so a server can
+// remember the exact bytes it sent with a nonce and compare a retried request's
+// attribute against them (§9.2.4 check 2), and so a client can echo them back
+// verbatim (§9.2.5).
+std::vector<unsigned char> encodePasswordAlgorithms(const std::vector<std::uint16_t> &algorithms);
+
+// RFC 8489 §9.2.1 / §14.10: the NONCE starts with the 13-character "nonce
+// cookie" = "obMatJos2" + the 4-character base64 encoding of the 24-bit STUN
+// Security Features. Bit 0 (the most significant bit of the first byte) is the
+// "Password algorithms" feature.
+constexpr std::uint32_t SecurityFeaturePasswordAlgorithms = 0x800000;
+std::string makeNonceCookie(std::uint32_t features);
+bool nonceHasPasswordAlgorithmsFeature(const std::string &nonce);
+
 // ALTERNATE-SERVER (0x8023, RFC 8489 §14.11): the transport address a 300
 // Try Alternate response points at. Encoded like MAPPED-ADDRESS (plain, not
 // XOR-obfuscated).

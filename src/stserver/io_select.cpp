@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // Author: zlyadvocate
-// Version: 0.14.1
+// Version: 0.15.0
 // SelectBackend: B plan implementation — control plane / data plane
 // separation with a thread pool.
 //
