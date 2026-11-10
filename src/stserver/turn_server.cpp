@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
 // Author: zlyadvocate
-// Version: 0.15.0
 // stserver TURN/STUN server implementation.
 //
 // Implements STUN Binding (RFC 5389), TURN Allocate/Refresh/CreatePermission/
@@ -227,6 +226,7 @@ bool TurnServer::init(const Config &cfg) {
 	relayPortBegin_ = cfg.relayPortBegin;
 	relayPortEnd_ = cfg.relayPortEnd;
 	workerCount_ = std::max(1, cfg.workerCount);
+	passwordAlgorithms_ = cfg.passwordAlgorithms;
 
 	// Determine the externally-reachable server IP advertised in
 	// XOR-RELAYED-ADDRESS. Priority: explicit relayAddress (coturn external-ip
@@ -329,8 +329,9 @@ void TurnServer::refreshNonce() {
 	// Bit 0 of the feature field (0x800000) declares PASSWORD-ALGORITHMS
 	// support. A client that sees it MUST echo the attribute in every
 	// authenticated request, and authenticate() below enforces that (§9.2.4
-	// anti-bid-down).
-	const std::uint32_t features = SecurityFeaturePasswordAlgorithms;
+	// anti-bid-down). The feature is opt-in because browsers do not echo it.
+	const std::uint32_t features =
+	    passwordAlgorithms_ ? SecurityFeaturePasswordAlgorithms : 0u;
 	std::int64_t expirySec = (nowMs() + nonceLifetimeMs_) / 1000;
 	nonce_ = makeNonceCookie(features) + ":" + std::to_string(expirySec) + ":" +
 	         stice::crypto::randomStr64(32);
@@ -568,17 +569,19 @@ int TurnServer::authenticate(const Message &msg, std::string &outUsername) {
 	const std::vector<std::uint16_t> advertised = {PasswordAlgorithmMd5,
 	                                               PasswordAlgorithmSha256};
 	const std::vector<unsigned char> advertisedWire = encodePasswordAlgorithms(advertised);
-	if (const Attribute *pas = msg.find(AttrType::PasswordAlgorithms)) {
-		if (pas->value != advertisedWire) return StunErrorBadRequest;
-	} else if (nonceHasPasswordAlgorithmsFeature(nonce_)) {
-		return StunErrorBadRequest;
-	}
-	if (const Attribute *pa = msg.find(AttrType::PasswordAlgorithm)) {
-		if (pa->value.size() < 2) return StunErrorBadRequest;
-		std::uint16_t algo = static_cast<std::uint16_t>(
-		    (static_cast<std::uint16_t>(pa->value[0]) << 8) | pa->value[1]);
-		if (std::find(advertised.begin(), advertised.end(), algo) == advertised.end())
+	if (passwordAlgorithms_) {
+		if (const Attribute *pas = msg.find(AttrType::PasswordAlgorithms)) {
+			if (pas->value != advertisedWire) return StunErrorBadRequest;
+		} else if (nonceHasPasswordAlgorithmsFeature(nonce_)) {
 			return StunErrorBadRequest;
+		}
+		if (const Attribute *pa = msg.find(AttrType::PasswordAlgorithm)) {
+			if (pa->value.size() < 2) return StunErrorBadRequest;
+			std::uint16_t algo = static_cast<std::uint16_t>(
+			    (static_cast<std::uint16_t>(pa->value[0]) << 8) | pa->value[1]);
+			if (std::find(advertised.begin(), advertised.end(), algo) == advertised.end())
+				return StunErrorBadRequest;
+		}
 	}
 
 	// RFC 8489 §14.2: USERHASH is the binary SHA-256 of "username:realm" and may
@@ -712,8 +715,10 @@ void TurnServer::sendAuthErrorResponse(const AddrRecord &dst, const Message &req
 	addString(resp, AttrType::Nonce, nonce_);
 	// RFC 8489 §9.2.4: both the 401 challenge and the 438 stale-nonce error
 	// advertise the password algorithms the server accepts so the client can
-	// pick SHA-256 instead of defaulting to MD5.
-	if (code == 401 || code == 438)
+	// pick SHA-256 instead of defaulting to MD5. Only when the opt-in
+	// anti-bid-down mode is on; advertising it unconditionally makes every
+	// browser allocation fail.
+	if (passwordAlgorithms_ && (code == 401 || code == 438))
 		addPasswordAlgorithms(resp, {PasswordAlgorithmMd5, PasswordAlgorithmSha256});
 	resp.encode(nullptr, nullptr, "stserver");
 	sendUdp(dst, resp);
@@ -728,7 +733,7 @@ void TurnServer::sendAuthErrorResponseTcp(TcpConn &conn, const Message &req, int
 	addString(resp, AttrType::Realm, realm_);
 	addString(resp, AttrType::Nonce, nonce_);
 	// RFC 8489 §9.2.4: same as the UDP 401/438 path above.
-	if (code == 401 || code == 438)
+	if (passwordAlgorithms_ && (code == 401 || code == 438))
 		addPasswordAlgorithms(resp, {PasswordAlgorithmMd5, PasswordAlgorithmSha256});
 	resp.encode(nullptr, nullptr, "stserver");
 	sendTcp(conn, resp);

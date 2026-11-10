@@ -18,6 +18,14 @@ extern "C" {
 #include <stddef.h>
 #include <stdint.h>
 
+// Library version. This is the single source of truth: CMakeLists.txt parses
+// these macros for project(VERSION ...), so a release bumps one file instead of
+// every file that used to carry a "// Version:" comment.
+#define STICE_VERSION_MAJOR 0
+#define STICE_VERSION_MINOR 15
+#define STICE_VERSION_PATCH 1
+#define STICE_VERSION_STRING "0.15.1"
+
 #ifndef STICE_STATIC
 #  ifdef _WIN32
 #    ifdef STICE_EXPORTS

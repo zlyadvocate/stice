@@ -1,3 +1,34 @@
+## [0.15.1] - 2026-11-10
+
+The version number now has a single definition, and the RFC 8489 §9.2.4
+PASSWORD-ALGORITHMS advertisement became opt-in so browser TURN clients can
+allocate through stserver again.
+
+### Changed
+
+- **The version is defined once, in `include/stice/stice.h`.**
+  `STICE_VERSION_MAJOR/MINOR/PATCH/STRING` live in the public header and
+  `CMakeLists.txt` parses them into `project(VERSION ...)`. The six
+  `// Version:` header comments in `src/stserver/` are gone, so a release no
+  longer touches (and re-commits) source files that did not actually change.
+  CMake fails at configure time if the macros cannot be found.
+- **RFC 8489 §9.2.4 anti-bid-down is opt-in.** `Config::passwordAlgorithms`
+  (config key `passwordAlgorithms`, default `false`) gates three things: the
+  `0x800000` security-feature bit in the nonce cookie, the echo/algorithm
+  verification in `authenticate()`, and the `PASSWORD-ALGORITHMS` attribute on
+  the 401/438 responses (UDP and TCP). Enabling it keeps the full §9.2.4
+  chain; leaving it off keeps wire compatibility with clients that do not
+  echo the list.
+
+### Fixed
+
+- **Browsers could not allocate through stserver.** Chromium and Firefox never
+  echo `PASSWORD-ALGORITHMS`, but the server advertised the feature
+  unconditionally, so every browser `Allocate` was rejected with 400 and the
+  ICE agent never produced a relay candidate. With the feature off by default
+  the browser path works; the strict chain remains available for stice's own
+  clients and is still covered by the protocol tests.
+
 ## [0.15.0] - 2026-11-08
 
 RFC 8489 §9.2.4 anti-bid-down is enforced end to end (the nonce advertises the

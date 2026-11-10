@@ -39,6 +39,16 @@ struct Config {
 	// where the "each stale request mints a new nonce" stampede used to kill
 	// every client at once, and reaching it otherwise takes 30 real minutes.
 	std::uint32_t nonceLifetimeSec = 1800;
+	// RFC 8489 §9.2.4 PASSWORD-ALGORITHMS negotiation. When on, the nonce
+	// declares the security feature and every authenticated request MUST echo
+	// the advertised list verbatim (a missing or rewritten value is answered
+	// with 400), which closes the on-path bid-down to MD5.
+	//
+	// Off by default: the feature is only meaningful between peers that both
+	// implement §9.2.4, and browsers (Chromium/Firefox) do not. Advertising it
+	// unconditionally makes every browser TURN allocation fail with 400, so
+	// interop is the safe default and strictness is opt-in.
+	bool passwordAlgorithms = false;
 	// Default relay range deliberately avoids the Windows ephemeral port
 	// range (49152-65535): binding relay sockets there collides with
 	// outbound connections' auto-assigned source ports and made Allocate

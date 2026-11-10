@@ -58,6 +58,10 @@ struct ServerOptions {
 	std::uint16_t relayPortBegin = 41000;
 	std::uint16_t relayPortEnd = 41999;
 	int workerCount = 1;
+	// Opt-in RFC 8489 §9.2.4 anti-bid-down enforcement (PASSWORD-ALGORITHMS
+	// echo). Off by default like the production server, because browsers do not
+	// echo the attribute; the protocol tests that exercise the chain enable it.
+	bool passwordAlgorithms = false;
 };
 
 inline AddrRecord loopback(std::uint16_t port) {
@@ -95,6 +99,7 @@ struct TestServer {
 			cfg.channelLifetimeSec = opt.channelLifetimeSec;
 			cfg.relayPortBegin = opt.relayPortBegin;
 			cfg.relayPortEnd = opt.relayPortEnd;
+			cfg.passwordAlgorithms = opt.passwordAlgorithms;
 			if (!srv->init(cfg)) continue;
 			server = std::move(srv);
 			port = p;

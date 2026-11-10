@@ -384,6 +384,10 @@ private:
 	std::uint16_t relayPortBegin_ = 49152;
 	std::uint16_t relayPortEnd_ = 65535;
 	int workerCount_ = 4;
+	// RFC 8489 §9.2.4 anti-bid-down enforcement. Off by default: browsers do
+	// not echo PASSWORD-ALGORITHMS, so enabling it rejects every browser TURN
+	// allocation with 400.
+	bool passwordAlgorithms_ = false;
 	// Externally-reachable server IP for XOR-RELAYED-ADDRESS (loopback when
 	// the listener is 0.0.0.0).
 	std::string relayIp_;

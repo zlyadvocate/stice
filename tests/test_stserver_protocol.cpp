@@ -148,7 +148,9 @@ TEST_CASE("stserver answers 400 when MESSAGE-INTEGRITY lacks REALM or NONCE",
 
 TEST_CASE("stserver answers 400 for an unadvertised PASSWORD-ALGORITHM",
           "[stserver][stun][protocol]") {
-	Fixture f;
+	ServerOptions opt;
+	opt.passwordAlgorithms = true;
+	Fixture f(opt);
 	f.waitReady();
 	auto creds = obtainCredentials(f);
 
@@ -193,7 +195,9 @@ TEST_CASE("stserver answers 400 for an unadvertised PASSWORD-ALGORITHM",
 // what an on-path attacker does to force MD5, so the server must reject it.
 TEST_CASE("stserver enforces the PASSWORD-ALGORITHMS echo (anti-bid-down)",
           "[stserver][stun][protocol]") {
-	Fixture f;
+	ServerOptions opt;
+	opt.passwordAlgorithms = true;
+	Fixture f(opt);
 	f.waitReady();
 	auto creds = obtainCredentials(f);
 	REQUIRE_FALSE(creds.passwordAlgorithms.empty());
@@ -264,7 +268,9 @@ TEST_CASE("stserver mirrors MESSAGE-INTEGRITY-SHA256 and emits only one integrit
 
 TEST_CASE("stserver 401 and 438 carry REALM, NONCE and PASSWORD-ALGORITHMS",
           "[stserver][stun][protocol]") {
-	Fixture f;
+	ServerOptions opt;
+	opt.passwordAlgorithms = true;
+	Fixture f(opt);
 	f.waitReady();
 
 	Message challenge;
@@ -306,6 +312,35 @@ TEST_CASE("stserver 401 and 438 carry REALM, NONCE and PASSWORD-ALGORITHMS",
 	algos.clear();
 	REQUIRE(stice::stun::readPasswordAlgorithms(staleResp, algos));
 	REQUIRE(algos.size() == 2);
+}
+
+// ---- G-STUN-8: default-off PASSWORD-ALGORITHMS (browser interop) -----------
+
+// The §9.2.4 echo chain is opt-in. With the default config the server must not
+// advertise PASSWORD-ALGORITHMS at all: browsers do not echo the attribute, so
+// an unconditional advertisement (and the matching omission rejection) made
+// every browser TURN allocation fail with 400.
+TEST_CASE("stserver does not advertise PASSWORD-ALGORITHMS by default",
+          "[stserver][stun][protocol]") {
+	Fixture f;
+	f.waitReady();
+
+	Message challenge;
+	Message probe = makeAllocateRequest(false, nullptr);
+	REQUIRE(transact(f.sock, f.serverAddr, probe, challenge));
+	REQUIRE(challenge.cls == Class::ErrorResponse);
+	REQUIRE(errorCodeOf(challenge) == stice::stun::StunErrorUnauthenticated);
+
+	REQUIRE(challenge.find(AttrType::PasswordAlgorithms) == nullptr);
+	const std::string nonce = stice::stun::getString(challenge, AttrType::Nonce);
+	REQUIRE_FALSE(nonce.empty());
+	REQUIRE_FALSE(stice::stun::nonceHasPasswordAlgorithmsFeature(nonce));
+
+	// A client that behaves like a browser (no echo) must still allocate.
+	auto creds = obtainCredentials(f);
+	REQUIRE(creds.passwordAlgorithms.empty());
+	Message resp = f.allocate(creds);
+	REQUIRE(resp.cls == Class::SuccessResponse);
 }
 
 // ---- G-TURN-1: 442 / 440 / 420 on Allocate --------------------------------

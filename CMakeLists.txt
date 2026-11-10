@@ -1,6 +1,23 @@
 cmake_minimum_required(VERSION 3.13)
+
+# The version is defined once, in include/stice/stice.h. Parse it here so
+# project(VERSION ...) cannot drift from the header; a release edits only the
+# header. (file(READ) works before project().)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/include/stice/stice.h" STICE_H_VERSION_SOURCE)
+foreach(_stice_v MAJOR MINOR PATCH)
+	string(REGEX MATCH "STICE_VERSION_${_stice_v}[ \t]+([0-9]+)"
+	       _stice_v_match "${STICE_H_VERSION_SOURCE}")
+	set(_stice_v_num "${CMAKE_MATCH_1}")
+	if("${_stice_v_num}" STREQUAL "")
+		message(FATAL_ERROR
+		        "STICE_VERSION_${_stice_v} not found in include/stice/stice.h")
+	endif()
+	set(STICE_VERSION_${_stice_v} "${_stice_v_num}")
+endforeach()
+message(STATUS "stice version: ${STICE_VERSION_MAJOR}.${STICE_VERSION_MINOR}.${STICE_VERSION_PATCH}")
+
 project(stice
-	VERSION 0.15.0
+	VERSION ${STICE_VERSION_MAJOR}.${STICE_VERSION_MINOR}.${STICE_VERSION_PATCH}
 	LANGUAGES CXX C
 	DESCRIPTION "C++17 ICE + TURN client (ported from pion/webrtc), libjuice replacement"
 	HOMEPAGE_URL "https://github.com/zlyadvocate/stice")

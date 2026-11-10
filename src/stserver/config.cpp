@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
 // Author: zlyadvocate
-// Version: 0.15.0
 #include "stice/stserver/config.hpp"
 
 #include "stice/log.hpp"
@@ -145,6 +144,12 @@ bool Config::load(const std::string &path) {
 		} else if (nk == "relayportend") {
 			if (!parseRange(val, "relay_port_end", 1024, 65535, num)) return false;
 			relayPortEnd = static_cast<std::uint16_t>(num);
+		} else if (nk == "passwordalgorithms") {
+			std::string lv;
+			lv.reserve(val.size());
+			for (char c : val)
+				lv.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+			passwordAlgorithms = (lv == "1" || lv == "true" || lv == "yes" || lv == "on");
 		} else if (nk == "loglevel") logLevel = val;
 		else if (nk == "workercount") {
 			if (!parseRange(val, "worker_count", 1, 256, num)) return false;
